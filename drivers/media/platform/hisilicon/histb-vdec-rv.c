@@ -250,41 +250,66 @@ static int rv_parse_picture_header(struct histb_rv_parser *parser,
 		return HISTB_RV_INVALID;
 	}
 
-	/* Dimension fields, widths from the ubfx at :1222-1226. */
+	/*
+	 * The geometry is not a pair of plain fields.  Real8_CB_GetPictureHeader
+	 * reads a second VLC value and unpacks several things from its 32 bits
+	 * (real8.S:1176-1193):
+	 *
+	 *   bit 0        must be 0, otherwise the header is rejected (:1181-1182)
+	 *   bit 1        CPFMT present flag (:1183-1188): clear selects the
+	 *                144x176 default, set means the dimensions follow and
+	 *                are read by Real8_CB_GetCPFMT (called from .L199)
+	 *   bits [6:2]   a five-bit field, stored at context+120
+	 *   bits [14:7]  an eight-bit field, stored at context+108
+	 *
+	 * The five- and eight-bit fields are recorded; their names are not
+	 * recoverable from the assembly, so they are not interpreted.
+	 */
 	{
-		__u32 hi = rv_bits_get(br, 5);
-		__u32 lo = rv_bits_get(br, 8);
+		__u32 geom = 0;
+
+		rv_bits_vlc(br, &geom);
+		if (br->overrun)
+			return HISTB_RV_NEED_MORE;
+
+		tag = geom;
+	}
+
+	if (tag & 1)
+		return HISTB_RV_INVALID;
+
+	if (tag & 2) {
+		/*
+		 * Real8_CB_GetCPFMT (:390-450): a four-bit code, then a
+		 * nine-bit width and a nine-bit height, each stored as
+		 * (value + 1) << 2.
+		 */
+		__u32 code = rv_bits_get(br, 4);
+		__u32 w = rv_bits_get(br, 9);
+		__u32 hgt = rv_bits_get(br, 9);
 
 		if (br->overrun)
 			return HISTB_RV_NEED_MORE;
 
-		/*
-		 * CPFMT default 144x176 when the flag is clear (:1259-1262).
-		 * Which bit is the flag is Q1, so the parsed pair is used
-		 * directly and the default is not applied.
-		 */
-		h->pic_size_code_hi = (__u8)hi;
-		h->pic_size_code = (__u8)lo;
-		h->pic_width_in_pixel = (__u16)((hi << 8) | lo);
-		h->pic_height_in_pixel = 0;
+		(void)code;
+		h->cp_fmt = 1;
+		h->pic_width_in_pixel = (__u16)(((w + 1) << 2) & 0xffff);
+		h->pic_height_in_pixel = (__u16)(((hgt + 1) << 2) & 0xffff);
+	} else {
+		h->cp_fmt = 0;
+		h->pic_height_in_pixel = 176;
+		h->pic_width_in_pixel = 144;
 	}
 
-	/*
-	 * Real8_CB_SetDimensions (:1254-1255) derives the rest.  Height is
-	 * not available from the fields above without Q1, so the frame is
-	 * marked blocked and validate_stateful_frame() will refuse it.
-	 */
+	h->pic_size_code_hi = (__u8)((tag >> 2) & 0x1f);
+	h->pic_size_code = (__u8)((tag >> 7) & 0xff);
+
+	/* Real8_CB_SetDimensions (:454-570). */
 	h->pic_width_in_mb = (__u16)((h->pic_width_in_pixel + 15) >> 4);
 	h->pic_height_in_mb = (__u16)((h->pic_height_in_pixel + 15) >> 4);
 	h->total_mbs = (__u16)(h->pic_width_in_mb * h->pic_height_in_mb);
 
-	/*
-	 * Geometry is the remaining gap: the dimension fields are read with
-	 * the widths the assembly uses, but which bit selects the CPFMT
-	 * default is still not pinned down, so height stays zero and the
-	 * frame is blocked on geometry rather than on the coding type.
-	 */
-	parser->blocker = HISTB_RV_BLOCK_GEOMETRY;
+	parser->blocker = HISTB_RV_BLOCK_NONE;
 
 	return HISTB_RV_OK;
 }
