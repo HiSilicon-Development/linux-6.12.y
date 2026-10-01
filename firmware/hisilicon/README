@@ -1,0 +1,45 @@
+HiSilicon Hi3798CV200 AVSP program
+=================================
+
+The histb-avsp.bin file is the 17,920-byte AVS processor program used by
+the Hi3798CV200 VDH/SCD.  It is stored as little-endian 32-bit words and
+has the following SHA-256 digest:
+
+  4ec0ea0b21ebd45057bbad20a1b69893fc02a4ae6244f46503781141fc785d3f
+
+The image was reconstructed from the product-linked g_avsp_firmware
+object.  The following independently shipped CV200 product trees contain
+byte-identical 4,480-word objects:
+
+  - HiSTBAndroidV600R002C00SPC030, HD_FULL
+  - HiSTBLinuxV100R005C00SPC050, LNX_CFG 32-bit and 64-bit
+  - HiSTBLinuxV100R005C00SPC060, LNX_CFG 32-bit and 64-bit
+  - the CV200 32-bit Linux 4.4 BSP
+
+The product source paths are:
+
+  source/msp/drv/vfmw/vfmw_v5.0/firmware/product/Hi3798CV200/
+    HD_FULL/*/driver/HiSCDV200/scd_drv.S
+  source/msp/drv/vfmw/vfmw_v5.0/product/Hi3798CV200/
+    LNX_CFG/{32bit,64bit}/core/driver/HiSCDV200/scd_drv.S
+  source/tee/drv/vfmw/vfmw_v5.0/core/driver/HiDSPV100/
+    dsp_v100_avsp.h
+
+The product build links g_avsp_firmware from scd_drv.S and explicitly
+sizes it to 17,920 bytes.  The HiDSPV100 header compiles to the same 4,480
+words.  Three hexadecimal values in that header are commented-out
+alternatives and must not be treated as array initializers by extraction
+tools.
+
+histb-avsp.bin is the raw little-endian serialization of those 4,480
+initializer words in source order.  A binary resource is used instead of
+copying the giant array into the V4L2 driver because the standard Linux
+firmware API consumes a byte image, keeps the SCD machine program separate
+from host driver code, and permits the same checked image to be either
+built into vmlinux or supplied by the root filesystem.  The retired VFMW
+framework linked the array directly; it is not carried into the Request API
+driver.
+
+The HiSTB arm64 defconfigs embed the image through CONFIG_EXTRA_FIRMWARE.
+The histb-vdec driver requests it as hisilicon/histb-avsp.bin and checks
+the exact size before copying it to a 128-byte-aligned coherent buffer.
