@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/regulator/hisilicon,hi3798cv200-pwm-regulator.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: HiSilicon Hi3798CV200 CPU and GPU regulators
+
+maintainers:
+  - Wei Xu <xuwei5@hisilicon.com>
+
+description:
+  The Hi3798CV200 contains dedicated PWM registers which control the
+  voltages supplied to its Cortex-A53 CPU cluster and integrated Mali GPU.
+
+allOf:
+  - $ref: regulator.yaml#
+
+properties:
+  compatible:
+    enum:
+      - hisilicon,hi3798cv200-cpu-regulator
+      - hisilicon,hi3798cv200-gpu-regulator
+
+  reg:
+    maxItems: 1
+
+required:
+  - compatible
+  - reg
+  - regulator-name
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    regulator@f8a23020 {
+        compatible = "hisilicon,hi3798cv200-gpu-regulator";
+        reg = <0xf8a23020 0x4>;
+        regulator-name = "vdd-gpu";
+        regulator-min-microvolt = <650000>;
+        regulator-max-microvolt = <1150000>;
+        regulator-always-on;
+    };

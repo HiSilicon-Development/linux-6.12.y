@@ -431,6 +431,17 @@ config REGULATOR_GPIO
 	  and the platform has to provide a mapping of GPIO-states
 	  to target volts/amps.
 
+config REGULATOR_HI3798CV200_PWM
+	tristate "HiSilicon Hi3798CV200 CPU/GPU regulators"
+	depends on SOC_HI3798CV200 || COMPILE_TEST
+	depends on OF
+	help
+	  Enable the voltage regulator driven by the dedicated PWM register
+	  found on HiSilicon Hi3798CV200 set-top-box SoCs. These supplies power
+	  the Cortex-A53 CPU cluster and integrated Mali-T720 GPU. The driver
+	  exposes them through the regulator framework so generic OPP, CPUFreq,
+	  and Panfrost drivers can coordinate voltage changes.
+
 config REGULATOR_HI6421
 	tristate "HiSilicon Hi6421 PMIC voltage regulator support"
 	depends on MFD_HI6421_PMIC && OF
