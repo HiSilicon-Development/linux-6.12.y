@@ -2711,15 +2711,9 @@ histb_vdec_alloc_decoded_buffers(struct histb_vdec_ctx *ctx,
 	 * large multiple of the decode time - measured 6 fps for 4K HEVC
 	 * Main10 against a 50 fps stream.
 	 */
-	/*
-	 * Field-rate DEI doubles every capture surface and keeps a three-frame
-	 * linear history.  Keeping its reconstruction surfaces in the shared
-	 * 192 MiB CMA pool leaves too little contiguous memory for those outputs
-	 * and the encoder queues.  They are bus-only while DEI is active, so use
-	 * the board's dedicated coherent VDEC pool without putting the normal or
-	 * UHD paths back on uncached memory.
-	 */
-	decoded->tile_noncoherent = !ctx->dei_field_rate;
+	/* FHD device-only reconstruction uses the dedicated VDEC pool. */
+	decoded->tile_noncoherent = ctx->src.pix.width > 1920 ||
+				    ctx->src.pix.height > 1088;
 	if (decoded->tile_noncoherent)
 		decoded->tile.cpu = dma_alloc_noncoherent(dev, decoded->tile.size,
 							  &decoded->tile.dma,
@@ -2731,7 +2725,7 @@ histb_vdec_alloc_decoded_buffers(struct histb_vdec_ctx *ctx,
 	if (!decoded->tile.cpu)
 		return -ENOMEM;
 	if (decoded->pmv.size) {
-		decoded->pmv_noncoherent = !ctx->dei_field_rate;
+		decoded->pmv_noncoherent = decoded->tile_noncoherent;
 		if (decoded->pmv_noncoherent)
 			decoded->pmv.cpu = dma_alloc_noncoherent(dev,
 								 decoded->pmv.size,
