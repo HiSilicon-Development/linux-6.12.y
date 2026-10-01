@@ -259,6 +259,7 @@ struct hix5hd2_priv {
 	phy_interface_t	phy_mode;
 
 	unsigned long hw_cap;
+	bool is_hi3798cv200;
 	unsigned int speed;
 	unsigned int duplex;
 
@@ -272,6 +273,8 @@ struct hix5hd2_priv {
 	struct napi_struct napi;
 	struct work_struct tx_timeout_task;
 };
+
+static int hix5hd2_mac_core_reset(struct hix5hd2_priv *priv);
 
 static inline void hix5hd2_mac_interface_reset(struct hix5hd2_priv *priv)
 {
@@ -292,6 +295,9 @@ static void hix5hd2_config_port(struct net_device *dev, u32 speed, u32 duplex)
 
 	switch (priv->phy_mode) {
 	case PHY_INTERFACE_MODE_RGMII:
+	case PHY_INTERFACE_MODE_RGMII_ID:
+	case PHY_INTERFACE_MODE_RGMII_RXID:
+	case PHY_INTERFACE_MODE_RGMII_TXID:
 		if (speed == SPEED_1000)
 			val = RGMII_SPEED_1000;
 		else if (speed == SPEED_100)
@@ -842,6 +848,22 @@ static int hix5hd2_net_open(struct net_device *dev)
 		return ret;
 	}
 
+	if (priv->is_hi3798cv200) {
+		ret = hix5hd2_mac_core_reset(priv);
+		if (ret) {
+			netdev_err(dev, "failed to reset mac core %d\n", ret);
+			clk_disable_unprepare(priv->mac_ifc_clk);
+			clk_disable_unprepare(priv->mac_core_clk);
+			return ret;
+		}
+
+		priv->speed = SPEED_UNKNOWN;
+		priv->duplex = DUPLEX_UNKNOWN;
+
+		/* Writes made while the interface is down are clock-gated. */
+		hix5hd2_hw_set_mac_addr(dev);
+	}
+
 	phy = of_phy_connect(dev, priv->phy_node,
 			     &hix5hd2_adjust_link, 0, priv->phy_mode);
 	if (!phy) {
@@ -850,6 +872,8 @@ static int hix5hd2_net_open(struct net_device *dev)
 		return -ENODEV;
 	}
 
+	if (priv->is_hi3798cv200)
+		netif_carrier_off(dev);
 	phy_start(phy);
 	hix5hd2_hw_init(priv);
 	hix5hd2_rx_refill(priv);
@@ -934,7 +958,8 @@ static int hix5hd2_mdio_read(struct mii_bus *bus, int phy, int reg)
 {
 	struct hix5hd2_priv *priv = bus->priv;
 	void __iomem *base = priv->base;
-	int val, ret;
+	u32 cmd, data, status;
+	int ret;
 
 	ret = hix5hd2_mdio_wait_ready(bus);
 	if (ret < 0)
@@ -945,15 +970,19 @@ static int hix5hd2_mdio_read(struct mii_bus *bus, int phy, int reg)
 	if (ret < 0)
 		goto out;
 
-	val = readl_relaxed(base + MDIO_RDATA_STATUS);
-	if (val & MDIO_R_VALID) {
-		dev_err(bus->parent, "SMI bus read not valid\n");
+	status = readl_relaxed(base + MDIO_RDATA_STATUS);
+	if (status & MDIO_R_VALID) {
+		cmd = readl_relaxed(base + MDIO_SINGLE_CMD);
+		data = readl_relaxed(base + MDIO_SINGLE_DATA);
+		dev_err_ratelimited(bus->parent,
+				    "SMI read invalid: phy=%d reg=%d cmd=%#x status=%#x data=%#x\n",
+				    phy, reg, cmd, status, data);
 		ret = -ENODEV;
 		goto out;
 	}
 
-	val = readl_relaxed(priv->base + MDIO_SINGLE_DATA);
-	ret = (val >> 16) & 0xFFFF;
+	data = readl_relaxed(priv->base + MDIO_SINGLE_DATA);
+	ret = (data >> 16) & 0xFFFF;
 out:
 	return ret;
 }
@@ -1047,13 +1076,23 @@ static void hix5hd2_destroy_sg_desc_queue(struct hix5hd2_priv *priv)
 	}
 }
 
-static inline void hix5hd2_mac_core_reset(struct hix5hd2_priv *priv)
+static int hix5hd2_mac_core_reset(struct hix5hd2_priv *priv)
 {
-	if (!priv->mac_core_rst)
-		return;
+	int ret;
 
-	reset_control_assert(priv->mac_core_rst);
-	reset_control_deassert(priv->mac_core_rst);
+	if (!priv->mac_core_rst)
+		return 0;
+	if (!priv->is_hi3798cv200) {
+		reset_control_assert(priv->mac_core_rst);
+		reset_control_deassert(priv->mac_core_rst);
+		return 0;
+	}
+
+	ret = reset_control_assert(priv->mac_core_rst);
+	if (ret)
+		return ret;
+
+	return reset_control_deassert(priv->mac_core_rst);
 }
 
 static void hix5hd2_sleep_us(u32 time_us)
@@ -1070,23 +1109,51 @@ static void hix5hd2_sleep_us(u32 time_us)
 		msleep(time_ms);
 }
 
-static void hix5hd2_phy_reset(struct hix5hd2_priv *priv)
+static int hix5hd2_phy_reset(struct hix5hd2_priv *priv)
 {
+	int ret;
+
+	if (!priv->is_hi3798cv200) {
+		reset_control_deassert(priv->phy_rst);
+		hix5hd2_sleep_us(priv->phy_reset_delays[PRE_DELAY]);
+		reset_control_assert(priv->phy_rst);
+		hix5hd2_sleep_us(priv->phy_reset_delays[PULSE]);
+		reset_control_deassert(priv->phy_rst);
+		hix5hd2_sleep_us(priv->phy_reset_delays[POST_DELAY]);
+		return 0;
+	}
+
 	/* To make sure PHY hardware reset success,
 	 * we must keep PHY in deassert state first and
 	 * then complete the hardware reset operation
 	 */
-	reset_control_deassert(priv->phy_rst);
+	if (priv->is_hi3798cv200)
+		dev_info(priv->dev, "PHY reset delays: %u/%u/%u us\n",
+			 priv->phy_reset_delays[PRE_DELAY],
+			 priv->phy_reset_delays[PULSE],
+			 priv->phy_reset_delays[POST_DELAY]);
+
+	ret = reset_control_deassert(priv->phy_rst);
+	if (ret)
+		return ret;
 	hix5hd2_sleep_us(priv->phy_reset_delays[PRE_DELAY]);
 
-	reset_control_assert(priv->phy_rst);
+	ret = reset_control_assert(priv->phy_rst);
+	if (ret)
+		return ret;
 	/* delay some time to ensure reset ok,
 	 * this depends on PHY hardware feature
 	 */
 	hix5hd2_sleep_us(priv->phy_reset_delays[PULSE]);
-	reset_control_deassert(priv->phy_rst);
+	ret = reset_control_deassert(priv->phy_rst);
+	if (ret)
+		return ret;
 	/* delay some time to ensure later MDIO access */
 	hix5hd2_sleep_us(priv->phy_reset_delays[POST_DELAY]);
+
+	if (priv->is_hi3798cv200)
+		dev_info(priv->dev, "PHY reset sequence complete\n");
+	return 0;
 }
 
 static const struct of_device_id hix5hd2_of_match[];
@@ -1109,6 +1176,8 @@ static int hix5hd2_dev_probe(struct platform_device *pdev)
 	priv = netdev_priv(ndev);
 	priv->dev = dev;
 	priv->netdev = ndev;
+	priv->is_hi3798cv200 = of_device_is_compatible(
+		node, "hisilicon,hi3798cv200-gmac");
 
 	priv->hw_cap = (unsigned long)device_get_match_data(dev);
 
@@ -1147,26 +1216,69 @@ static int hix5hd2_dev_probe(struct platform_device *pdev)
 		goto out_disable_mac_core_clk;
 	}
 
-	priv->mac_core_rst = devm_reset_control_get(dev, "mac_core");
-	if (IS_ERR(priv->mac_core_rst))
-		priv->mac_core_rst = NULL;
-	hix5hd2_mac_core_reset(priv);
+	if (priv->is_hi3798cv200) {
+		priv->mac_core_rst =
+			devm_reset_control_get_optional_exclusive(dev, "mac_core");
+		if (IS_ERR(priv->mac_core_rst)) {
+			ret = dev_err_probe(dev, PTR_ERR(priv->mac_core_rst),
+					    "failed to get MAC core reset\n");
+			goto out_disable_clk;
+		}
 
-	priv->mac_ifc_rst = devm_reset_control_get(dev, "mac_ifc");
-	if (IS_ERR(priv->mac_ifc_rst))
-		priv->mac_ifc_rst = NULL;
+		priv->mac_ifc_rst =
+			devm_reset_control_get_optional_exclusive(dev, "mac_ifc");
+		if (IS_ERR(priv->mac_ifc_rst)) {
+			ret = dev_err_probe(dev, PTR_ERR(priv->mac_ifc_rst),
+					    "failed to get MAC interface reset\n");
+			goto out_disable_clk;
+		}
 
-	priv->phy_rst = devm_reset_control_get(dev, "phy");
-	if (IS_ERR(priv->phy_rst)) {
-		priv->phy_rst = NULL;
+		priv->phy_rst =
+			devm_reset_control_get_optional_exclusive(dev, "phy");
+		if (IS_ERR(priv->phy_rst)) {
+			ret = dev_err_probe(dev, PTR_ERR(priv->phy_rst),
+					    "failed to get PHY reset\n");
+			goto out_disable_clk;
+		}
+
+		dev_info(dev, "reset controls: core=%s interface=%s phy=%s\n",
+			 priv->mac_core_rst ? "present" : "absent",
+			 priv->mac_ifc_rst ? "present" : "absent",
+			 priv->phy_rst ? "present" : "absent");
+
+		ret = hix5hd2_mac_core_reset(priv);
+		if (ret) {
+			dev_err(dev, "MAC core reset failed: %d\n", ret);
+			goto out_disable_clk;
+		}
 	} else {
+		priv->mac_core_rst = devm_reset_control_get(dev, "mac_core");
+		if (IS_ERR(priv->mac_core_rst))
+			priv->mac_core_rst = NULL;
+		hix5hd2_mac_core_reset(priv);
+
+		priv->mac_ifc_rst = devm_reset_control_get(dev, "mac_ifc");
+		if (IS_ERR(priv->mac_ifc_rst))
+			priv->mac_ifc_rst = NULL;
+
+		priv->phy_rst = devm_reset_control_get(dev, "phy");
+		if (IS_ERR(priv->phy_rst))
+			priv->phy_rst = NULL;
+	}
+
+	if (priv->phy_rst) {
 		ret = of_property_read_u32_array(node,
 						 PHY_RESET_DELAYS_PROPERTY,
 						 priv->phy_reset_delays,
 						 DELAYS_NUM);
 		if (ret)
 			goto out_disable_clk;
-		hix5hd2_phy_reset(priv);
+
+		ret = hix5hd2_phy_reset(priv);
+		if (ret && priv->is_hi3798cv200) {
+			dev_err(dev, "PHY reset failed: %d\n", ret);
+			goto out_disable_clk;
+		}
 	}
 
 	bus = mdiobus_alloc();
