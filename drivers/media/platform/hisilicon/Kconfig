@@ -2,6 +2,20 @@
 
 comment "HiSilicon media platform drivers"
 
+config DVB_HISTB_DMX
+	tristate "HiSilicon HiSTB transport stream demultiplexer"
+	depends on DVB_PLATFORM_DRIVERS
+	depends on DVB_CORE && I2C && OF && HAS_DMA
+	depends on ARCH_HISI || COMPILE_TEST
+	select DVB_MXL214 if MEDIA_SUBDRV_AUTOSELECT && GPIOLIB
+	help
+	  Support the transport stream input and descriptor DMA engine found in
+	  HiSilicon HiSTB SoCs. The hardware DMA engine supplies complete MPEG
+	  transport streams to the Linux DVB software demultiplexer.
+
+	  To compile this driver as a module, choose M here. The module will be
+	  called histb-dmx.
+
 config VIDEO_HISTB_VDEC
 	tristate "HiSilicon Hi3798CV200 video decoder"
 	depends on V4L_MEM2MEM_DRIVERS
