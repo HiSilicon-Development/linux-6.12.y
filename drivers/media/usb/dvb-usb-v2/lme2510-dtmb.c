@@ -1311,52 +1311,6 @@ static void lme2510_dtmb_reset_stream(struct lme2510_dtmb_state *state)
 	spin_unlock_irqrestore(&state->stream_lock, flags);
 }
 
-static void lme2510_dtmb_count_packet(struct lme2510_dtmb_state *state,
-				      const u8 *packet)
-{
-	u16 pid = ((packet[1] & 0x1f) << 8) | packet[2];
-	u8 adaptation = (packet[3] >> 4) & 0x03;
-	u8 counter = packet[3] & 0x0f;
-	bool discontinuity = false;
-
-	if (packet[1] & BIT(7))
-		state->stream_tei++;
-	if (pid == 0x1fff || !adaptation)
-		return;
-	if ((adaptation & 0x02) && packet[4] &&
-	    packet[4] < LME2510_DTMB_TS_PACKET_SIZE - 5)
-		discontinuity = packet[5] & BIT(7);
-	if (discontinuity)
-		clear_bit(pid, state->stream_cc_valid);
-	if (!(adaptation & 0x01))
-		return;
-	if (test_bit(pid, state->stream_cc_valid) &&
-	    counter != ((state->stream_cc[pid] + 1) & 0x0f))
-		state->stream_cc_errors++;
-	state->stream_cc[pid] = counter;
-	set_bit(pid, state->stream_cc_valid);
-}
-
-static size_t lme2510_dtmb_find_sync(const u8 *buffer, size_t length,
-				     size_t offset)
-{
-	size_t packet;
-
-	while (offset + (LME2510_DTMB_TS_SYNC_PACKETS - 1) *
-				LME2510_DTMB_TS_PACKET_SIZE <
-	       length) {
-		for (packet = 0; packet < LME2510_DTMB_TS_SYNC_PACKETS;
-		     packet++)
-			if (buffer[offset +
-				   packet * LME2510_DTMB_TS_PACKET_SIZE] !=
-			    0x47)
-				break;
-		if (packet == LME2510_DTMB_TS_SYNC_PACKETS)
-			return offset;
-		offset++;
-	}
-	return length;
-}
 
 static void lme2510_dtmb_stream_complete(struct usb_data_stream *stream,
 					 u8 *data, size_t length)
@@ -1364,61 +1318,15 @@ static void lme2510_dtmb_stream_complete(struct usb_data_stream *stream,
 	struct dvb_usb_adapter *adapter = stream->user_priv;
 	struct lme2510_dtmb_state *state = adap_to_priv(adapter);
 	unsigned long flags;
-	size_t total;
-	size_t scan = 0;
-	size_t output = 0;
-	size_t sync;
-	size_t keep;
-	size_t i;
 
-	if (!atomic_read(&state->streaming) || !length ||
-	    length > LME2510_DTMB_TS_BUFFER_SIZE)
+	if (!atomic_read(&state->streaming) || !length)
 		return;
 
 	spin_lock_irqsave(&state->stream_lock, flags);
 	state->stream_bytes += length;
-	total = state->stream_carry + length;
-	memcpy(state->stream_buffer + state->stream_carry, data, length);
-
-	for (;;) {
-		sync = lme2510_dtmb_find_sync(state->stream_buffer, total,
-					      scan);
-		if (sync == total)
-			break;
-		if (sync > scan) {
-			lme2510_dtmb_parse_status(state,
-						  state->stream_buffer + scan,
-						  sync - scan);
-		}
-
-		while (sync + LME2510_DTMB_TS_PACKET_SIZE < total &&
-		       state->stream_buffer[sync] == 0x47 &&
-		       state->stream_buffer[sync + LME2510_DTMB_TS_PACKET_SIZE] ==
-			       0x47) {
-			memmove(state->stream_buffer + output,
-				state->stream_buffer + sync,
-				LME2510_DTMB_TS_PACKET_SIZE);
-			output += LME2510_DTMB_TS_PACKET_SIZE;
-			sync += LME2510_DTMB_TS_PACKET_SIZE;
-		}
-		scan = sync;
-	}
-
-	state->stream_packets += output / LME2510_DTMB_TS_PACKET_SIZE;
-	if (output)
-		state->stream_last_packet = jiffies;
-	for (i = 0; i < output; i += LME2510_DTMB_TS_PACKET_SIZE)
-		lme2510_dtmb_count_packet(state, state->stream_buffer + i);
-	if (output && state->stream_validated)
-		dvb_dmx_swfilter_packets(&adapter->demux, state->stream_buffer,
-					 output / LME2510_DTMB_TS_PACKET_SIZE);
-
-	keep = min_t(size_t, total - scan, LME2510_DTMB_TS_CARRY_SIZE);
-	if (keep)
-		memmove(state->stream_buffer,
-			state->stream_buffer + total - keep, keep);
-	state->stream_carry = keep;
 	spin_unlock_irqrestore(&state->stream_lock, flags);
+
+	dvb_dmx_swfilter(&adapter->demux, data, length);
 }
 
 static int lme2510_dtmb_stream_command(struct lme2510_dtmb_state *state,
