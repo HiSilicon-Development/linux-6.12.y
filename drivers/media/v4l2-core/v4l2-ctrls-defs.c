@@ -594,6 +594,15 @@ const char * const *v4l2_ctrl_get_menu(u32 id)
 		"Annex B Start Code",
 		NULL,
 	};
+	static const char * const avs_decode_mode[] = {
+		"Frame-Based",
+		NULL,
+	};
+	static const char * const avs_start_code[] = {
+		"No Start Code",
+		"Start Code Prefix",
+		NULL,
+	};
 	static const char * const camera_orientation[] = {
 		"Front",
 		"Back",
@@ -746,6 +755,10 @@ const char * const *v4l2_ctrl_get_menu(u32 id)
 		return hevc_decode_mode;
 	case V4L2_CID_STATELESS_HEVC_START_CODE:
 		return hevc_start_code;
+	case V4L2_CID_STATELESS_AVS_DECODE_MODE:
+		return avs_decode_mode;
+	case V4L2_CID_STATELESS_AVS_START_CODE:
+		return avs_start_code;
 	case V4L2_CID_CAMERA_ORIENTATION:
 		return camera_orientation;
 	case V4L2_CID_MPEG_VIDEO_INTRA_REFRESH_PERIOD_TYPE:
@@ -1223,6 +1236,10 @@ const char *v4l2_ctrl_get_name(u32 id)
 	case V4L2_CID_STATELESS_MPEG2_SEQUENCE:			return "MPEG-2 Sequence Header";
 	case V4L2_CID_STATELESS_MPEG2_PICTURE:			return "MPEG-2 Picture Header";
 	case V4L2_CID_STATELESS_MPEG2_QUANTISATION:		return "MPEG-2 Quantisation Matrices";
+	case V4L2_CID_STATELESS_MPEG1_SEQUENCE:		return "MPEG-1 Sequence Header";
+	case V4L2_CID_STATELESS_MPEG1_PICTURE:			return "MPEG-1 Picture Header";
+	case V4L2_CID_STATELESS_MPEG1_QUANTISATION:
+		return "MPEG-1 Quantisation Matrices";
 	case V4L2_CID_STATELESS_VP9_COMPRESSED_HDR:	return "VP9 Probabilities Updates";
 	case V4L2_CID_STATELESS_VP9_FRAME:			return "VP9 Frame Decode Parameters";
 	case V4L2_CID_STATELESS_HEVC_SPS:			return "HEVC Sequence Parameter Set";
@@ -1237,6 +1254,12 @@ const char *v4l2_ctrl_get_name(u32 id)
 	case V4L2_CID_STATELESS_AV1_TILE_GROUP_ENTRY:		return "AV1 Tile Group Entry";
 	case V4L2_CID_STATELESS_AV1_FRAME:			return "AV1 Frame Parameters";
 	case V4L2_CID_STATELESS_AV1_FILM_GRAIN:			return "AV1 Film Grain";
+	case V4L2_CID_STATELESS_AVS_SEQUENCE:			return "AVS Sequence Parameters";
+	case V4L2_CID_STATELESS_AVS_PICTURE:			return "AVS Picture Parameters";
+	case V4L2_CID_STATELESS_AVS_SLICE_PARAMS:		return "AVS Slice Parameters";
+	case V4L2_CID_STATELESS_AVS_DECODE_PARAMS:		return "AVS Decode Parameters";
+	case V4L2_CID_STATELESS_AVS_DECODE_MODE:		return "AVS Decode Mode";
+	case V4L2_CID_STATELESS_AVS_START_CODE:			return "AVS Start Code";
 
 	/* Colorimetry controls */
 	/* Keep the order of the 'case's the same as in v4l2-controls.h! */
@@ -1418,6 +1441,8 @@ void v4l2_ctrl_fill(u32 id, const char **name, enum v4l2_ctrl_type *type,
 	case V4L2_CID_STATELESS_HEVC_START_CODE:
 	case V4L2_CID_STATELESS_H264_DECODE_MODE:
 	case V4L2_CID_STATELESS_H264_START_CODE:
+	case V4L2_CID_STATELESS_AVS_DECODE_MODE:
+	case V4L2_CID_STATELESS_AVS_START_CODE:
 	case V4L2_CID_CAMERA_ORIENTATION:
 	case V4L2_CID_MPEG_VIDEO_INTRA_REFRESH_PERIOD_TYPE:
 	case V4L2_CID_HDR_SENSOR_MODE:
@@ -1534,6 +1559,15 @@ void v4l2_ctrl_fill(u32 id, const char **name, enum v4l2_ctrl_type *type,
 	case V4L2_CID_STATELESS_MPEG2_QUANTISATION:
 		*type = V4L2_CTRL_TYPE_MPEG2_QUANTISATION;
 		break;
+	case V4L2_CID_STATELESS_MPEG1_SEQUENCE:
+		*type = V4L2_CTRL_TYPE_MPEG1_SEQUENCE;
+		break;
+	case V4L2_CID_STATELESS_MPEG1_PICTURE:
+		*type = V4L2_CTRL_TYPE_MPEG1_PICTURE;
+		break;
+	case V4L2_CID_STATELESS_MPEG1_QUANTISATION:
+		*type = V4L2_CTRL_TYPE_MPEG1_QUANTISATION;
+		break;
 	case V4L2_CID_STATELESS_FWHT_PARAMS:
 		*type = V4L2_CTRL_TYPE_FWHT_PARAMS;
 		break;
@@ -1596,6 +1630,19 @@ void v4l2_ctrl_fill(u32 id, const char **name, enum v4l2_ctrl_type *type,
 		break;
 	case V4L2_CID_STATELESS_AV1_FILM_GRAIN:
 		*type = V4L2_CTRL_TYPE_AV1_FILM_GRAIN;
+		break;
+	case V4L2_CID_STATELESS_AVS_SEQUENCE:
+		*type = V4L2_CTRL_TYPE_AVS_SEQUENCE;
+		break;
+	case V4L2_CID_STATELESS_AVS_PICTURE:
+		*type = V4L2_CTRL_TYPE_AVS_PICTURE;
+		break;
+	case V4L2_CID_STATELESS_AVS_SLICE_PARAMS:
+		*type = V4L2_CTRL_TYPE_AVS_SLICE_PARAMS;
+		*flags |= V4L2_CTRL_FLAG_DYNAMIC_ARRAY;
+		break;
+	case V4L2_CID_STATELESS_AVS_DECODE_PARAMS:
+		*type = V4L2_CTRL_TYPE_AVS_DECODE_PARAMS;
 		break;
 	case V4L2_CID_UNIT_CELL_SIZE:
 		*type = V4L2_CTRL_TYPE_AREA;

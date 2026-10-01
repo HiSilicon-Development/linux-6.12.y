@@ -506,9 +506,11 @@ void v4l2_m2m_job_finish(struct v4l2_m2m_dev *m2m_dev,
 }
 EXPORT_SYMBOL(v4l2_m2m_job_finish);
 
-void v4l2_m2m_buf_done_and_job_finish(struct v4l2_m2m_dev *m2m_dev,
-				      struct v4l2_m2m_ctx *m2m_ctx,
-				      enum vb2_buffer_state state)
+void v4l2_m2m_buf_done_and_job_finish_states(
+					struct v4l2_m2m_dev *m2m_dev,
+					struct v4l2_m2m_ctx *m2m_ctx,
+					enum vb2_buffer_state src_state,
+					enum vb2_buffer_state dst_state)
 {
 	struct vb2_v4l2_buffer *src_buf, *dst_buf;
 	bool schedule_next = false;
@@ -523,7 +525,7 @@ void v4l2_m2m_buf_done_and_job_finish(struct v4l2_m2m_dev *m2m_dev,
 	dst_buf->is_held = src_buf->flags & V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF;
 	if (!dst_buf->is_held) {
 		v4l2_m2m_dst_buf_remove(m2m_ctx);
-		v4l2_m2m_buf_done(dst_buf, state);
+		v4l2_m2m_buf_done(dst_buf, dst_state);
 	}
 	/*
 	 * If the request API is being used, returning the OUTPUT
@@ -534,13 +536,22 @@ void v4l2_m2m_buf_done_and_job_finish(struct v4l2_m2m_dev *m2m_dev,
 	 * to avoid signalling the request file descriptor
 	 * before the CAPTURE buffer is done.
 	 */
-	v4l2_m2m_buf_done(src_buf, state);
+	v4l2_m2m_buf_done(src_buf, src_state);
 	schedule_next = _v4l2_m2m_job_finish(m2m_dev, m2m_ctx);
 unlock:
 	spin_unlock_irqrestore(&m2m_dev->job_spinlock, flags);
 
 	if (schedule_next)
 		v4l2_m2m_schedule_next_job(m2m_dev, m2m_ctx);
+}
+EXPORT_SYMBOL(v4l2_m2m_buf_done_and_job_finish_states);
+
+void v4l2_m2m_buf_done_and_job_finish(struct v4l2_m2m_dev *m2m_dev,
+				      struct v4l2_m2m_ctx *m2m_ctx,
+				      enum vb2_buffer_state state)
+{
+	v4l2_m2m_buf_done_and_job_finish_states(m2m_dev, m2m_ctx,
+						       state, state);
 }
 EXPORT_SYMBOL(v4l2_m2m_buf_done_and_job_finish);
 
@@ -1640,4 +1651,3 @@ __poll_t v4l2_m2m_fop_poll(struct file *file, poll_table *wait)
 	return ret;
 }
 EXPORT_SYMBOL_GPL(v4l2_m2m_fop_poll);
-

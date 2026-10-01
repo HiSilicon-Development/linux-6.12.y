@@ -2073,6 +2073,66 @@ struct v4l2_ctrl_mpeg2_quantisation {
 	__u8	chroma_non_intra_quantiser_matrix[64];
 };
 
+/* Stateless MPEG-1 controls */
+
+#define V4L2_CID_STATELESS_MPEG1_SEQUENCE \
+	(V4L2_CID_CODEC_STATELESS_BASE + 223)
+/**
+ * struct v4l2_ctrl_mpeg1_sequence - MPEG-1 sequence header
+ *
+ * @horizontal_size: horizontal_size_value from the sequence header.
+ * @vertical_size: vertical_size_value from the sequence header.
+ * @vbv_buffer_size: vbv_buffer_size_value from the sequence header.
+ */
+struct v4l2_ctrl_mpeg1_sequence {
+	__u16	horizontal_size;
+	__u16	vertical_size;
+	__u32	vbv_buffer_size;
+};
+
+#define V4L2_MPEG1_PIC_CODING_TYPE_I			1
+#define V4L2_MPEG1_PIC_CODING_TYPE_P			2
+#define V4L2_MPEG1_PIC_CODING_TYPE_B			3
+
+#define V4L2_MPEG1_PIC_FLAG_FULL_PEL_FORWARD		0x01
+#define V4L2_MPEG1_PIC_FLAG_FULL_PEL_BACKWARD		0x02
+
+#define V4L2_CID_STATELESS_MPEG1_PICTURE \
+	(V4L2_CID_CODEC_STATELESS_BASE + 224)
+/**
+ * struct v4l2_ctrl_mpeg1_picture - MPEG-1 picture header
+ *
+ * @backward_ref_ts: timestamp of the capture buffer used for backward
+ * prediction.
+ * @forward_ref_ts: timestamp of the capture buffer used for forward
+ * prediction. Timestamps refer to struct v4l2_buffer and are expressed in ns.
+ * @f_code: motion vector f_code values, in forward, backward order.
+ * @picture_coding_type: see V4L2_MPEG1_PIC_CODING_TYPE_{}.
+ * @flags: see V4L2_MPEG1_PIC_FLAG_{}.
+ * @reserved: padding field. Applications must set it to zero.
+ */
+struct v4l2_ctrl_mpeg1_picture {
+	__u64	backward_ref_ts;
+	__u64	forward_ref_ts;
+	__u8	f_code[2];
+	__u8	picture_coding_type;
+	__u8	flags;
+	__u8	reserved[3];
+};
+
+#define V4L2_CID_STATELESS_MPEG1_QUANTISATION \
+	(V4L2_CID_CODEC_STATELESS_BASE + 225)
+/**
+ * struct v4l2_ctrl_mpeg1_quantisation - MPEG-1 quantisation matrices
+ *
+ * @intra_quantiser_matrix: intra matrix in zigzag scanning order.
+ * @non_intra_quantiser_matrix: non-intra matrix in zigzag scanning order.
+ */
+struct v4l2_ctrl_mpeg1_quantisation {
+	__u8	intra_quantiser_matrix[64];
+	__u8	non_intra_quantiser_matrix[64];
+};
+
 #define V4L2_CID_STATELESS_HEVC_SPS		(V4L2_CID_CODEC_STATELESS_BASE + 400)
 #define V4L2_CID_STATELESS_HEVC_PPS		(V4L2_CID_CODEC_STATELESS_BASE + 401)
 #define V4L2_CID_STATELESS_HEVC_SLICE_PARAMS	(V4L2_CID_CODEC_STATELESS_BASE + 402)
@@ -3491,6 +3551,140 @@ struct v4l2_ctrl_av1_film_grain {
 	__u16 cb_offset;
 	__u16 cr_offset;
 	__u8 reserved[4];
+};
+
+/* Stateless AVS/AVS+ controls */
+
+#define V4L2_CID_STATELESS_AVS_SEQUENCE		(V4L2_CID_CODEC_STATELESS_BASE + 600)
+#define V4L2_CID_STATELESS_AVS_PICTURE		(V4L2_CID_CODEC_STATELESS_BASE + 601)
+#define V4L2_CID_STATELESS_AVS_SLICE_PARAMS	(V4L2_CID_CODEC_STATELESS_BASE + 602)
+#define V4L2_CID_STATELESS_AVS_DECODE_PARAMS	(V4L2_CID_CODEC_STATELESS_BASE + 603)
+#define V4L2_CID_STATELESS_AVS_DECODE_MODE	(V4L2_CID_CODEC_STATELESS_BASE + 604)
+#define V4L2_CID_STATELESS_AVS_START_CODE	(V4L2_CID_CODEC_STATELESS_BASE + 605)
+
+enum v4l2_stateless_avs_decode_mode {
+	V4L2_STATELESS_AVS_DECODE_MODE_FRAME_BASED,
+};
+
+enum v4l2_stateless_avs_start_code {
+	V4L2_STATELESS_AVS_START_CODE_NONE,
+	V4L2_STATELESS_AVS_START_CODE_PREFIX,
+};
+
+#define V4L2_AVS_SEQUENCE_FLAG_PROGRESSIVE	(1ULL << 0)
+#define V4L2_AVS_SEQUENCE_FLAG_LOW_DELAY		(1ULL << 1)
+
+/**
+ * struct v4l2_ctrl_avs_sequence - AVS sequence header parameters
+ * @horizontal_size: coded picture width in pixels.
+ * @vertical_size: coded picture height in pixels.
+ * @profile_id: AVS profile identifier.
+ * @level_id: AVS level identifier.
+ * @chroma_format: chroma format syntax element.
+ * @sample_precision: sample precision syntax element.
+ * @aspect_ratio: sample aspect ratio syntax element.
+ * @frame_rate_code: frame rate syntax element.
+ * @reserved: applications and drivers must set this to zero.
+ * @flags: see V4L2_AVS_SEQUENCE_FLAG_{}.
+ */
+struct v4l2_ctrl_avs_sequence {
+	__u16 horizontal_size;
+	__u16 vertical_size;
+	__u8 profile_id;
+	__u8 level_id;
+	__u8 chroma_format;
+	__u8 sample_precision;
+	__u8 aspect_ratio;
+	__u8 frame_rate_code;
+	__u8 reserved[6];
+	__u64 flags;
+};
+
+#define V4L2_AVS_PICTURE_TYPE_I	0
+#define V4L2_AVS_PICTURE_TYPE_P	1
+#define V4L2_AVS_PICTURE_TYPE_B	2
+
+#define V4L2_AVS_PICTURE_STRUCTURE_FIELD	0
+#define V4L2_AVS_PICTURE_STRUCTURE_FRAME	1
+
+#define V4L2_AVS_PICTURE_FLAG_PROGRESSIVE_FRAME		(1U << 0)
+#define V4L2_AVS_PICTURE_FLAG_TOP_FIELD_FIRST		(1U << 1)
+#define V4L2_AVS_PICTURE_FLAG_REPEAT_FIRST_FIELD		(1U << 2)
+#define V4L2_AVS_PICTURE_FLAG_FIXED_QP			(1U << 3)
+#define V4L2_AVS_PICTURE_FLAG_SKIP_MODE			(1U << 4)
+#define V4L2_AVS_PICTURE_FLAG_LOOP_FILTER_DISABLE	(1U << 5)
+#define V4L2_AVS_PICTURE_FLAG_LOOP_FILTER_PARAMS		(1U << 6)
+#define V4L2_AVS_PICTURE_FLAG_REFERENCE			(1U << 7)
+#define V4L2_AVS_PICTURE_FLAG_NO_FORWARD_REFERENCE	(1U << 8)
+#define V4L2_AVS_PICTURE_FLAG_ADVANCED_PRED_DISABLE	(1U << 9)
+#define V4L2_AVS_PICTURE_FLAG_WEIGHTING_QUANT		(1U << 10)
+#define V4L2_AVS_PICTURE_FLAG_CHROMA_QP_DISABLE		(1U << 11)
+#define V4L2_AVS_PICTURE_FLAG_AEC			(1U << 12)
+#define V4L2_AVS_PICTURE_FLAG_P_FIELD_ENHANCED		(1U << 13)
+#define V4L2_AVS_PICTURE_FLAG_B_FIELD_ENHANCED		(1U << 14)
+
+/**
+ * struct v4l2_ctrl_avs_picture - AVS/AVS+ picture header parameters
+ * @flags: see V4L2_AVS_PICTURE_FLAG_{}.
+ * @bbv_delay: bit buffer verifier delay.
+ * @picture_distance: picture distance syntax element.
+ * @picture_coding_type: one of V4L2_AVS_PICTURE_TYPE_{}.
+ * @picture_structure: one of V4L2_AVS_PICTURE_STRUCTURE_{}.
+ * @picture_qp: picture quantisation parameter.
+ * @alpha_c_offset: loop filter alpha offset.
+ * @beta_offset: loop filter beta offset.
+ * @chroma_qp_delta_u: U component quantisation parameter delta.
+ * @chroma_qp_delta_v: V component quantisation parameter delta.
+ * @reserved: applications and drivers must set this to zero.
+ * @weighting_quant_matrix: active 8x8 weighting matrix in raster order.
+ */
+struct v4l2_ctrl_avs_picture {
+	__u32 flags;
+	__u32 bbv_delay;
+	__u32 picture_distance;
+	__u8 picture_coding_type;
+	__u8 picture_structure;
+	__u8 picture_qp;
+	__s8 alpha_c_offset;
+	__s8 beta_offset;
+	__s8 chroma_qp_delta_u;
+	__s8 chroma_qp_delta_v;
+	__u8 reserved[9];
+	__u16 weighting_quant_matrix[64];
+};
+
+/**
+ * struct v4l2_ctrl_avs_slice_params - AVS coded slice parameters
+ * @bit_size: size in bits of the coded slice, as selected by the start-code
+ *	control.
+ * @data_byte_offset: offset in the OUTPUT buffer to the representation
+ *	selected by the start-code control.
+ * @slice_start_mb: address of the first macroblock in raster order.
+ * @reserved: applications and drivers must set this to zero.
+ */
+struct v4l2_ctrl_avs_slice_params {
+	__u32 bit_size;
+	__u32 data_byte_offset;
+	__u32 slice_start_mb;
+	__u32 reserved;
+};
+
+#define V4L2_AVS_DECODE_PARAM_FLAG_BACKWARD_REF	(1U << 0)
+#define V4L2_AVS_DECODE_PARAM_FLAG_FORWARD_REF0	(1U << 1)
+#define V4L2_AVS_DECODE_PARAM_FLAG_FORWARD_REF1	(1U << 2)
+
+/**
+ * struct v4l2_ctrl_avs_decode_params - AVS reference picture parameters
+ * @backward_ref_ts: timestamp of the backward reference capture buffer.
+ * @forward_ref_ts: timestamps of the two forward reference capture buffers.
+ * @flags: see V4L2_AVS_DECODE_PARAM_FLAG_{}.
+ * @reserved: applications and drivers must set this to zero.
+ */
+struct v4l2_ctrl_avs_decode_params {
+	__u64 backward_ref_ts;
+	__u64 forward_ref_ts[2];
+	__u32 flags;
+	__u32 reserved;
 };
 
 /* MPEG-compression definitions kept for backwards compatibility */

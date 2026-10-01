@@ -101,12 +101,26 @@ static const u8 mpeg2_intra_quant_matrix[64] = {
 	46, 46, 56, 56, 58, 69, 69, 83
 };
 
+/* Default MPEG-1 intra quantisation coefficients, in bitstream order. */
+static const u8 mpeg1_intra_quant_matrix[64] = {
+	8,  16, 16, 19, 16, 19, 22, 22,
+	22, 22, 22, 22, 26, 24, 26, 27,
+	27, 27, 26, 26, 26, 26, 27, 27,
+	27, 29, 29, 29, 34, 34, 34, 29,
+	29, 29, 27, 27, 29, 29, 32, 32,
+	34, 34, 37, 38, 37, 35, 35, 34,
+	35, 38, 38, 40, 40, 40, 48, 48,
+	46, 46, 56, 56, 58, 69, 69, 83
+};
+
 static void std_init_compound(const struct v4l2_ctrl *ctrl, u32 idx,
 			      union v4l2_ctrl_ptr ptr)
 {
 	struct v4l2_ctrl_mpeg2_sequence *p_mpeg2_sequence;
 	struct v4l2_ctrl_mpeg2_picture *p_mpeg2_picture;
 	struct v4l2_ctrl_mpeg2_quantisation *p_mpeg2_quant;
+	struct v4l2_ctrl_mpeg1_picture *p_mpeg1_picture;
+	struct v4l2_ctrl_mpeg1_quantisation *p_mpeg1_quant;
 	struct v4l2_ctrl_vp8_frame *p_vp8_frame;
 	struct v4l2_ctrl_vp9_frame *p_vp9_frame;
 	struct v4l2_ctrl_fwht_params *p_fwht_params;
@@ -146,6 +160,21 @@ static void std_init_compound(const struct v4l2_ctrl *ctrl, u32 idx,
 		 */
 		memset(p_mpeg2_quant->non_intra_quantiser_matrix, 16,
 		       sizeof(p_mpeg2_quant->non_intra_quantiser_matrix));
+		break;
+	case V4L2_CTRL_TYPE_MPEG1_PICTURE:
+		p_mpeg1_picture = p;
+		p_mpeg1_picture->picture_coding_type =
+			V4L2_MPEG1_PIC_CODING_TYPE_I;
+		p_mpeg1_picture->f_code[0] = 1;
+		p_mpeg1_picture->f_code[1] = 1;
+		break;
+	case V4L2_CTRL_TYPE_MPEG1_QUANTISATION:
+		p_mpeg1_quant = p;
+		memcpy(p_mpeg1_quant->intra_quantiser_matrix,
+		       mpeg1_intra_quant_matrix,
+		       ARRAY_SIZE(mpeg1_intra_quant_matrix));
+		memset(p_mpeg1_quant->non_intra_quantiser_matrix, 16,
+		       sizeof(p_mpeg1_quant->non_intra_quantiser_matrix));
 		break;
 	case V4L2_CTRL_TYPE_VP8_FRAME:
 		p_vp8_frame = p;
@@ -331,6 +360,15 @@ void v4l2_ctrl_type_op_log(const struct v4l2_ctrl *ctrl)
 	case V4L2_CTRL_TYPE_MPEG2_QUANTISATION:
 		pr_cont("MPEG2_QUANTISATION");
 		break;
+	case V4L2_CTRL_TYPE_MPEG1_SEQUENCE:
+		pr_cont("MPEG1_SEQUENCE");
+		break;
+	case V4L2_CTRL_TYPE_MPEG1_PICTURE:
+		pr_cont("MPEG1_PICTURE");
+		break;
+	case V4L2_CTRL_TYPE_MPEG1_QUANTISATION:
+		pr_cont("MPEG1_QUANTISATION");
+		break;
 	case V4L2_CTRL_TYPE_MPEG2_SEQUENCE:
 		pr_cont("MPEG2_SEQUENCE");
 		break;
@@ -369,6 +407,18 @@ void v4l2_ctrl_type_op_log(const struct v4l2_ctrl *ctrl)
 		break;
 	case V4L2_CTRL_TYPE_AV1_FILM_GRAIN:
 		pr_cont("AV1_FILM_GRAIN");
+		break;
+	case V4L2_CTRL_TYPE_AVS_SEQUENCE:
+		pr_cont("AVS_SEQUENCE");
+		break;
+	case V4L2_CTRL_TYPE_AVS_PICTURE:
+		pr_cont("AVS_PICTURE");
+		break;
+	case V4L2_CTRL_TYPE_AVS_SLICE_PARAMS:
+		pr_cont("AVS_SLICE_PARAMS");
+		break;
+	case V4L2_CTRL_TYPE_AVS_DECODE_PARAMS:
+		pr_cont("AVS_DECODE_PARAMS");
 		break;
 
 	default:
@@ -823,6 +873,7 @@ static int std_validate_compound(const struct v4l2_ctrl *ctrl, u32 idx,
 {
 	struct v4l2_ctrl_mpeg2_sequence *p_mpeg2_sequence;
 	struct v4l2_ctrl_mpeg2_picture *p_mpeg2_picture;
+	struct v4l2_ctrl_mpeg1_picture *p_mpeg1_picture;
 	struct v4l2_ctrl_vp8_frame *p_vp8_frame;
 	struct v4l2_ctrl_fwht_params *p_fwht_params;
 	struct v4l2_ctrl_h264_sps *p_h264_sps;
@@ -835,6 +886,10 @@ static int std_validate_compound(const struct v4l2_ctrl *ctrl, u32 idx,
 	struct v4l2_ctrl_hevc_slice_params *p_hevc_slice_params;
 	struct v4l2_ctrl_hdr10_mastering_display *p_hdr10_mastering;
 	struct v4l2_ctrl_hevc_decode_params *p_hevc_decode_params;
+	struct v4l2_ctrl_avs_sequence *p_avs_sequence;
+	struct v4l2_ctrl_avs_picture *p_avs_picture;
+	struct v4l2_ctrl_avs_slice_params *p_avs_slice_params;
+	struct v4l2_ctrl_avs_decode_params *p_avs_decode_params;
 	struct v4l2_area *area;
 	void *p = ptr.p + idx * ctrl->elem_size;
 	unsigned int i;
@@ -887,6 +942,29 @@ static int std_validate_compound(const struct v4l2_ctrl *ctrl, u32 idx,
 		break;
 
 	case V4L2_CTRL_TYPE_MPEG2_QUANTISATION:
+		break;
+
+	case V4L2_CTRL_TYPE_MPEG1_SEQUENCE:
+		break;
+
+	case V4L2_CTRL_TYPE_MPEG1_PICTURE:
+		p_mpeg1_picture = p;
+		if (p_mpeg1_picture->picture_coding_type <
+				V4L2_MPEG1_PIC_CODING_TYPE_I ||
+		    p_mpeg1_picture->picture_coding_type >
+				V4L2_MPEG1_PIC_CODING_TYPE_B ||
+		    p_mpeg1_picture->flags &
+				~(V4L2_MPEG1_PIC_FLAG_FULL_PEL_FORWARD |
+				  V4L2_MPEG1_PIC_FLAG_FULL_PEL_BACKWARD) ||
+		    !p_mpeg1_picture->f_code[0] ||
+		    p_mpeg1_picture->f_code[0] > 7 ||
+		    !p_mpeg1_picture->f_code[1] ||
+		    p_mpeg1_picture->f_code[1] > 7)
+			return -EINVAL;
+		zero_reserved(*p_mpeg1_picture);
+		break;
+
+	case V4L2_CTRL_TYPE_MPEG1_QUANTISATION:
 		break;
 
 	case V4L2_CTRL_TYPE_FWHT_PARAMS:
@@ -1212,6 +1290,94 @@ static int std_validate_compound(const struct v4l2_ctrl *ctrl, u32 idx,
 		break;
 
 	case V4L2_CTRL_TYPE_HEVC_SCALING_MATRIX:
+		break;
+
+	case V4L2_CTRL_TYPE_AVS_SEQUENCE:
+		p_avs_sequence = p;
+		if (!p_avs_sequence->horizontal_size ||
+		    !p_avs_sequence->vertical_size ||
+		    p_avs_sequence->horizontal_size > GENMASK(13, 0) ||
+		    p_avs_sequence->vertical_size > GENMASK(13, 0) ||
+		    p_avs_sequence->chroma_format > 3 ||
+		    p_avs_sequence->sample_precision > 7 ||
+		    p_avs_sequence->aspect_ratio > GENMASK(3, 0) ||
+		    p_avs_sequence->frame_rate_code > GENMASK(3, 0) ||
+		    p_avs_sequence->profile_id == 0)
+			return -EINVAL;
+		if (p_avs_sequence->flags & ~(V4L2_AVS_SEQUENCE_FLAG_PROGRESSIVE |
+						      V4L2_AVS_SEQUENCE_FLAG_LOW_DELAY))
+			return -EINVAL;
+		zero_reserved(*p_avs_sequence);
+		break;
+
+	case V4L2_CTRL_TYPE_AVS_PICTURE:
+		p_avs_picture = p;
+		if (p_avs_picture->picture_coding_type > V4L2_AVS_PICTURE_TYPE_B ||
+		    p_avs_picture->picture_structure > V4L2_AVS_PICTURE_STRUCTURE_FRAME ||
+		    p_avs_picture->bbv_delay > GENMASK(22, 0) ||
+		    p_avs_picture->picture_distance > 0xff ||
+		    p_avs_picture->picture_qp > 63 ||
+		    p_avs_picture->alpha_c_offset < -16 ||
+		    p_avs_picture->alpha_c_offset > 15 ||
+		    p_avs_picture->beta_offset < -16 ||
+		    p_avs_picture->beta_offset > 15 ||
+		    p_avs_picture->chroma_qp_delta_u < -32 ||
+		    p_avs_picture->chroma_qp_delta_u > 31 ||
+		    p_avs_picture->chroma_qp_delta_v < -32 ||
+		    p_avs_picture->chroma_qp_delta_v > 31)
+			return -EINVAL;
+		if (p_avs_picture->flags & ~(V4L2_AVS_PICTURE_FLAG_PROGRESSIVE_FRAME |
+				V4L2_AVS_PICTURE_FLAG_TOP_FIELD_FIRST |
+				V4L2_AVS_PICTURE_FLAG_REPEAT_FIRST_FIELD |
+				V4L2_AVS_PICTURE_FLAG_FIXED_QP |
+				V4L2_AVS_PICTURE_FLAG_SKIP_MODE |
+				V4L2_AVS_PICTURE_FLAG_LOOP_FILTER_DISABLE |
+				V4L2_AVS_PICTURE_FLAG_LOOP_FILTER_PARAMS |
+				V4L2_AVS_PICTURE_FLAG_REFERENCE |
+				V4L2_AVS_PICTURE_FLAG_NO_FORWARD_REFERENCE |
+				V4L2_AVS_PICTURE_FLAG_ADVANCED_PRED_DISABLE |
+				V4L2_AVS_PICTURE_FLAG_WEIGHTING_QUANT |
+				V4L2_AVS_PICTURE_FLAG_CHROMA_QP_DISABLE |
+				V4L2_AVS_PICTURE_FLAG_AEC |
+				V4L2_AVS_PICTURE_FLAG_P_FIELD_ENHANCED |
+				V4L2_AVS_PICTURE_FLAG_B_FIELD_ENHANCED))
+			return -EINVAL;
+		if (!(p_avs_picture->flags &
+		      V4L2_AVS_PICTURE_FLAG_LOOP_FILTER_PARAMS) &&
+		    (p_avs_picture->alpha_c_offset ||
+		     p_avs_picture->beta_offset))
+			return -EINVAL;
+		if ((p_avs_picture->flags &
+		     V4L2_AVS_PICTURE_FLAG_CHROMA_QP_DISABLE) &&
+		    (p_avs_picture->chroma_qp_delta_u ||
+		     p_avs_picture->chroma_qp_delta_v))
+			return -EINVAL;
+		for (i = 0; i < ARRAY_SIZE(p_avs_picture->weighting_quant_matrix);
+		     i++)
+			if ((p_avs_picture->flags &
+			     V4L2_AVS_PICTURE_FLAG_WEIGHTING_QUANT) ?
+			    p_avs_picture->weighting_quant_matrix[i] > 255 :
+			    p_avs_picture->weighting_quant_matrix[i])
+				return -EINVAL;
+		zero_reserved(*p_avs_picture);
+		break;
+
+	case V4L2_CTRL_TYPE_AVS_SLICE_PARAMS:
+		p_avs_slice_params = p;
+		if (p_avs_slice_params->bit_size < 32 ||
+		    p_avs_slice_params->bit_size & 7)
+			return -EINVAL;
+		p_avs_slice_params->reserved = 0;
+		break;
+
+	case V4L2_CTRL_TYPE_AVS_DECODE_PARAMS:
+		p_avs_decode_params = p;
+		if (p_avs_decode_params->flags & ~(
+				V4L2_AVS_DECODE_PARAM_FLAG_BACKWARD_REF |
+				V4L2_AVS_DECODE_PARAM_FLAG_FORWARD_REF0 |
+				V4L2_AVS_DECODE_PARAM_FLAG_FORWARD_REF1))
+			return -EINVAL;
+		p_avs_decode_params->reserved = 0;
 		break;
 
 	case V4L2_CTRL_TYPE_VP9_COMPRESSED_HDR:
@@ -1867,6 +2033,15 @@ static struct v4l2_ctrl *v4l2_ctrl_new(struct v4l2_ctrl_handler *hdl,
 	case V4L2_CTRL_TYPE_MPEG2_QUANTISATION:
 		elem_size = sizeof(struct v4l2_ctrl_mpeg2_quantisation);
 		break;
+	case V4L2_CTRL_TYPE_MPEG1_SEQUENCE:
+		elem_size = sizeof(struct v4l2_ctrl_mpeg1_sequence);
+		break;
+	case V4L2_CTRL_TYPE_MPEG1_PICTURE:
+		elem_size = sizeof(struct v4l2_ctrl_mpeg1_picture);
+		break;
+	case V4L2_CTRL_TYPE_MPEG1_QUANTISATION:
+		elem_size = sizeof(struct v4l2_ctrl_mpeg1_quantisation);
+		break;
 	case V4L2_CTRL_TYPE_FWHT_PARAMS:
 		elem_size = sizeof(struct v4l2_ctrl_fwht_params);
 		break;
@@ -1929,6 +2104,18 @@ static struct v4l2_ctrl *v4l2_ctrl_new(struct v4l2_ctrl_handler *hdl,
 		break;
 	case V4L2_CTRL_TYPE_AV1_FILM_GRAIN:
 		elem_size = sizeof(struct v4l2_ctrl_av1_film_grain);
+		break;
+	case V4L2_CTRL_TYPE_AVS_SEQUENCE:
+		elem_size = sizeof(struct v4l2_ctrl_avs_sequence);
+		break;
+	case V4L2_CTRL_TYPE_AVS_PICTURE:
+		elem_size = sizeof(struct v4l2_ctrl_avs_picture);
+		break;
+	case V4L2_CTRL_TYPE_AVS_SLICE_PARAMS:
+		elem_size = sizeof(struct v4l2_ctrl_avs_slice_params);
+		break;
+	case V4L2_CTRL_TYPE_AVS_DECODE_PARAMS:
+		elem_size = sizeof(struct v4l2_ctrl_avs_decode_params);
 		break;
 	case V4L2_CTRL_TYPE_AREA:
 		elem_size = sizeof(struct v4l2_area);

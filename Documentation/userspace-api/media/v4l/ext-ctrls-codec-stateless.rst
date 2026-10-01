@@ -1257,6 +1257,71 @@ FWHT Flags
       - ``padding[3]``
       - Applications and drivers must set this to zero.
 
+.. _v4l2-codec-stateless-mpeg1:
+
+``V4L2_CID_STATELESS_MPEG1_SEQUENCE (struct)``
+    Specifies the sequence header for the associated progressive 4:2:0 MPEG-1
+    slice data.
+
+.. c:type:: v4l2_ctrl_mpeg1_sequence
+
+.. flat-table:: struct v4l2_ctrl_mpeg1_sequence
+    :header-rows: 0
+
+    * - __u16
+      - ``horizontal_size``
+      - Displayable luminance width from the sequence header.
+    * - __u16
+      - ``vertical_size``
+      - Displayable luminance height from the sequence header.
+    * - __u32
+      - ``vbv_buffer_size``
+      - ``vbv_buffer_size_value`` from the sequence header.
+
+``V4L2_CID_STATELESS_MPEG1_PICTURE (struct)``
+    Supplies the picture-header reference timestamps, f_code values, coding
+    type, and full-pel motion-vector flags for the associated MPEG-1 slices.
+
+.. c:type:: v4l2_ctrl_mpeg1_picture
+
+.. flat-table:: struct v4l2_ctrl_mpeg1_picture
+    :header-rows: 0
+
+    * - __u64
+      - ``backward_ref_ts``
+      - Backward prediction reference timestamp for B pictures.
+    * - __u64
+      - ``forward_ref_ts``
+      - Forward prediction reference timestamp for P and B pictures.
+    * - __u8
+      - ``f_code[2]``
+      - Motion-vector f_code values in forward, backward order.
+    * - __u8
+      - ``picture_coding_type``
+      - I, P or B picture coding type.
+    * - __u8
+      - ``flags``
+      - Forward/backward full-pel flags.
+    * - __u8
+      - ``reserved[3]``
+      - Must be zero.
+
+``V4L2_CID_STATELESS_MPEG1_QUANTISATION (struct)``
+    Supplies the MPEG-1 intra and non-intra quantisation matrices in zigzag
+    scanning order.
+
+.. c:type:: v4l2_ctrl_mpeg1_quantisation
+
+.. flat-table:: struct v4l2_ctrl_mpeg1_quantisation
+    :header-rows: 0
+
+    * - __u8
+      - ``intra_quantiser_matrix[64]``
+      - Intra matrix in zigzag scanning order.
+    * - __u8
+      - ``non_intra_quantiser_matrix[64]``
+      - Non-intra matrix in zigzag scanning order.
+
 .. _v4l2-codec-stateless-mpeg2:
 
 ``V4L2_CID_STATELESS_MPEG2_SEQUENCE (struct)``
@@ -2957,6 +3022,277 @@ This structure contains all loop filter related parameters. See sections
     * - ``V4L2_HEVC_DECODE_PARAM_FLAG_NO_OUTPUT_OF_PRIOR``
       - 0x00000004
       -
+
+.. _v4l2-codec-stateless-avs:
+
+Stateless AVS/AVS+ Control Reference
+------------------------------------
+
+The controls in this section describe one AVS or AVS+ picture. They are
+intended to be used with the :ref:`V4L2_PIX_FMT_AVS_SLICE
+<V4L2-PIX-FMT-AVS-SLICE>` pixel format and the :ref:`media-request-api`.
+Profile identifier ``0x20`` selects the JiZhun profile and ``0x48`` selects
+the Guangdian AVS+ profile. AVS2 is a different codec and is not described by
+these controls.
+
+``V4L2_CID_STATELESS_AVS_SEQUENCE (struct)``
+    Specifies the sequence-header parameters that apply to the picture.
+
+.. c:type:: v4l2_ctrl_avs_sequence
+
+.. flat-table:: struct v4l2_ctrl_avs_sequence
+    :header-rows:  0
+    :stub-columns: 0
+    :widths:       1 1 2
+
+    * - __u16
+      - ``horizontal_size``
+      - Coded picture width in pixels.
+    * - __u16
+      - ``vertical_size``
+      - Coded picture height in pixels.
+    * - __u8
+      - ``profile_id``
+      - Profile identifier from the sequence header.
+    * - __u8
+      - ``level_id``
+      - Level identifier from the sequence header.
+    * - __u8
+      - ``chroma_format``
+      - Chroma-format syntax element.
+    * - __u8
+      - ``sample_precision``
+      - Sample-precision syntax element.
+    * - __u8
+      - ``aspect_ratio``
+      - Aspect-ratio syntax element.
+    * - __u8
+      - ``frame_rate_code``
+      - Frame-rate syntax element.
+    * - __u8
+      - ``reserved[6]``
+      - Applications and drivers must set this to zero.
+    * - __u64
+      - ``flags``
+      - A bitwise combination of ``V4L2_AVS_SEQUENCE_FLAG_PROGRESSIVE`` and
+        ``V4L2_AVS_SEQUENCE_FLAG_LOW_DELAY``.
+
+.. flat-table:: AVS sequence flags
+    :header-rows:  0
+    :stub-columns: 0
+    :widths:       1 1 2
+
+    * - ``V4L2_AVS_SEQUENCE_FLAG_PROGRESSIVE``
+      - 0x0000000000000001
+      - The sequence contains progressive pictures.
+    * - ``V4L2_AVS_SEQUENCE_FLAG_LOW_DELAY``
+      - 0x0000000000000002
+      - The sequence uses low-delay coding.
+
+``V4L2_CID_STATELESS_AVS_PICTURE (struct)``
+    Specifies picture-header and AVS+ weighting-quantisation parameters.
+
+.. c:type:: v4l2_ctrl_avs_picture
+
+.. flat-table:: struct v4l2_ctrl_avs_picture
+    :header-rows:  0
+    :stub-columns: 0
+    :widths:       1 1 2
+
+    * - __u32
+      - ``flags``
+      - A bitwise combination of the ``V4L2_AVS_PICTURE_FLAG_*`` values.
+    * - __u32
+      - ``bbv_delay``
+      - Bit-buffer-verifier delay from the picture header.
+    * - __u32
+      - ``picture_distance``
+      - Picture-distance syntax element.
+    * - __u8
+      - ``picture_coding_type``
+      - One of ``V4L2_AVS_PICTURE_TYPE_I``,
+        ``V4L2_AVS_PICTURE_TYPE_P`` or ``V4L2_AVS_PICTURE_TYPE_B``.
+    * - __u8
+      - ``picture_structure``
+      - One of ``V4L2_AVS_PICTURE_STRUCTURE_FIELD`` or
+        ``V4L2_AVS_PICTURE_STRUCTURE_FRAME``.
+    * - __u8
+      - ``picture_qp``
+      - Picture quantisation parameter.
+    * - __s8
+      - ``alpha_c_offset``
+      - Loop-filter alpha offset from the picture header.
+    * - __s8
+      - ``beta_offset``
+      - Loop-filter beta offset from the picture header.
+    * - __s8
+      - ``chroma_qp_delta_u``
+      - U-component chroma QP delta.
+    * - __s8
+      - ``chroma_qp_delta_v``
+      - V-component chroma QP delta.
+    * - __u8
+      - ``reserved[9]``
+      - Applications and drivers must set this to zero.
+    * - __u16
+      - ``weighting_quant_matrix[64]``
+      - Resolved 8 by 8 weighting matrix in raster order. Userspace performs
+        the profile-specific parameter-model expansion. This field is used
+        when ``V4L2_AVS_PICTURE_FLAG_WEIGHTING_QUANT`` is set.
+
+.. flat-table:: AVS picture flags
+    :header-rows:  0
+    :stub-columns: 0
+    :widths:       1 1 2
+
+    * - ``V4L2_AVS_PICTURE_FLAG_PROGRESSIVE_FRAME``
+      - 0x00000001
+      - Carries the ``progressive_frame`` syntax element.
+    * - ``V4L2_AVS_PICTURE_FLAG_TOP_FIELD_FIRST``
+      - 0x00000002
+      - Carries the ``top_field_first`` syntax element.
+    * - ``V4L2_AVS_PICTURE_FLAG_REPEAT_FIRST_FIELD``
+      - 0x00000004
+      - Carries the ``repeat_first_field`` syntax element.
+    * - ``V4L2_AVS_PICTURE_FLAG_FIXED_QP``
+      - 0x00000008
+      - The picture uses a fixed quantisation parameter.
+    * - ``V4L2_AVS_PICTURE_FLAG_SKIP_MODE``
+      - 0x00000010
+      - Carries the ``skip_mode_flag`` syntax element.
+    * - ``V4L2_AVS_PICTURE_FLAG_LOOP_FILTER_DISABLE``
+      - 0x00000020
+      - The in-loop filter is disabled for this picture.
+    * - ``V4L2_AVS_PICTURE_FLAG_LOOP_FILTER_PARAMS``
+      - 0x00000040
+      - The picture header supplies loop-filter alpha and beta offsets.
+    * - ``V4L2_AVS_PICTURE_FLAG_REFERENCE``
+      - 0x00000080
+      - Carries the ``picture_reference_flag`` syntax element. This is not a
+        V4L2 capture-buffer lifetime flag; I and P pictures may be supplied as
+        references through the decode-parameter control.
+    * - ``V4L2_AVS_PICTURE_FLAG_NO_FORWARD_REFERENCE``
+      - 0x00000100
+      - Carries the ``no_forward_reference_flag`` syntax element.
+    * - ``V4L2_AVS_PICTURE_FLAG_ADVANCED_PRED_DISABLE``
+      - 0x00000200
+      - Advanced prediction is disabled.
+    * - ``V4L2_AVS_PICTURE_FLAG_WEIGHTING_QUANT``
+      - 0x00000400
+      - Weighting quantisation is enabled and
+        ``weighting_quant_matrix`` is valid.
+    * - ``V4L2_AVS_PICTURE_FLAG_CHROMA_QP_DISABLE``
+      - 0x00000800
+      - Chroma QP adjustment is disabled.
+    * - ``V4L2_AVS_PICTURE_FLAG_AEC``
+      - 0x00001000
+      - Arithmetic entropy coding is enabled.
+    * - ``V4L2_AVS_PICTURE_FLAG_P_FIELD_ENHANCED``
+      - 0x00002000
+      - Carries the AVS+ P-field enhancement syntax element.
+    * - ``V4L2_AVS_PICTURE_FLAG_B_FIELD_ENHANCED``
+      - 0x00004000
+      - Carries the AVS+ B-field enhancement syntax element.
+
+The signed loop-filter offsets and chroma QP deltas retain their bitstream
+values. A field picture represents one coded picture containing both fields
+and is submitted as one request; applications must not submit separate
+top-field and bottom-field requests.
+
+``V4L2_CID_STATELESS_AVS_SLICE_PARAMS (struct)``
+    Dynamic array containing one entry for every slice in the OUTPUT buffer.
+
+.. c:type:: v4l2_ctrl_avs_slice_params
+
+.. flat-table:: struct v4l2_ctrl_avs_slice_params
+    :header-rows:  0
+    :stub-columns: 0
+    :widths:       1 1 2
+
+    * - __u32
+      - ``bit_size``
+      - Byte-aligned slice size in bits. Whether it includes the four-byte
+        ``00 00 01 xx`` start code is selected by
+        ``V4L2_CID_STATELESS_AVS_START_CODE``.
+    * - __u32
+      - ``data_byte_offset``
+      - Offset of the representation selected by
+        ``V4L2_CID_STATELESS_AVS_START_CODE`` in the OUTPUT buffer.
+    * - __u32
+      - ``slice_start_mb``
+      - Raster-order address of the first macroblock in the slice.
+    * - __u32
+      - ``reserved``
+      - Applications and drivers must set this to zero.
+
+``V4L2_CID_STATELESS_AVS_DECODE_PARAMS (struct)``
+    Specifies the capture-buffer timestamps used for reference pictures.
+
+.. c:type:: v4l2_ctrl_avs_decode_params
+
+.. flat-table:: struct v4l2_ctrl_avs_decode_params
+    :header-rows:  0
+    :stub-columns: 0
+    :widths:       1 1 2
+
+    * - __u64
+      - ``backward_ref_ts``
+      - Timestamp of the backward reference capture buffer. Used when
+        ``V4L2_AVS_DECODE_PARAM_FLAG_BACKWARD_REF`` is set.
+    * - __u64
+      - ``forward_ref_ts[2]``
+      - Timestamps of forward reference capture buffers 0 and 1. Each entry
+        is used when its matching ``V4L2_AVS_DECODE_PARAM_FLAG_FORWARD_REF*``
+        flag is set.
+    * - __u32
+      - ``flags``
+      - A bitwise combination of the ``V4L2_AVS_DECODE_PARAM_FLAG_*`` values.
+    * - __u32
+      - ``reserved``
+      - Applications and drivers must set this to zero.
+
+.. flat-table:: AVS decode-parameter flags
+    :header-rows:  0
+    :stub-columns: 0
+    :widths:       1 1 2
+
+    * - ``V4L2_AVS_DECODE_PARAM_FLAG_BACKWARD_REF``
+      - 0x00000001
+      - ``backward_ref_ts`` identifies a valid reference buffer.
+    * - ``V4L2_AVS_DECODE_PARAM_FLAG_FORWARD_REF0``
+      - 0x00000002
+      - ``forward_ref_ts[0]`` identifies a valid reference buffer.
+    * - ``V4L2_AVS_DECODE_PARAM_FLAG_FORWARD_REF1``
+      - 0x00000004
+      - ``forward_ref_ts[1]`` identifies a valid reference buffer.
+
+A timestamp is copied from the matching reference CAPTURE buffer's
+``v4l2_buffer.timestamp`` field and converted with
+``v4l2_timeval_to_ns()``. I pictures use no references. P pictures require
+forward reference 0 and may additionally use forward reference 1. B pictures
+require the backward reference and forward reference 0, and may additionally
+use forward reference 1.
+
+``V4L2_CID_STATELESS_AVS_DECODE_MODE (enum)``
+    Specifies how pictures are submitted with ``V4L2_PIX_FMT_AVS_SLICE``.
+    ``V4L2_STATELESS_AVS_DECODE_MODE_FRAME_BASED`` requires one OUTPUT buffer
+    to contain all slices for one picture.
+
+.. c:type:: v4l2_stateless_avs_decode_mode
+
+``V4L2_CID_STATELESS_AVS_START_CODE (enum)``
+    Specifies how each slice is stored in the OUTPUT buffer.
+    ``V4L2_STATELESS_AVS_START_CODE_NONE`` makes ``data_byte_offset`` point to
+    the first coded byte after the start code and excludes the start code from
+    ``bit_size``. ``V4L2_STATELESS_AVS_START_CODE_PREFIX`` requires every
+    slice to begin with ``00 00 01`` followed by its slice start-code byte;
+    ``bit_size`` and ``data_byte_offset`` include that four-byte prefix.
+    Drivers may expose only the representation supported by their hardware.
+    The HiSilicon Hi3798CV200 driver exposes the prefix representation and
+    accepts both frame and field pictures. An AVS field picture remains one
+    coded picture and one VDH transaction.
+
+.. c:type:: v4l2_stateless_avs_start_code
 
 .. _v4l2-codec-stateless-av1:
 

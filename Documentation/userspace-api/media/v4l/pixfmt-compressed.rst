@@ -128,6 +128,15 @@ Compressed Formats
 	this pixel format. The output buffer must contain the appropriate number
 	of macroblocks to decode a full corresponding frame to the matching
 	capture buffer.
+    * .. _V4L2-PIX-FMT-MPEG1-SLICE:
+
+      - ``V4L2_PIX_FMT_MPEG1_SLICE``
+      - 'MG1S'
+      - MPEG-1 parsed slice data for a :ref:`stateless_decoder`. Metadata is
+	passed through ``V4L2_CID_STATELESS_MPEG1_SEQUENCE`` and
+	``V4L2_CID_STATELESS_MPEG1_PICTURE``; quantisation matrices use
+	``V4L2_CID_STATELESS_MPEG1_QUANTISATION``. See the :ref:`associated Codec
+	Control IDs <v4l2-codec-stateless-mpeg1>`.
     * .. _V4L2-PIX-FMT-MPEG4:
 
       - ``V4L2_PIX_FMT_MPEG4``
@@ -220,6 +229,22 @@ Compressed Formats
 	See the :ref:`associated Codec Control IDs <v4l2-codec-stateless-hevc>`.
 	Buffers associated with this pixel format must contain the appropriate
 	number of macroblocks to decode a full corresponding frame.
+    * .. _V4L2-PIX-FMT-AVS-SLICE:
+
+      - ``V4L2_PIX_FMT_AVS_SLICE``
+      - 'SAVS'
+      - AVS/AVS+ parsed slice data, as extracted from an AVS elementary
+	stream. This format is intended for stateless video decoders using the
+	:ref:`media-request-api`. Exactly one output and one capture buffer must
+	be provided for each decoded picture. Sequence, picture, slice and
+	reference metadata are supplied through
+	``V4L2_CID_STATELESS_AVS_SEQUENCE``,
+	``V4L2_CID_STATELESS_AVS_PICTURE``,
+	``V4L2_CID_STATELESS_AVS_SLICE_PARAMS`` and
+	``V4L2_CID_STATELESS_AVS_DECODE_PARAMS``. Applications must also set
+	``V4L2_CID_STATELESS_AVS_DECODE_MODE`` and
+	``V4L2_CID_STATELESS_AVS_START_CODE`` before decoding. See the
+	:ref:`associated Codec Control IDs <v4l2-codec-stateless-avs>`.
     * .. _V4L2-PIX-FMT-FWHT:
 
       - ``V4L2_PIX_FMT_FWHT``

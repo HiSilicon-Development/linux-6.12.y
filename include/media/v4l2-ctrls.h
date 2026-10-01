@@ -36,6 +36,9 @@ struct video_device;
  * @p_mpeg2_sequence:		Pointer to a MPEG2 sequence structure.
  * @p_mpeg2_picture:		Pointer to a MPEG2 picture structure.
  * @p_mpeg2_quantisation:	Pointer to a MPEG2 quantisation data structure.
+ * @p_mpeg1_sequence:		Pointer to a MPEG1 sequence structure.
+ * @p_mpeg1_picture:		Pointer to a MPEG1 picture structure.
+ * @p_mpeg1_quantisation:	Pointer to a MPEG1 quantisation data structure.
  * @p_fwht_params:		Pointer to a FWHT stateless parameters structure.
  * @p_h264_sps:			Pointer to a struct v4l2_ctrl_h264_sps.
  * @p_h264_pps:			Pointer to a struct v4l2_ctrl_h264_pps.
@@ -49,6 +52,10 @@ struct video_device;
  * @p_hevc_sps:			Pointer to an HEVC sequence parameter set structure.
  * @p_hevc_pps:			Pointer to an HEVC picture parameter set structure.
  * @p_hevc_slice_params:	Pointer to an HEVC slice parameters structure.
+ * @p_avs_sequence:		Pointer to an AVS sequence structure.
+ * @p_avs_picture:		Pointer to an AVS picture structure.
+ * @p_avs_slice_params:		Pointer to an AVS slice parameters structure.
+ * @p_avs_decode_params:	Pointer to an AVS decode parameters structure.
  * @p_hdr10_cll:		Pointer to an HDR10 Content Light Level structure.
  * @p_hdr10_mastering:		Pointer to an HDR10 Mastering Display structure.
  * @p_area:			Pointer to an area.
@@ -69,6 +76,9 @@ union v4l2_ctrl_ptr {
 	struct v4l2_ctrl_mpeg2_sequence *p_mpeg2_sequence;
 	struct v4l2_ctrl_mpeg2_picture *p_mpeg2_picture;
 	struct v4l2_ctrl_mpeg2_quantisation *p_mpeg2_quantisation;
+	struct v4l2_ctrl_mpeg1_sequence *p_mpeg1_sequence;
+	struct v4l2_ctrl_mpeg1_picture *p_mpeg1_picture;
+	struct v4l2_ctrl_mpeg1_quantisation *p_mpeg1_quantisation;
 	struct v4l2_ctrl_fwht_params *p_fwht_params;
 	struct v4l2_ctrl_h264_sps *p_h264_sps;
 	struct v4l2_ctrl_h264_pps *p_h264_pps;
@@ -80,6 +90,10 @@ union v4l2_ctrl_ptr {
 	struct v4l2_ctrl_hevc_sps *p_hevc_sps;
 	struct v4l2_ctrl_hevc_pps *p_hevc_pps;
 	struct v4l2_ctrl_hevc_slice_params *p_hevc_slice_params;
+	struct v4l2_ctrl_avs_sequence *p_avs_sequence;
+	struct v4l2_ctrl_avs_picture *p_avs_picture;
+	struct v4l2_ctrl_avs_slice_params *p_avs_slice_params;
+	struct v4l2_ctrl_avs_decode_params *p_avs_decode_params;
 	struct v4l2_ctrl_vp9_compressed_hdr *p_vp9_compressed_hdr_probs;
 	struct v4l2_ctrl_vp9_frame *p_vp9_frame;
 	struct v4l2_ctrl_hdr10_cll_info *p_hdr10_cll;

@@ -224,6 +224,26 @@ void v4l2_m2m_buf_done_and_job_finish(struct v4l2_m2m_dev *m2m_dev,
 				      struct v4l2_m2m_ctx *m2m_ctx,
 				      enum vb2_buffer_state state);
 
+/**
+ * v4l2_m2m_buf_done_and_job_finish_states() - return source/destination
+ * buffers with independent states and finish the job
+ *
+ * @m2m_dev: opaque pointer to the internal data to handle M2M context
+ * @m2m_ctx: m2m context assigned to the instance
+ * @src_state: vb2 state for the source (OUTPUT) buffer
+ * @dst_state: vb2 state for the destination (CAPTURE) buffer
+ *
+ * This is the state-split form of v4l2_m2m_buf_done_and_job_finish().  It
+ * preserves held-capture semantics while allowing a decoder to report a
+ * successfully produced but error-tainted CAPTURE buffer independently of
+ * its request OUTPUT buffer.
+ */
+void v4l2_m2m_buf_done_and_job_finish_states(
+					struct v4l2_m2m_dev *m2m_dev,
+					struct v4l2_m2m_ctx *m2m_ctx,
+					enum vb2_buffer_state src_state,
+					enum vb2_buffer_state dst_state);
+
 static inline void
 v4l2_m2m_buf_done(struct vb2_v4l2_buffer *buf, enum vb2_buffer_state state)
 {
@@ -898,4 +918,3 @@ int v4l2_m2m_fop_mmap(struct file *file, struct vm_area_struct *vma);
 __poll_t v4l2_m2m_fop_poll(struct file *file, poll_table *wait);
 
 #endif /* _MEDIA_V4L2_MEM2MEM_H */
-
