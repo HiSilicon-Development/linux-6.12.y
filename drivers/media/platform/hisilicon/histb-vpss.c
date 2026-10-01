@@ -131,7 +131,6 @@
 #define HISTB_VPSS_MACCFG		0x318
 #define HISTB_VPSS_FTCONFIG		0x320
 #define HISTB_VPSS_BUSCTRL		0x344
-#define HISTB_VPSS_STT_WB_SIZE		(32 * 1024 * 5)
 
 /* VPSS_CTRL */
 #define HISTB_VPSS_CTRL_DEI_EN		BIT(7)
@@ -301,11 +300,6 @@ struct histb_vpss {
 	size_t dei_st_size;
 	u32 dei_st_seq;
 
-	/* Statistics write-back target: VPSS_STT_W_ADDR (BSP: u32stt_w_phy_addr). */
-	void *stt_cpu;
-	dma_addr_t stt_dma;
-	size_t stt_size;
-
 	/* Serializes the single hardware pipeline and its staging buffer. */
 	struct mutex lock;
 	struct completion completion;
@@ -442,41 +436,6 @@ static u32 histb_vpss_node_read(struct histb_vpss *vpss, u32 reg)
 	return le32_to_cpu(vpss->node[reg / sizeof(*vpss->node)]);
 }
 
-/*
- * Diagnostic / hypothesis sweep for the de-interlacer.  Each bit adds one
- * element the vendor's node builder writes and this driver does not, or one
- * probe that tells a stalled pipeline from one that never started:
- *
- *   0x01  CTRL.four_pix_en, which the detile node - the node this engine is
- *         known to complete - sets and the de-interlace node does not.
- *   0x02  VPSS_FTCONFIG.node_rst_en, the only enable bit in the top level
- *         that no BSP code writes and this driver never touched.
- *   0x04  reserved; the VHD0 crop is now part of the normal port setup.
- *   0x08  give VPSS_STT_W_ADDR a real buffer, as the BSP's
- *         u32stt_w_phy_addr always is, instead of the zero this driver wrote.
- *   0x10  arm the logic watchdog (VPSS_TIMEOUT) and unmask its interrupt, so a
- *         pipeline that starts and then stalls reports itself instead of
- *         sitting silent behind a 0xffffffff timeout.
- *   0x20  pulse DIECTRL.die_rst in the live window before the start.
- *   0x40  write sentinels into the sys/status words of the node and dump them
- *         back afterwards: it says which registers the engine's node load
- *         actually overwrites, i.e. whether diesta is hardware state at all.
- *   0x80  dump the same register set after a detile job succeeds, which is
- *         the reference for "the engine ran this node to completion".
- */
-static unsigned int dei_opt;
-module_param(dei_opt, uint, 0644);
-MODULE_PARM_DESC(dei_opt, "VPSS de-interlacer hypothesis bits (0x1 four_pix, 0x2 node_rst_en, 0x8 stt write-back, 0x10 watchdog, 0x20 die_rst pulse, 0x40 node sentinel probe, 0x80 detile reference dump)");
-
-#define HISTB_VPSS_OPT_FOUR_PIX		BIT(0)
-#define HISTB_VPSS_OPT_NODE_RST_EN	BIT(1)
-#define HISTB_VPSS_OPT_STT_WB		BIT(3)
-#define HISTB_VPSS_OPT_WATCHDOG		BIT(4)
-#define HISTB_VPSS_OPT_DIE_RST		BIT(5)
-#define HISTB_VPSS_OPT_SENTINEL		BIT(6)
-#define HISTB_VPSS_OPT_DETILE_REF	BIT(7)
-#define HISTB_VPSS_OPT_LONG_WAIT	BIT(8)
-
 static void histb_vpss_dump_state(struct histb_vpss *vpss, const char *tag)
 {
 	static const u32 words[] = {
@@ -504,28 +463,6 @@ static void histb_vpss_dump_state(struct histb_vpss *vpss, const char *tag)
 		dev_err(vpss->dev, "vpss[%s] dbg[%04x]=%08x %08x %08x %08x\n",
 			tag, q, readl(vpss->regs + q), readl(vpss->regs + q + 4),
 			readl(vpss->regs + q + 8), readl(vpss->regs + q + 12));
-}
-
-static int histb_vpss_prepare_stt_wb(struct histb_vpss *vpss)
-{
-	if (vpss->stt_cpu)
-		return 0;
-
-	vpss->stt_cpu = dma_alloc_coherent(vpss->dev, HISTB_VPSS_STT_WB_SIZE,
-					   &vpss->stt_dma, GFP_KERNEL);
-	if (!vpss->stt_cpu)
-		return -ENOMEM;
-	vpss->stt_size = HISTB_VPSS_STT_WB_SIZE;
-	memset(vpss->stt_cpu, 0, vpss->stt_size);
-	if (upper_32_bits(vpss->stt_dma)) {
-		dma_free_coherent(vpss->dev, vpss->stt_size, vpss->stt_cpu,
-				  vpss->stt_dma);
-		vpss->stt_cpu = NULL;
-		vpss->stt_size = 0;
-		return -ERANGE;
-	}
-
-	return 0;
 }
 
 static void histb_vpss_node_write(struct histb_vpss *vpss, u32 reg,
@@ -1305,10 +1242,6 @@ int histb_vpss_dei(struct histb_vpss *vpss,
 	ret = histb_vpss_prepare_dei_st(vpss, frame->width, frame->height);
 	if (ret < 0)
 		goto put;
-	if ((dei_opt & HISTB_VPSS_OPT_STT_WB) && histb_vpss_prepare_stt_wb(vpss)) {
-		ret = -ENOMEM;
-		goto put;
-	}
 
 	st_stride = histb_vpss_dei_st_stride(frame->width);
 	st_slot = st_stride * frame->height;
@@ -1382,8 +1315,6 @@ int histb_vpss_dei(struct histb_vpss *vpss,
 	 * grouping the memory never produces.
 	 */
 	ctrl &= ~(u32)HISTB_VPSS_CTRL_FOUR_PIX;
-	if (dei_opt & HISTB_VPSS_OPT_FOUR_PIX)
-		ctrl |= HISTB_VPSS_CTRL_FOUR_PIX;
 	/*
 	 * MCDI stays off, which is what the vendor's own de-interlace node
 	 * does: VPSS_HAL_SetNode_H265_Step2_Dei() selects the same 4-field
@@ -1553,9 +1484,7 @@ int histb_vpss_dei(struct histb_vpss *vpss,
 	 * offsets inside the node even when TNR is disabled.  VPSS_REG_SIZE_
 	 * CALC() nets out to the plain register offset, so these are 0x3800
 	 * and 0x3b00, not four bytes short of them. */
-	histb_vpss_node_write(vpss, HISTB_VPSS_STT_W_ADDR,
-			      (dei_opt & HISTB_VPSS_OPT_STT_WB) && vpss->stt_cpu
-			      ? lower_32_bits(vpss->stt_dma) : 0);
+	histb_vpss_node_write(vpss, HISTB_VPSS_STT_W_ADDR, 0);
 	histb_vpss_config_dei_port(vpss, frame->width, frame->height * 2);
 	histb_vpss_node_write(vpss, HISTB_VPSS_TNR_ADDR,
 			      lower_32_bits(vpss->node_dma + 0x3800));
@@ -1673,53 +1602,6 @@ int histb_vpss_dei(struct histb_vpss *vpss,
 	writel(0, vpss->regs + HISTB_VPSS_VHD0CROP_POS);
 	writel(histb_vpss_node_read(vpss, HISTB_VPSS_VHD0CROP_SIZE),
 	       vpss->regs + HISTB_VPSS_VHD0CROP_SIZE);
-	if (dei_opt & HISTB_VPSS_OPT_NODE_RST_EN) {
-		histb_vpss_node_write(vpss, HISTB_VPSS_FTCONFIG, 1);
-		writel(1, vpss->regs + HISTB_VPSS_FTCONFIG);
-	}
-	if (dei_opt & HISTB_VPSS_OPT_WATCHDOG) {
-		/*
-		 * Bypass the 0xffffffff this driver leaves in VPSS_TIMEOUT and
-		 * unmask the logic timeout: if the pipeline starts and then
-		 * stalls, the watchdog says so instead of timing out silently.
-		 */
-		u32 to = 0x800000;
-		u32 mask = 0x7e;
-
-		histb_vpss_node_write(vpss, HISTB_VPSS_TIMEOUT, to);
-		histb_vpss_node_write(vpss, HISTB_VPSS_INT_MASK, mask);
-		writel(to, vpss->regs + HISTB_VPSS_TIMEOUT);
-		writel(mask, vpss->regs + HISTB_VPSS_INT_MASK);
-	}
-	if (dei_opt & HISTB_VPSS_OPT_SENTINEL) {
-		/*
-		 * Sentinels in the words the engine may or may not copy out of
-		 * the node: whatever comes back as the sentinel was overwritten
-		 * by the node load, so it is not hardware state.  The values are
-		 * chosen to sit in bits the interrupt logic ignores (INTSTATE
-		 * and RAWINT) or to be harmless counters.  DIESTA's is
-		 * cur_state=0/cur_cstate=0 with a non-zero line count - the
-		 * state the vendor's own tables seed it with, plus a marker.
-		 */
-		histb_vpss_node_write(vpss, HISTB_VPSS_INT_STATE, 0x00010000);
-		histb_vpss_node_write(vpss, HISTB_VPSS_INT_CLEAR, 0x00010000);
-		histb_vpss_node_write(vpss, HISTB_VPSS_RAW_INT, 0x00020000);
-		histb_vpss_node_write(vpss, HISTB_VPSS_PFCNT, 0x00001111);
-		histb_vpss_node_write(vpss, HISTB_VPSS_MACCFG, 0x00040000);
-		histb_vpss_node_write(vpss, HISTB_VPSS_EOF_CNT, 0x00002222);
-		histb_vpss_node_write(vpss, HISTB_VPSS_BUSCTRL, 0x00030000);
-		histb_vpss_node_write(vpss, HISTB_VPSS_DIESTA, 0x00012300);
-	}
-	if (dei_opt & HISTB_VPSS_OPT_DIE_RST) {
-		u32 diectrl = readl(vpss->regs + HISTB_VPSS_DIECTRL);
-
-		writel(diectrl | HISTB_VPSS_DIE_RST,
-		       vpss->regs + HISTB_VPSS_DIECTRL);
-		udelay(2);
-		writel(diectrl & ~(u32)HISTB_VPSS_DIE_RST,
-		       vpss->regs + HISTB_VPSS_DIECTRL);
-		udelay(2);
-	}
 	/* Keep the live window consistent too: harmless, and it is what the
 	 * scaler path already does. */
 	writel(lower_32_bits(vpss->node_dma), vpss->regs + HISTB_VPSS_NEXT);
@@ -1736,9 +1618,7 @@ int histb_vpss_dei(struct histb_vpss *vpss,
 	pnext_ack = readl(vpss->regs + HISTB_VPSS_NEXT);
 
 	timeout = wait_for_completion_timeout(&vpss->completion,
-					      msecs_to_jiffies(
-						      (dei_opt & HISTB_VPSS_OPT_LONG_WAIT)
-						      ? 3000 : 500));
+					      msecs_to_jiffies(HISTB_VPSS_JOB_TIMEOUT_MS));
 	if (!timeout) {
 		{
 			unsigned int q;
@@ -1944,8 +1824,6 @@ int histb_vpss_detile(struct histb_vpss *vpss,
 			vpss->irq_state);
 		ret = -EIO;
 	} else {
-		if (dei_opt & HISTB_VPSS_OPT_DETILE_REF)
-			histb_vpss_dump_state(vpss, "detile");
 		if (!direct_output) {
 			dma_sync_single_for_cpu(vpss->dev, vpss->staging_dma,
 						vpss->staging_size, DMA_FROM_DEVICE);
@@ -2157,9 +2035,6 @@ static void histb_vpss_remove(struct platform_device *pdev)
 	if (vpss->dei_st_cpu)
 		dma_free_coherent(vpss->dev, vpss->dei_st_size,
 				  vpss->dei_st_cpu, vpss->dei_st_dma);
-	if (vpss->stt_cpu)
-		dma_free_coherent(vpss->dev, vpss->stt_size,
-				  vpss->stt_cpu, vpss->stt_dma);
 	dma_free_coherent(vpss->dev, HISTB_VPSS_ZME_COEF_SIZE,
 			  vpss->zme_coef, vpss->zme_coef_dma);
 	dma_free_coherent(vpss->dev, HISTB_VPSS_NODE_SIZE,
