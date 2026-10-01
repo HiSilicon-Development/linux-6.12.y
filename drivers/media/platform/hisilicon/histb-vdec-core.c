@@ -12,6 +12,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/firmware.h>
 #include <linux/interrupt.h>
+#include <linux/histb-vpss.h>
 #include <linux/iopoll.h>
 #include <linux/ktime.h>
 #include <linux/log2.h>
@@ -568,20 +569,6 @@ struct histb_vdec_q_data {
 
 struct histb_vdec_dev;
 
-/*
- * Drive the VPSS de-interlacer instead of the software path for interlaced
- * streams.  Off by default: the block's thresholds come from a vendor binary
- * tuning table we do not have, so this is opt-in until it has been measured.
- */
-static bool dei;
-module_param(dei, bool, 0644);
-MODULE_PARM_DESC(dei, "de-interlace with the VPSS DI block (default off)");
-
-static bool dei_field_rate;
-module_param(dei_field_rate, bool, 0644);
-MODULE_PARM_DESC(dei_field_rate,
-		 "store both VPSS DI field outputs in each capture buffer");
-
 struct histb_vdec_ctx {
 	struct v4l2_fh fh;
 	struct v4l2_ctrl_handler ctrl_handler;
@@ -609,31 +596,6 @@ struct histb_vdec_ctx {
 	bool h264_new_surface;
 	bool h264_last_slice;
 	bool h264_field_picture;
-	/*
-	 * VPSS de-interlace ring.  The DI block wants four consecutive fields;
-	 * each entry is the address of one field within a woven frame.  A bottom
-	 * field starts one pitch after the top field, matching VPSS_IMG_CopyAddr().
-	 */
-	dma_addr_t dei_field[4];
-	/*
-	 * Scratch surfaces for the linear copies the de-interlacer needs.  Its
-	 * four input fields are linear, while the parser produces a tiled
-	 * surface; DIESTA showed the engine walking 24 lines and stalling,
-	 * which is what a linear stride applied to tiled data looks like.
-	 *
-	 * Three detiled frames are kept.  A woven picture writes both of its
-	 * fields at once, whereas the vendor reference list replaces only one
-	 * field for each DEI run.  The third surface prevents the next whole
-	 * picture detile from overwriting the oldest field before the first run
-	 * for that picture has consumed it.
-	 */
-	void *dei_lin;
-	dma_addr_t dei_lin_dma;
-	size_t dei_lin_size;
-	unsigned int dei_fields;
-	unsigned int dei_slot;
-	bool dei_field_rate;
-
 	bool h264_bottom_field;
 	bool h264_second_field;
 	bool h264_field_transaction;
@@ -4114,80 +4076,6 @@ static dma_addr_t histb_vdec_capture_dma(struct vb2_buffer *vb,
 	return vb2_dma_contig_plane_dma_addr(vb, plane);
 }
 
-/*
- * Advance the VPSS four-field reference list exactly as the BSP does between
- * H265 Step1 and Step2.  During startup the missing older fields are aliases
- * of the first valid field; once full, the oldest field is discarded for
- * every newly inserted field.
- */
-static void histb_vdec_dei_push_field(struct histb_vdec_ctx *ctx,
-				      dma_addr_t field,
-				      struct histb_vpss_dei_frame *d)
-{
-	if (ctx->dei_fields == ARRAY_SIZE(ctx->dei_field)) {
-		memmove(&ctx->dei_field[0], &ctx->dei_field[1],
-			(sizeof(ctx->dei_field[0]) *
-			 (ARRAY_SIZE(ctx->dei_field) - 1)));
-		ctx->dei_fields--;
-	}
-
-	ctx->dei_field[ctx->dei_fields++] = field;
-
-	switch (ctx->dei_fields) {
-	case 1:
-		d->ref_dma = ctx->dei_field[0];
-		d->cur_dma = ctx->dei_field[0];
-		d->nxt1_dma = ctx->dei_field[0];
-		d->nxt2_dma = ctx->dei_field[0];
-		break;
-	case 2:
-		d->ref_dma = ctx->dei_field[0];
-		d->cur_dma = ctx->dei_field[0];
-		d->nxt1_dma = ctx->dei_field[0];
-		d->nxt2_dma = ctx->dei_field[1];
-		break;
-	case 3:
-		d->ref_dma = ctx->dei_field[0];
-		d->cur_dma = ctx->dei_field[0];
-		d->nxt1_dma = ctx->dei_field[1];
-		d->nxt2_dma = ctx->dei_field[2];
-		break;
-	default:
-		d->ref_dma = ctx->dei_field[0];
-		d->cur_dma = ctx->dei_field[1];
-		d->nxt1_dma = ctx->dei_field[2];
-		d->nxt2_dma = ctx->dei_field[3];
-		break;
-	}
-}
-
-static bool
-histb_vdec_dei_picture(const struct histb_vdec_ctx *ctx,
-			const struct histb_vdec_decoded_buffer *decoded,
-			bool *top_field_first)
-{
-	*top_field_first = true;
-
-	/*
-	 * The AVS request API is frame based.  A field-structured AVS+ picture
-	 * still submits both fields and all slices in one request, so the
-	 * reconstructed capture surface is a complete woven frame here.
-	 */
-	if (ctx->avs) {
-		if (!decoded->avs.interlaced)
-			return false;
-		*top_field_first = decoded->avs.top_field_first;
-		return true;
-	}
-
-	if (ctx->mbaff)
-		return true;
-	if (!ctx->h264_field_picture || !ctx->h264_second_field)
-		return false;
-
-	*top_field_first = !ctx->h264_pending_bottom;
-	return true;
-}
 
 static int histb_vdec_copy_capture(struct histb_vdec_ctx *ctx,
 				   struct vb2_v4l2_buffer *dst_buf)
@@ -4196,8 +4084,6 @@ static int histb_vdec_copy_capture(struct histb_vdec_ctx *ctx,
 	struct histb_vpss_frame frame;
 	dma_addr_t dst_dma;
 	u8 *dst;
-	bool top_field_first;
-	bool deinterlace;
 	int ret;
 
 	if (!dst_buf)
@@ -4252,156 +4138,6 @@ static int histb_vdec_copy_capture(struct histb_vdec_ctx *ctx,
 	frame.input_ten_bit = ctx->hevc_main10;
 	frame.output_ten_bit =
 		ctx->dst.pix.pixelformat == V4L2_PIX_FMT_P010;
-	deinterlace = histb_vdec_dei_picture(ctx, decoded, &top_field_first);
-	/*
-	 * Interlaced streams can be turned into progressive frames by the VPSS
-	 * DI block instead of by detiling the woven surface.  It consumes a
-	 * rolling four-field window.  During startup the vendor driver aliases
-	 * the missing history to the oldest available field, so a DEI job is
-	 * submitted for every arriving field rather than waiting for four.
-	 *
-	 * A field sits inside the woven surface, so it needs no extra allocation.
-	 * The vendor path advances a linear bottom field by one pitch and also sets
-	 * bfield_mode for the field being emitted.
-	 *
-	 * histb_vpss_dei() rejects anything above 1920x1088, which is where the
-	 * vendor validation starts forcing progressive, so a 4K interlaced
-	 * source falls back to this path automatically.
-	 */
-	if ((dei || ctx->dei_field_rate) &&
-	    frame.input_width == frame.width &&
-	    frame.input_height == frame.height &&
-	    deinterlace &&
-	    ctx->dst.pix.pixelformat == V4L2_PIX_FMT_NV12 && dst_dma) {
-		u32 field_height = frame.height / 2;
-		u32 lstride = ALIGN(frame.width, 256);
-		size_t slot = (size_t)lstride * frame.height * 3 / 2;
-		struct histb_vpss_dei_frame d;
-		dma_addr_t new_field[2];
-		bool new_bottom[2];
-		bool detiled = false;
-		unsigned int i;
-
-		/*
-		 * Linux detiles a complete woven picture at once.  Keep three frame
-		 * surfaces so the next picture cannot overwrite the oldest field still
-		 * present in the rolling four-field window.
-		 */
-		if (!ctx->dei_lin || ctx->dei_lin_size < 3 * slot) {
-			if (ctx->dei_lin)
-				dma_free_noncoherent(ctx->vdec->dev,
-						     ctx->dei_lin_size,
-						     ctx->dei_lin,
-						     ctx->dei_lin_dma,
-						     DMA_BIDIRECTIONAL);
-			ctx->dei_lin = dma_alloc_noncoherent(ctx->vdec->dev,
-							     3 * slot,
-							     &ctx->dei_lin_dma,
-							     DMA_BIDIRECTIONAL,
-							     GFP_KERNEL);
-			ctx->dei_lin_size = ctx->dei_lin ? 3 * slot : 0;
-			ctx->dei_slot = 0;
-			ctx->dei_fields = 0;
-		}
-		if (ctx->dei_lin) {
-			dma_addr_t base = ctx->dei_lin_dma +
-					  ctx->dei_slot * slot;
-			struct histb_vpss_frame lf;
-
-			/*
-			 * The de-interlacer consumes linear fields, but the parser
-			 * hands over a tiled surface.  The BSP never feeds DEI
-			 * straight from the parser either: its interlace step runs
-			 * first and chooses the port output path.  Do the same here
-			 * - one detile pass per picture into a ring slot, then give
-			 * DEI four linear fields.
-			 */
-			memset(&lf, 0, sizeof(lf));
-			lf.input_dma = decoded->tile.dma;
-			lf.input_size = decoded->tile.size;
-			lf.output_dma = base;
-			lf.input_width = frame.width;
-			lf.input_height = frame.height;
-			lf.width = frame.width;
-			lf.height = frame.height;
-			lf.input_stride = frame.input_stride;
-			lf.input_height_align = frame.input_height_align;
-			lf.output_stride = lstride;
-			lf.input_ten_bit = frame.input_ten_bit;
-			if (!histb_vpss_detile(ctx->vdec->vpss, &lf)) {
-				ctx->dei_slot = (ctx->dei_slot + 1) % 3;
-				for (i = 0; i < ARRAY_SIZE(new_field); i++) {
-					bool bottom = top_field_first ? i : !i;
-
-					/* VPSS_IMG_CopyAddr(): linear bottom field += pitch. */
-					new_field[i] = base + (bottom ? lstride : 0);
-					new_bottom[i] = bottom;
-				}
-				detiled = true;
-			}
-		}
-
-		if (detiled) {
-			memset(&d, 0, sizeof(d));
-			d.width = frame.width;
-			d.height = field_height;
-			/* H.265 Step2 field mode takes the linear frame pitch here. */
-			d.stride = lstride;
-			/*
-			 * The port writes the de-interlaced frame to the capture
-			 * surface at the capture surface's own pitch, which the
-			 * format code sets to the same value the detile path
-			 * writes with.
-			 */
-			d.output_stride = frame.output_stride;
-			d.top_field_first = top_field_first;
-			d.ten_bit = frame.input_ten_bit;
-			d.tile = false;
-
-			if (ctx->dei_field_rate) {
-				/*
-				 * Keep each field-rate output in one complete negotiated
-				 * NV12 surface.  For a 1080-line H.264 picture the request
-				 * API negotiates a 1088-line capture surface, so this is
-				 * 1920 * 1088 * 3 / 2 rather than a visible-height or
-				 * page-aligned approximation.
-				 */
-				size_t frame_size = (size_t)frame.output_stride *
-						    frame.height * 3 / 2;
-
-				for (i = 0; i < ARRAY_SIZE(new_field); i++) {
-					/*
-					 * The BSP advances its four-entry field reference head
-					 * once per Step2 job.  Snapshot the window immediately
-					 * after inserting this field, then emit that field.
-					 */
-					histb_vdec_dei_push_field(ctx, new_field[i], &d);
-					d.bottom_field = new_bottom[i];
-					ret = histb_vpss_dei(ctx->vdec->vpss, &d,
-							      dst_dma + i * frame_size);
-					if (ret)
-						break;
-				}
-			} else {
-				for (i = 0; i < ARRAY_SIZE(new_field); i++)
-					histb_vdec_dei_push_field(ctx, new_field[i], &d);
-				d.bottom_field = new_bottom[1];
-				ret = histb_vpss_dei(ctx->vdec->vpss, &d, dst_dma);
-			}
-		} else {
-			ret = ctx->dei_lin ? -EIO : -ENOMEM;
-		}
-
-		if (!ret) {
-			ret = histb_vdec_capture_begin_cpu_access(&dst_buf->vb2_buf);
-			if (ret)
-				return ret;
-			return histb_vdec_apply_vc1_range_map(ctx, dst_buf, dst);
-		}
-		ctx->dei_fields = 0;
-		if (ctx->dei_field_rate)
-			return ret;
-	}
 	ret = histb_vpss_detile(ctx->vdec->vpss, &frame);
 	if (!ret) {
 		/*
@@ -14776,8 +14512,6 @@ static void histb_vdec_try_capture_format(struct histb_vdec_ctx *ctx,
 	/* Both public capture formats are linear; CV200 tile storage is internal. */
 	pix->bytesperline = p010 ? pix->width * 2 : ALIGN(pix->width, 64);
 	pix->sizeimage = pix->bytesperline * pix->height * 3 / 2;
-	if (ctx->dei_field_rate && !p010)
-		pix->sizeimage *= 2;
 	pix->colorspace = ctx->src.pix.colorspace;
 	pix->ycbcr_enc = ctx->src.pix.ycbcr_enc;
 	pix->quantization = ctx->src.pix.quantization;
@@ -15055,6 +14789,80 @@ static int histb_vdec_subscribe_event(
 	}
 }
 
+/*
+ * Stateless decode returns request-owned woven pixels. Temporal processing is
+ * submitted only after userspace's codec has reordered those captures.
+ */
+static long histb_vdec_default_ioctl(struct file *file, void *priv,
+				     bool valid_prio, unsigned int cmd, void *arg)
+{
+	struct histb_vdec_ctx *ctx = fh_to_histb_vdec_ctx(priv);
+	struct histb_vpss_dei_request *job = arg;
+	struct vb2_queue *q = v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx);
+	struct vb2_buffer *source[4], *dst;
+	struct histb_vpss_dei_frame frame = {};
+	dma_addr_t field[4], output;
+	u32 stride = ctx->dst.pix.bytesperline;
+	u32 size = ctx->dst.pix.sizeimage;
+	unsigned int i;
+	int ret;
+
+	if (cmd != VIDIOC_HISTB_VPSS_DEI)
+		return -ENOTTY;
+	if (!valid_prio)
+		return -EBUSY;
+	/* DEI indices identify driver-owned surfaces, not unbound imports. */
+	if (q->memory != VB2_MEMORY_MMAP)
+		return -EINVAL;
+	if (ctx->dst.pix.pixelformat != V4L2_PIX_FMT_NV12 ||
+	    ctx->dst.pix.width > 1920 || ctx->dst.pix.height > 1088 ||
+	    (ctx->dst.pix.height & 1) || job->bottom_mask & ~0xfU ||
+	    job->flags & ~HISTB_VPSS_DEI_TOP_FIELD_FIRST || job->reserved)
+		return -EINVAL;
+
+	dst = vb2_get_buffer(q, job->destination);
+	if (!dst || dst->state != VB2_BUF_STATE_DEQUEUED ||
+	    dst->num_planes != 1 || dst->planes[0].data_offset ||
+	    size > vb2_plane_size(dst, 0))
+		return -EINVAL;
+	output = histb_vdec_capture_dma(dst, 0);
+	if (!output)
+		return -EOPNOTSUPP;
+	for (i = 0; i < ARRAY_SIZE(source); i++) {
+		dma_addr_t base;
+
+		source[i] = vb2_get_buffer(q, job->source[i]);
+		if (!source[i] || source[i] == dst ||
+		    source[i]->state != VB2_BUF_STATE_DEQUEUED ||
+		    source[i]->num_planes != 1 || source[i]->planes[0].data_offset ||
+		    vb2_plane_size(source[i], 0) < size ||
+		    vb2_get_plane_payload(source[i], 0) < size)
+			return -EINVAL;
+		base = histb_vdec_capture_dma(source[i], 0);
+		if (!base)
+			return -EOPNOTSUPP;
+		field[i] = base + ((job->bottom_mask & BIT(i)) ? stride : 0);
+	}
+
+	for (i = 0; i < ARRAY_SIZE(source); i++)
+		histb_vdec_capture_prepare(source[i]->planes[0].mem_priv);
+	histb_vdec_capture_prepare(dst->planes[0].mem_priv);
+	frame.ref_dma = field[0];
+	frame.cur_dma = field[1];
+	frame.nxt1_dma = field[2];
+	frame.nxt2_dma = field[3];
+	frame.width = ctx->dst.pix.width;
+	frame.height = ctx->dst.pix.height / 2;
+	frame.stride = stride;
+	frame.output_stride = stride;
+	frame.top_field_first = job->flags & HISTB_VPSS_DEI_TOP_FIELD_FIRST;
+	frame.bottom_field = job->bottom_mask & BIT(1);
+	ret = histb_vpss_dei(ctx->vdec->vpss, &frame, output);
+	if (!ret)
+		ret = histb_vdec_capture_begin_cpu_access(dst);
+	return ret;
+}
+
 static const struct v4l2_ioctl_ops histb_vdec_ioctl_ops = {
 	.vidioc_querycap = histb_vdec_querycap,
 	.vidioc_enum_fmt_vid_cap = histb_vdec_enum_fmt,
@@ -15079,6 +14887,7 @@ static const struct v4l2_ioctl_ops histb_vdec_ioctl_ops = {
 	.vidioc_try_decoder_cmd = histb_vdec_try_decoder_cmd,
 	.vidioc_subscribe_event = histb_vdec_subscribe_event,
 	.vidioc_unsubscribe_event = v4l2_event_unsubscribe,
+	.vidioc_default = histb_vdec_default_ioctl,
 };
 
 static const struct v4l2_ctrl_config histb_vdec_ctrls[] = {
@@ -15248,7 +15057,6 @@ static int histb_vdec_open(struct file *file)
 		return -ENOMEM;
 
 	ctx->vdec = vdec;
-	ctx->dei_field_rate = dei_field_rate;
 	mutex_init(&ctx->mpeg4_lock);
 	mutex_init(&ctx->vc1_lock);
 	mutex_init(&ctx->rv_lock);
@@ -15278,10 +15086,6 @@ free_ctrls:
 	v4l2_ctrl_handler_free(&ctx->ctrl_handler);
 free_fh:
 	v4l2_fh_exit(&ctx->fh);
-	if (ctx->dei_lin)
-		dma_free_noncoherent(ctx->vdec->dev, ctx->dei_lin_size,
-				     ctx->dei_lin, ctx->dei_lin_dma,
-				     DMA_BIDIRECTIONAL);
 	kfree(ctx);
 	return ret;
 }
@@ -15296,10 +15100,6 @@ static int histb_vdec_release(struct file *file)
 	v4l2_ctrl_handler_free(&ctx->ctrl_handler);
 	v4l2_fh_del(&ctx->fh);
 	v4l2_fh_exit(&ctx->fh);
-	if (ctx->dei_lin)
-		dma_free_noncoherent(ctx->vdec->dev, ctx->dei_lin_size,
-				     ctx->dei_lin, ctx->dei_lin_dma,
-				     DMA_BIDIRECTIONAL);
 	kfree(ctx);
 	return 0;
 }
@@ -15817,7 +15617,7 @@ module_platform_driver(histb_vdec_driver);
 MODULE_AUTHOR("HiSilicon Technologies Co., Ltd.");
 MODULE_DESCRIPTION("HiSilicon Hi3798CV200 VDH video decoder");
 /* Build tag so a deployment can be proven to have taken effect. */
-#define HISTB_VDEC_BUILD_TAG "dvbip-20260916-align2"
+#define HISTB_VDEC_BUILD_TAG "dvbip-20261003-display-order-dei"
 MODULE_VERSION(HISTB_VDEC_BUILD_TAG);
 /* dma_buf_export() lives in the DMA_BUF symbol namespace. */
 MODULE_IMPORT_NS(DMA_BUF);

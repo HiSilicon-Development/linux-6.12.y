@@ -32,17 +32,16 @@ int histb_vpss_detile(struct histb_vpss *vpss,
 /*
  * Hardware de-interlacing, the DI block inside the VPSS.
  *
- * It consumes four consecutive fields and emits one progressive frame.
+ * It consumes four consecutive display-ordered fields and emits CUR, the
+ * second field of LAST/CUR/NEXT1/NEXT2, as one progressive frame.
  * Field address registers sit at 0x100..0x13c in groups of four - control,
- * Y, C, stride - with LAST at 0x110, CUR at 0x100, NXT1 at 0x120 and NEXT2
- * at 0x130, and the block is handed them oldest first.
+ * Y, C, stride - with LAST at 0x110, CUR at 0x100, NEXT1 at 0x120 and NEXT2
+ * at 0x130.
  *
- * A field is not a surface of its own: it lives inside a frame sized surface,
- * two fields per surface.  The vendor path programs the same woven-frame base
- * for both parities and selects field reads through CTRL.bfield_mode.  The
- * pair's chroma plane sits a full woven frame height beyond the shared luma
- * base.  Four inputs therefore refer to consecutive frame sized surfaces in
- * display-field order, with duplicate bases for the two fields of each frame.
+ * A field lives in a woven frame-sized surface. The bottom field's luma
+ * and chroma addresses advance by one frame pitch, matching BSP
+ * VPSS_IMG_CopyAddr(); bfield_mode identifies CUR's parity. Chroma starts
+ * one full woven-frame height beyond the same-parity luma address.
  *
  * The input is linear NV12.  Decoder tile surfaces must be detiled first.
  */
