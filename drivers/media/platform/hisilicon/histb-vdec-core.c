@@ -15,6 +15,7 @@
 #include <linux/iopoll.h>
 #include <linux/ktime.h>
 #include <linux/log2.h>
+#include <linux/math64.h>
 #include <linux/mfd/syscon.h>
 #include <linux/module.h>
 #include <linux/overflow.h>
@@ -29,6 +30,7 @@
 #include <linux/sizes.h>
 #include <linux/unaligned.h>
 #include <linux/workqueue.h>
+#include <linux/vmalloc.h>
 
 #include <media/media-device.h>
 #include <media/v4l2-ctrls.h>
@@ -477,6 +479,7 @@ struct histb_vdec_mpeg2_slice {
 struct histb_vdec_avs_metadata {
 	bool valid;
 	bool anchor;
+	bool interlaced;
 	bool top_field_first;
 	u8 picture_structure;
 	u8 picture_coding_type;
@@ -572,6 +575,11 @@ static bool dei;
 module_param(dei, bool, 0644);
 MODULE_PARM_DESC(dei, "de-interlace with the VPSS DI block (default off)");
 
+static bool dei_field_rate;
+module_param(dei_field_rate, bool, 0644);
+MODULE_PARM_DESC(dei_field_rate,
+		 "store both VPSS DI field outputs in each capture buffer");
+
 struct histb_vdec_ctx {
 	struct v4l2_fh fh;
 	struct v4l2_ctrl_handler ctrl_handler;
@@ -584,6 +592,12 @@ struct histb_vdec_ctx {
 	/* AVS only: one allocation carries every entry of buffers[]. */
 	struct histb_vdec_dma_buffer buf_arena;
 	struct histb_vdec_dma_buffer bitstream;
+	/* HEVC RBSP conversion is CPU-heavy; keep its staging buffer cacheable. */
+	void *hevc_stream_shadow;
+	size_t hevc_stream_shadow_size;
+	/* Build HEVC messages in cached memory, then copy only active slots to DMA. */
+	void *hevc_msg_shadow;
+	size_t hevc_msg_shadow_size;
 	struct histb_vdec_dma_buffer vc1_stream;
 	struct histb_vdec_decoded_buffer *apc[HISTB_VDEC_H264_DPB_SIZE];
 	u32 total_mbs;
@@ -595,10 +609,28 @@ struct histb_vdec_ctx {
 	bool h264_field_picture;
 	/*
 	 * VPSS de-interlace ring.  The DI block wants four consecutive fields;
-	 * each entry is the tile base address of one field surface.
+	 * each entry is the address of one field within a woven frame.  A bottom
+	 * field starts one pitch after the top field, matching VPSS_IMG_CopyAddr().
 	 */
 	dma_addr_t dei_field[4];
+	/*
+	 * Scratch surfaces for the linear copies the de-interlacer needs.  Its
+	 * four input fields are linear, while the parser produces a tiled
+	 * surface; DIESTA showed the engine walking 24 lines and stalling,
+	 * which is what a linear stride applied to tiled data looks like.
+	 *
+	 * Three detiled frames are kept.  A woven picture writes both of its
+	 * fields at once, whereas the vendor reference list replaces only one
+	 * field for each DEI run.  The third surface prevents the next whole
+	 * picture detile from overwriting the oldest field before the first run
+	 * for that picture has consumed it.
+	 */
+	void *dei_lin;
+	dma_addr_t dei_lin_dma;
+	size_t dei_lin_size;
 	unsigned int dei_fields;
+	unsigned int dei_slot;
+	bool dei_field_rate;
 
 	bool h264_bottom_field;
 	bool h264_second_field;
@@ -1292,9 +1324,9 @@ static u32 histb_vdec_surface_stride(struct histb_vdec_ctx *ctx)
 	    histb_vdec_is_rv_format(ctx->src.pix.pixelformat) ||
 	    histb_vdec_is_vc1_format(ctx->src.pix.pixelformat) ||
 	    ctx->src.pix.pixelformat == V4L2_PIX_FMT_VP9_FRAME)
-		return ALIGN(ctx->dst.pix.width, 256);
+		return ALIGN(ctx->src.pix.width, 256);
 
-	return histb_vdec_tile_stride(ctx->dst.pix.width);
+	return histb_vdec_tile_stride(ctx->src.pix.width);
 }
 
 static u32 histb_vdec_surface_height_align(struct histb_vdec_ctx *ctx)
@@ -2452,13 +2484,17 @@ static int histb_vdec_copy_hevc_bitstream(
 {
 	struct histb_vdec_dma_buffer *stream = &ctx->bitstream;
 	struct histb_vdec_dev *vdec = ctx->vdec;
-	size_t src_offset = 0, dst_offset = 0;
+	size_t allocation, required, src_offset = 0, dst_offset = 0;
 	u8 *src_cpu;
 	unsigned int i;
 
-	if (stream->size < payload) {
+	if (check_add_overflow((size_t)payload,
+			       (size_t)HISTB_VDEC_RAW_STREAM_GUARD, &required) ||
+	    required > HISTB_VDEC_MAX_BITSTREAM)
+		return -E2BIG;
+	allocation = ALIGN(required, SZ_64K);
+	if (stream->size < allocation) {
 		struct histb_vdec_dma_buffer replacement = { };
-		size_t allocation = ALIGN(payload, SZ_64K);
 
 		replacement.cpu = dma_alloc_coherent(vdec->dev, allocation,
 						     &replacement.dma, GFP_KERNEL);
@@ -2481,6 +2517,16 @@ static int histb_vdec_copy_hevc_bitstream(
 	if (!src_cpu)
 		return -EOPNOTSUPP;
 	src_cpu += src->vb2_buf.planes[0].data_offset;
+	if (ctx->hevc_stream_shadow_size < required) {
+		void *replacement;
+
+		replacement = kvzalloc(required, GFP_KERNEL);
+		if (!replacement)
+			return -ENOMEM;
+		kvfree(ctx->hevc_stream_shadow);
+		ctx->hevc_stream_shadow = replacement;
+		ctx->hevc_stream_shadow_size = required;
+	}
 	for (i = 0; i < num_slices; i++) {
 		const struct v4l2_ctrl_hevc_slice_params *slice = &slices[i];
 		size_t nal_size = DIV_ROUND_UP(slice->bit_size, 8);
@@ -2490,8 +2536,9 @@ static int histb_vdec_copy_hevc_bitstream(
 		if (!nal_size || nal_size > payload - src_offset ||
 		    slice->data_byte_offset >= nal_size)
 			return -EINVAL;
-		memcpy(stream->cpu + dst_offset, src_cpu + src_offset, nal_size);
-		rbsp_size = histb_vdec_ebsp_to_rbsp(stream->cpu + dst_offset,
+		memcpy(ctx->hevc_stream_shadow + dst_offset,
+		       src_cpu + src_offset, nal_size);
+		rbsp_size = histb_vdec_ebsp_to_rbsp(ctx->hevc_stream_shadow + dst_offset,
 						    nal_size);
 		skipped_bits = ((u64)(nal_size - rbsp_size) +
 			slice->data_byte_offset) * 8;
@@ -2504,7 +2551,12 @@ static int histb_vdec_copy_hevc_bitstream(
 	}
 	if (src_offset != payload)
 		return -EINVAL;
-	memset(stream->cpu + dst_offset, 0, stream->size - dst_offset);
+	memcpy(stream->cpu, ctx->hevc_stream_shadow, dst_offset);
+	/* VDH may fetch one final bus burst past valid_bits, but it cannot
+	 * consume data beyond that boundary.  Clearing the whole allocation
+	 * made every request write up to 8 MiB of uncached coherent memory after
+	 * a single large access unit had grown the buffer. */
+	memset(stream->cpu + dst_offset, 0, HISTB_VDEC_RAW_STREAM_GUARD);
 	*stream_dma = stream->dma;
 
 	return 0;
@@ -2522,9 +2574,9 @@ static size_t histb_vdec_tile_size(struct histb_vdec_ctx *ctx)
 	 */
 	if (ctx->src.pix.pixelformat == V4L2_PIX_FMT_MPEG1_SLICE ||
 	    ctx->src.pix.pixelformat == V4L2_PIX_FMT_MPEG2_SLICE)
-		height = ALIGN(ctx->dst.pix.height, 32);
+		height = ALIGN(ctx->src.pix.height, 32);
 	else
-		height = ALIGN(ctx->dst.pix.height,
+		height = ALIGN(ctx->src.pix.height,
 			       histb_vdec_surface_height_align(ctx));
 	size = stride * height * 3 / 2;
 
@@ -2538,16 +2590,16 @@ static size_t histb_vdec_tile_size(struct histb_vdec_ctx *ctx)
 
 static size_t histb_vdec_pmv_size(struct histb_vdec_ctx *ctx)
 {
-	u32 width_mbs = DIV_ROUND_UP(ctx->dst.pix.width, 16);
+	u32 width_mbs = DIV_ROUND_UP(ctx->src.pix.width, 16);
 	u32 height_mbs;
 	size_t size;
 
 	if (ctx->src.pix.pixelformat == V4L2_PIX_FMT_MPEG2_SLICE)
-		height_mbs = 2 * DIV_ROUND_UP(ctx->dst.pix.height, 32);
+		height_mbs = 2 * DIV_ROUND_UP(ctx->src.pix.height, 32);
 	else if (ctx->src.pix.pixelformat == V4L2_PIX_FMT_AVS_SLICE)
-		height_mbs = histb_vdec_avs_height_mbs(ctx->dst.pix.height, false);
+		height_mbs = histb_vdec_avs_height_mbs(ctx->src.pix.height, false);
 	else
-		height_mbs = DIV_ROUND_UP(ctx->dst.pix.height, 16);
+		height_mbs = DIV_ROUND_UP(ctx->src.pix.height, 16);
 
 	/* VP9 uses the single context-level work slot allocated with the codec. */
 	if (ctx->src.pix.pixelformat == V4L2_PIX_FMT_VP9_FRAME)
@@ -2569,7 +2621,7 @@ static int histb_vdec_set_decoded_buffer_sizes(
 
 	/*
 	 * The surface geometry is fixed for the lifetime of a setup: it is
-	 * derived from the capture format and a per-stream flag such as
+	 * derived from the coded format and a per-stream flag such as
 	 * mpeg2_field_picture.  HEVC renegotiates the capture format on
 	 * every job, so releasing the surfaces here made the decoder
 	 * pipeline fail to reset on each frame (-110, ETIMEDOUT) and the
@@ -3388,10 +3440,17 @@ histb_vdec_sync_apc(struct histb_vdec_ctx *ctx,
 	return 0;
 }
 
+static bool histb_vdec_retain_hevc_surfaces(const struct histb_vdec_ctx *ctx)
+{
+	return ctx->src.pix.pixelformat == V4L2_PIX_FMT_HEVC_SLICE &&
+		(ctx->dst.pix.width < ctx->src.pix.width ||
+		 ctx->dst.pix.height < ctx->src.pix.height);
+}
+
 static int
 histb_vdec_sync_hevc_apc(struct histb_vdec_ctx *ctx,
-			 const struct v4l2_ctrl_hevc_decode_params *decode,
-			 s8 dpb_to_apc[V4L2_HEVC_DPB_ENTRIES_NUM_MAX])
+				 const struct v4l2_ctrl_hevc_decode_params *decode,
+				 s8 dpb_to_apc[V4L2_HEVC_DPB_ENTRIES_NUM_MAX])
 {
 	struct histb_vdec_decoded_buffer *active[V4L2_HEVC_DPB_ENTRIES_NUM_MAX] = {};
 	bool keep[V4L2_HEVC_DPB_ENTRIES_NUM_MAX] = {};
@@ -3420,7 +3479,8 @@ histb_vdec_sync_hevc_apc(struct histb_vdec_ctx *ctx,
 		if (!ctx->apc[slot] || keep[slot])
 			continue;
 		ctx->apc[slot]->apc_slot = HISTB_VDEC_APC_INVALID;
-		histb_vdec_free_decoded_buffers(ctx, ctx->apc[slot]);
+		if (!histb_vdec_retain_hevc_surfaces(ctx))
+			histb_vdec_free_decoded_buffers(ctx, ctx->apc[slot]);
 		ctx->apc[slot] = NULL;
 	}
 	for (i = 0; i < decode->num_active_dpb_entries; i++) {
@@ -3623,6 +3683,7 @@ histb_vdec_reclaim_decoded_buffers(struct histb_vdec_ctx *ctx,
 		/* H.264 references may leave the request DPB and reappear after MMCO. */
 		if (decoded == output ||
 		    ctx->src.pix.pixelformat == V4L2_PIX_FMT_H264_SLICE ||
+		    histb_vdec_retain_hevc_surfaces(ctx) ||
 		    (ctx->src.pix.pixelformat == V4L2_PIX_FMT_AVS_SLICE &&
 		     decoded->avs.valid) ||
 		    decoded->vp9_dpb_valid ||
@@ -3774,8 +3835,8 @@ static __le16 histb_vdec_p010_sample(const u8 *high, u8 low, u32 offset,
 static void histb_vdec_detile_nv12(struct histb_vdec_ctx *ctx,
 				   const u8 *src, u8 *dst, bool swap_uv)
 {
-	u32 width = ctx->dst.pix.width;
-	u32 height = ctx->dst.pix.height;
+	u32 width = ctx->src.pix.width;
+	u32 height = ctx->src.pix.height;
 	u32 stride = histb_vdec_surface_stride(ctx);
 	u32 chroma_base = stride *
 		ALIGN(height, histb_vdec_surface_height_align(ctx));
@@ -3822,8 +3883,8 @@ static void histb_vdec_detile_nv12(struct histb_vdec_ctx *ctx,
 static void histb_vdec_detile_p010(struct histb_vdec_ctx *ctx,
 				   const u8 *src, __le16 *dst)
 {
-	u32 width = ctx->dst.pix.width;
-	u32 height = ctx->dst.pix.height;
+	u32 width = ctx->src.pix.width;
+	u32 height = ctx->src.pix.height;
 	u32 stride = histb_vdec_surface_stride(ctx);
 	u32 aligned_height = ALIGN(height, histb_vdec_surface_height_align(ctx));
 	u32 chroma_base = stride * aligned_height;
@@ -3981,6 +4042,81 @@ static dma_addr_t histb_vdec_capture_dma(struct vb2_buffer *vb,
 	return vb2_dma_contig_plane_dma_addr(vb, plane);
 }
 
+/*
+ * Advance the VPSS four-field reference list exactly as the BSP does between
+ * H265 Step1 and Step2.  During startup the missing older fields are aliases
+ * of the first valid field; once full, the oldest field is discarded for
+ * every newly inserted field.
+ */
+static void histb_vdec_dei_push_field(struct histb_vdec_ctx *ctx,
+				      dma_addr_t field,
+				      struct histb_vpss_dei_frame *d)
+{
+	if (ctx->dei_fields == ARRAY_SIZE(ctx->dei_field)) {
+		memmove(&ctx->dei_field[0], &ctx->dei_field[1],
+			(sizeof(ctx->dei_field[0]) *
+			 (ARRAY_SIZE(ctx->dei_field) - 1)));
+		ctx->dei_fields--;
+	}
+
+	ctx->dei_field[ctx->dei_fields++] = field;
+
+	switch (ctx->dei_fields) {
+	case 1:
+		d->ref_dma = ctx->dei_field[0];
+		d->cur_dma = ctx->dei_field[0];
+		d->nxt1_dma = ctx->dei_field[0];
+		d->nxt2_dma = ctx->dei_field[0];
+		break;
+	case 2:
+		d->ref_dma = ctx->dei_field[0];
+		d->cur_dma = ctx->dei_field[0];
+		d->nxt1_dma = ctx->dei_field[0];
+		d->nxt2_dma = ctx->dei_field[1];
+		break;
+	case 3:
+		d->ref_dma = ctx->dei_field[0];
+		d->cur_dma = ctx->dei_field[0];
+		d->nxt1_dma = ctx->dei_field[1];
+		d->nxt2_dma = ctx->dei_field[2];
+		break;
+	default:
+		d->ref_dma = ctx->dei_field[0];
+		d->cur_dma = ctx->dei_field[1];
+		d->nxt1_dma = ctx->dei_field[2];
+		d->nxt2_dma = ctx->dei_field[3];
+		break;
+	}
+}
+
+static bool
+histb_vdec_dei_picture(const struct histb_vdec_ctx *ctx,
+			const struct histb_vdec_decoded_buffer *decoded,
+			bool *top_field_first)
+{
+	*top_field_first = true;
+
+	/*
+	 * The AVS request API is frame based.  A field-structured AVS+ picture
+	 * still submits both fields and all slices in one request, so the
+	 * reconstructed capture surface is a complete woven frame here.
+	 */
+	if (ctx->avs) {
+		if (!decoded->avs.interlaced)
+			return false;
+		*top_field_first = decoded->avs.top_field_first;
+		return true;
+	}
+
+	if (ctx->mbaff)
+		return true;
+	if (!ctx->h264_field_picture || !ctx->h264_second_field)
+		return false;
+
+	*top_field_first = !ctx->h264_pending_bottom;
+	return true;
+}
+
 static int histb_vdec_copy_capture(struct histb_vdec_ctx *ctx)
 {
 	struct histb_vdec_decoded_buffer *decoded;
@@ -3988,6 +4124,8 @@ static int histb_vdec_copy_capture(struct histb_vdec_ctx *ctx)
 	struct vb2_v4l2_buffer *dst_buf;
 	dma_addr_t dst_dma;
 	u8 *dst;
+	bool top_field_first;
+	bool deinterlace;
 	int ret;
 
 	dst_buf = v4l2_m2m_next_dst_buf(ctx->fh.m2m_ctx);
@@ -4006,25 +4144,14 @@ static int histb_vdec_copy_capture(struct histb_vdec_ctx *ctx)
 		dst += dst_buf->vb2_buf.planes[0].data_offset;
 
 	/*
-	 * The VDH completion IRQ can precede the final 4K FSP store bursts.
-	 * Poll for the state to settle instead of always paying a fixed 50 ms:
-	 * in the common case it is already final, and 50 ms out of the ~166 ms
-	 * a 4K frame costs was pure waste.  Bail out as soon as DECODE_DONE is
-	 * visible and the state stops changing.
+	 * The threaded IRQ publishes post-processing only after validating the
+	 * completed picture state, its UP reports and both SMMU status words.
+	 * HISTB_VDEC_STATE is cleared as that interrupt is acknowledged, so
+	 * polling it here can never prove that later FSP stores finished; the old
+	 * loop consequently paid its full 60 ms budget on every 4K picture.
+	 * Order the already completed DMA writes before handing the surface to
+	 * VPSS instead.
 	 */
-	if (ctx->dst.pix.width >= 3840) {
-		u32 prev = 0, cur = 0;
-		unsigned int spin;
-
-		for (spin = 0; spin < 60; spin++) {
-			cur = readl(ctx->vdec->regs + HISTB_VDEC_STATE);
-			if (spin && cur == prev &&
-			    (cur & HISTB_VDEC_STATE_DECODE_DONE))
-				break;
-			prev = cur;
-			usleep_range(500, 1000);
-		}
-	}
 	dma_rmb();
 	/* VC-1 reconstruction surfaces are allocated non-coherent.  The VDH
 	 * completion only orders the engine; it does not invalidate the VPSS
@@ -4034,19 +4161,13 @@ static int histb_vdec_copy_capture(struct histb_vdec_ctx *ctx)
 					decoded->tile.size, DMA_BIDIRECTIONAL);
 	memset(&frame, 0, sizeof(frame));
 	frame.input_dma = decoded->tile.dma;
+	frame.input_size = decoded->tile.size;
 	if (ctx->dst.pix.pixelformat == V4L2_PIX_FMT_NV12)
 		frame.output_dma = dst_dma;
 	frame.output_cpu = dst;
-	/*
-	 * Input and output are the same size: this driver does not scale.
-	 * Splitting them to engage the VPSS ZME was tried (histb_vdec_core)
-	 * and made things worse - 1080p transcoding fell from 0.91x to 0.73x
-	 * and 4K produced almost no output, because ctx->src.pix is not yet
-	 * the decoded size at this point.  Do not reintroduce it without
-	 * first proving ctx->src is populated.
-	 */
-	frame.input_width = ctx->dst.pix.width;
-	frame.input_height = ctx->dst.pix.height;
+	/* VDH reconstructs at the coded size; VPSS writes the negotiated size. */
+	frame.input_width = ctx->src.pix.width;
+	frame.input_height = ctx->src.pix.height;
 	frame.width = ctx->dst.pix.width;
 	frame.height = ctx->dst.pix.height;
 	if (ctx->vc1 && ctx->vc1_annex_l &&
@@ -4060,68 +4181,144 @@ static int histb_vdec_copy_capture(struct histb_vdec_ctx *ctx)
 	frame.input_ten_bit = ctx->hevc_main10;
 	frame.output_ten_bit =
 		ctx->dst.pix.pixelformat == V4L2_PIX_FMT_P010;
+	deinterlace = histb_vdec_dei_picture(ctx, decoded, &top_field_first);
 	/*
 	 * Interlaced streams can be turned into progressive frames by the VPSS
-	 * DI block instead of by detiling the woven surface.  It wants four
-	 * consecutive fields, so the first three go into the ring and only the
-	 * fourth actually runs the block; until the ring is full the old path
-	 * is taken, which also keeps a single-frame stream correct.
+	 * DI block instead of by detiling the woven surface.  It consumes a
+	 * rolling four-field window.  During startup the vendor driver aliases
+	 * the missing history to the oldest available field, so a DEI job is
+	 * submitted for every arriving field rather than waiting for four.
 	 *
-	 * A field sits inside the woven surface, so it needs no extra
-	 * allocation: the top field starts at the tile base and the bottom
-	 * field one field-stride further in.
+	 * A field sits inside the woven surface, so it needs no extra allocation.
+	 * The vendor path advances a linear bottom field by one pitch and also sets
+	 * bfield_mode for the field being emitted.
 	 *
 	 * histb_vpss_dei() rejects anything above 1920x1088, which is where the
 	 * vendor validation starts forcing progressive, so a 4K interlaced
 	 * source falls back to this path automatically.
 	 */
-	if (dei && (ctx->mbaff || ctx->h264_field_picture) &&
+	if ((dei || ctx->dei_field_rate) &&
+	    frame.input_width == frame.width &&
+	    frame.input_height == frame.height &&
+	    deinterlace &&
 	    ctx->dst.pix.pixelformat == V4L2_PIX_FMT_NV12 && dst_dma) {
 		u32 field_height = frame.height / 2;
-		u32 field_stride = frame.input_stride * field_height;
-
-		dma_addr_t field = decoded->tile.dma;
+		u32 lstride = ALIGN(frame.width, 256);
+		size_t slot = (size_t)lstride * frame.height * 3 / 2;
 		struct histb_vpss_dei_frame d;
+		dma_addr_t new_field[2];
+		bool new_bottom[2];
+		bool detiled = false;
 		unsigned int i;
 
-		/* Two fields per woven frame, alternating top and bottom. */
-		for (i = 0; i < 2 && ctx->dei_fields < ARRAY_SIZE(ctx->dei_field);
-		     i++) {
-			bool bottom = (ctx->dst.sequence & 1) ? !i : i;
+		/*
+		 * Linux detiles a complete woven picture at once.  Keep three frame
+		 * surfaces so the next picture cannot overwrite the oldest field still
+		 * present in the rolling four-field window.
+		 */
+		if (!ctx->dei_lin || ctx->dei_lin_size < 3 * slot) {
+			if (ctx->dei_lin)
+				dma_free_noncoherent(ctx->vdec->dev,
+						     ctx->dei_lin_size,
+						     ctx->dei_lin,
+						     ctx->dei_lin_dma,
+						     DMA_BIDIRECTIONAL);
+			ctx->dei_lin = dma_alloc_noncoherent(ctx->vdec->dev,
+							     3 * slot,
+							     &ctx->dei_lin_dma,
+							     DMA_BIDIRECTIONAL,
+							     GFP_KERNEL);
+			ctx->dei_lin_size = ctx->dei_lin ? 3 * slot : 0;
+			ctx->dei_slot = 0;
+			ctx->dei_fields = 0;
+		}
+		if (ctx->dei_lin) {
+			dma_addr_t base = ctx->dei_lin_dma +
+					  ctx->dei_slot * slot;
+			struct histb_vpss_frame lf;
 
-			ctx->dei_field[ctx->dei_fields++] =
-				field + (bottom ? field_stride : 0);
+			/*
+			 * The de-interlacer consumes linear fields, but the parser
+			 * hands over a tiled surface.  The BSP never feeds DEI
+			 * straight from the parser either: its interlace step runs
+			 * first and chooses the port output path.  Do the same here
+			 * - one detile pass per picture into a ring slot, then give
+			 * DEI four linear fields.
+			 */
+			memset(&lf, 0, sizeof(lf));
+			lf.input_dma = decoded->tile.dma;
+			lf.input_size = decoded->tile.size;
+			lf.output_dma = base;
+			lf.input_width = frame.width;
+			lf.input_height = frame.height;
+			lf.width = frame.width;
+			lf.height = frame.height;
+			lf.input_stride = frame.input_stride;
+			lf.input_height_align = frame.input_height_align;
+			lf.output_stride = lstride;
+			lf.input_ten_bit = frame.input_ten_bit;
+			if (!histb_vpss_detile(ctx->vdec->vpss, &lf)) {
+				ctx->dei_slot = (ctx->dei_slot + 1) % 3;
+				for (i = 0; i < ARRAY_SIZE(new_field); i++) {
+					bool bottom = top_field_first ? i : !i;
+
+					/* VPSS_IMG_CopyAddr(): linear bottom field += pitch. */
+					new_field[i] = base + (bottom ? lstride : 0);
+					new_bottom[i] = bottom;
+				}
+				detiled = true;
+			}
 		}
 
-		if (ctx->dei_fields == ARRAY_SIZE(ctx->dei_field)) {
+		if (detiled) {
 			memset(&d, 0, sizeof(d));
-			/*
-			 * Field order follows VPSS_HAL_SetDeiCfg(): the newest field is
-			 * the one the engine takes through the NEXT2 slot and the oldest
-			 * is LAST.  This driver had it the other way round.
-			 */
-			d.ref_dma = ctx->dei_field[3];
-			d.cur_dma = ctx->dei_field[2];
-			d.nxt1_dma = ctx->dei_field[1];
-			d.nxt2_dma = ctx->dei_field[0];
 			d.width = frame.width;
 			d.height = field_height;
+			/* H.265 Step2 field mode takes the linear frame pitch here. */
+			d.stride = lstride;
 			/*
-			 * The parser hands us a tiled surface but the de-interlacer is
-			 * programmed for linear input (the BSP sets ImgTile(FALSE) on all
-			 * four fields and runs a separate interlace step ahead of DEI).
-			 * Feeding a tile pitch as a linear stride made the engine walk 24
-			 * lines and then stall - DIESTA read cur_state=8, l_height_cnt=24.
-			 * Use the linear pitch instead.
+			 * The port writes the de-interlaced frame to the capture
+			 * surface at the capture surface's own pitch, which the
+			 * format code sets to the same value the detile path
+			 * writes with.
 			 */
-			d.stride = ALIGN(frame.width, 256);
-			d.top_field_first = true;
+			d.output_stride = frame.output_stride;
+			d.top_field_first = top_field_first;
 			d.ten_bit = frame.input_ten_bit;
-			d.tile = true;
-			ret = histb_vpss_dei(ctx->vdec->vpss, &d, dst_dma);
-			ctx->dei_fields = 0;
+			d.tile = false;
+
+			if (ctx->dei_field_rate) {
+				/*
+				 * Keep each field-rate output in one complete negotiated
+				 * NV12 surface.  For a 1080-line H.264 picture the request
+				 * API negotiates a 1088-line capture surface, so this is
+				 * 1920 * 1088 * 3 / 2 rather than a visible-height or
+				 * page-aligned approximation.
+				 */
+				size_t frame_size = (size_t)frame.output_stride *
+						    frame.height * 3 / 2;
+
+				for (i = 0; i < ARRAY_SIZE(new_field); i++) {
+					/*
+					 * The BSP advances its four-entry field reference head
+					 * once per Step2 job.  Snapshot the window immediately
+					 * after inserting this field, then emit that field.
+					 */
+					histb_vdec_dei_push_field(ctx, new_field[i], &d);
+					d.bottom_field = new_bottom[i];
+					ret = histb_vpss_dei(ctx->vdec->vpss, &d,
+							      dst_dma + i * frame_size);
+					if (ret)
+						break;
+				}
+			} else {
+				for (i = 0; i < ARRAY_SIZE(new_field); i++)
+					histb_vdec_dei_push_field(ctx, new_field[i], &d);
+				d.bottom_field = new_bottom[1];
+				ret = histb_vpss_dei(ctx->vdec->vpss, &d, dst_dma);
+			}
 		} else {
-			ret = -EAGAIN;
+			ret = ctx->dei_lin ? -EIO : -ENOMEM;
 		}
 
 		if (!ret) {
@@ -4130,8 +4327,9 @@ static int histb_vdec_copy_capture(struct histb_vdec_ctx *ctx)
 				return ret;
 			return histb_vdec_apply_vc1_range_map(ctx, dst_buf, dst);
 		}
-		if (ret != -EAGAIN)
-			ctx->dei_fields = 0;
+		ctx->dei_fields = 0;
+		if (ctx->dei_field_rate)
+			return ret;
 	}
 	ret = histb_vpss_detile(ctx->vdec->vpss, &frame);
 	if (!ret) {
@@ -4150,6 +4348,15 @@ static int histb_vdec_copy_capture(struct histb_vdec_ctx *ctx)
 	dev_warn_ratelimited(ctx->vdec->dev,
 			     "VPSS post-process failed (%d), using CPU fallback\n",
 			     ret);
+	/*
+	 * The legacy CPU path cannot safely downscale into a capture buffer that
+	 * is smaller than the reconstructed surface.  Keep the existing VC-1
+	 * RESPIC upscale fallback, which expands in-place from the end of the
+	 * destination buffer.
+	 */
+	if (frame.input_width > frame.width ||
+	    frame.input_height > frame.height)
+		return ret;
 	if (!dst)
 		return ret;
 	ret = histb_vdec_capture_begin_cpu_access(&dst_buf->vb2_buf);
@@ -4203,10 +4410,8 @@ static __le32 *histb_vdec_msg_slot(struct histb_vdec_ctx *ctx,
 	       slot * HISTB_VDEC_H264_MSG_SLOT_SIZE;
 }
 
-static __le32 *histb_vdec_hevc_msg_slot(struct histb_vdec_ctx *ctx,
-					unsigned int slot)
+static __le32 *histb_vdec_hevc_msg_slot(__le32 *base, unsigned int slot)
 {
-	__le32 *base = ctx->buffers[HISTB_VDEC_BUF_MSG].cpu;
 	unsigned int words = slot;
 
 	words *= HISTB_VDEC_HEVC_MSG_SLOT_WORDS;
@@ -6589,6 +6794,8 @@ histb_vdec_prepare_avs_messages(struct histb_vdec_ctx *ctx,
 {
 	struct histb_vdec_avs_metadata metadata = {
 		.anchor = picture->picture_coding_type != V4L2_AVS_PICTURE_TYPE_B,
+		.interlaced = !(picture->flags &
+			V4L2_AVS_PICTURE_FLAG_PROGRESSIVE_FRAME),
 		.top_field_first = picture->flags &
 			V4L2_AVS_PICTURE_FLAG_TOP_FIELD_FIRST,
 		.picture_structure = picture->picture_structure,
@@ -7562,8 +7769,8 @@ histb_vdec_validate_hevc(struct histb_vdec_ctx *ctx,
 	ctb_log2 = min_cb_log2 +
 		sps->log2_diff_max_min_luma_coding_block_size;
 	if (ctb_log2 < 4 || ctb_log2 > 6 ||
-	    sps->pic_width_in_luma_samples != ctx->dst.pix.width ||
-	    sps->pic_height_in_luma_samples != ctx->dst.pix.height)
+	    sps->pic_width_in_luma_samples != ctx->src.pix.width ||
+	    sps->pic_height_in_luma_samples != ctx->src.pix.height)
 		return -EINVAL;
 	if (sps->flags & V4L2_HEVC_SPS_FLAG_PCM_ENABLED) {
 		min_pcm_log2 =
@@ -7878,6 +8085,7 @@ static void histb_vdec_write_hevc_weighted_list(
 
 static int histb_vdec_prepare_hevc_slice(
 		struct histb_vdec_ctx *ctx,
+		__le32 *msg_base,
 		struct histb_vdec_decoded_buffer *decoded,
 		const struct v4l2_ctrl_hevc_decode_params *decode,
 		const struct v4l2_ctrl_hevc_sps *sps,
@@ -7890,7 +8098,7 @@ static int histb_vdec_prepare_hevc_slice(
 		unsigned int slice_index,
 		unsigned int num_slices)
 {
-	__le32 *slice_msg = histb_vdec_hevc_msg_slot(ctx,
+	__le32 *slice_msg = histb_vdec_hevc_msg_slot(msg_base,
 		HISTB_VDEC_SLICE_MSG_SLOT + slice_index);
 	dma_addr_t msg_dma = histb_vdec_buffer_dma(ctx, HISTB_VDEC_BUF_MSG);
 	dma_addr_t stream = src_dma + stream_info->data_offset;
@@ -8056,7 +8264,9 @@ histb_vdec_prepare_hevc_messages(
 		dma_addr_t src_dma,
 		const struct histb_vdec_hevc_stream *streams)
 {
-	__le32 *pic = histb_vdec_hevc_msg_slot(ctx, HISTB_VDEC_PIC_MSG_SLOT);
+	__le32 *msg_base;
+	__le32 *pic;
+	u8 *dma_msg_base = ctx->buffers[HISTB_VDEC_BUF_MSG].cpu;
 	dma_addr_t msg_dma = histb_vdec_buffer_dma(ctx, HISTB_VDEC_BUF_MSG);
 	u32 min_cb_log2 = sps->log2_min_luma_coding_block_size_minus3 + 3;
 	u32 ctb_log2 = min_cb_log2 +
@@ -8082,18 +8292,60 @@ histb_vdec_prepare_hevc_messages(
 	s8 dpb_to_apc[V4L2_HEVC_DPB_ENTRIES_NUM_MAX];
 	u32 independent_addr = 0;
 	u32 value, i;
+	int ret;
 
-	if (histb_vdec_sync_hevc_apc(ctx, decode, dpb_to_apc))
+	if (ctx->hevc_msg_shadow_size < HISTB_VDEC_HEVC_MSG_SIZE) {
+		void *shadow;
+
+		shadow = kvzalloc(HISTB_VDEC_HEVC_MSG_SIZE, GFP_KERNEL);
+		if (!shadow)
+			return -ENOMEM;
+		kvfree(ctx->hevc_msg_shadow);
+		ctx->hevc_msg_shadow = shadow;
+		ctx->hevc_msg_shadow_size = HISTB_VDEC_HEVC_MSG_SIZE;
+	}
+	msg_base = ctx->hevc_msg_shadow;
+	pic = histb_vdec_hevc_msg_slot(msg_base, HISTB_VDEC_PIC_MSG_SLOT);
+
+	ret = histb_vdec_sync_hevc_apc(ctx, decode, dpb_to_apc);
+	if (ret) {
+		dev_err_ratelimited(ctx->vdec->dev,
+			"HEVC APC sync failed: ret=%d active=%u poc=%d\n",
+			ret, decode->num_active_dpb_entries,
+			decode->pic_order_cnt_val);
+		return ret;
+	}
+	ret = histb_vdec_hevc_init_tiles(pps, ctb_width, ctb_height, &tiles);
+	if (ret) {
+		dev_err_ratelimited(ctx->vdec->dev,
+			"HEVC tile setup failed: ret=%d ctb=%ux%u tiles=%ux%u flags=0x%llx\n",
+			ret, ctb_width, ctb_height, tiles.columns, tiles.rows,
+			(unsigned long long)pps->flags);
+		return ret;
+	}
+	if (decoded->apc_slot != HISTB_VDEC_APC_INVALID) {
+		dev_err_ratelimited(ctx->vdec->dev,
+			"HEVC output APC slot is still active: slot=%d poc=%d\n",
+			decoded->apc_slot, decode->pic_order_cnt_val);
 		return -EINVAL;
-	if (histb_vdec_hevc_init_tiles(pps, ctb_width, ctb_height, &tiles))
-		return -EINVAL;
-	if (decoded->apc_slot != HISTB_VDEC_APC_INVALID)
-		return -EINVAL;
+	}
 	histb_vdec_reclaim_decoded_buffers(ctx, decoded);
-	if (histb_vdec_alloc_decoded_buffers(ctx, decoded))
-		return -ENOMEM;
-	memset(ctx->buffers[HISTB_VDEC_BUF_MSG].cpu, 0,
-	       ctx->buffers[HISTB_VDEC_BUF_MSG].size);
+	ret = histb_vdec_alloc_decoded_buffers(ctx, decoded);
+	if (ret) {
+		dev_err_ratelimited(ctx->vdec->dev,
+			"HEVC surface allocation failed: ret=%d size=%ux%u\n",
+			ret, ctx->dst.pix.width, ctx->dst.pix.height);
+		return ret;
+	}
+	/* Only these message slots participate in this request.  The HEVC
+	 * buffer is sized for 200 slices, so clearing it in full on an ordinary
+	 * one-slice frame needlessly writes roughly 260 KiB through an uncached
+	 * coherent mapping. */
+	memset(histb_vdec_hevc_msg_slot(msg_base, HISTB_VDEC_UP_MSG_SLOT), 0,
+	       HISTB_VDEC_HEVC_MSG_SLOT_SIZE);
+	memset(pic, 0, HISTB_VDEC_HEVC_MSG_SLOT_SIZE);
+	memset(histb_vdec_hevc_msg_slot(msg_base, HISTB_VDEC_SLICE_MSG_SLOT), 0,
+	       num_slices * HISTB_VDEC_HEVC_MSG_SLOT_SIZE);
 	memset(ctx->buffers[HISTB_VDEC_BUF_APC_MV].cpu, 0,
 	       V4L2_HEVC_DPB_ENTRIES_NUM_MAX * sizeof(__le32));
 	histb_vdec_write_hevc_tile_info(ctx, &tiles, ctb_log2);
@@ -8207,14 +8459,29 @@ histb_vdec_prepare_hevc_messages(
 		if (!(slices[i].flags &
 		      V4L2_HEVC_SLICE_PARAMS_FLAG_DEPENDENT_SLICE_SEGMENT))
 			independent_addr = slices[i].slice_segment_addr;
-		ret = histb_vdec_prepare_hevc_slice(ctx, decoded, decode, sps, pps,
+		ret = histb_vdec_prepare_hevc_slice(ctx, msg_base, decoded, decode, sps, pps,
 						    &slices[i], dpb_to_apc, src_dma, &streams[i],
 			&tiles, ctb_width, end_rs, end_ts, independent_addr,
 			i, num_slices);
-		if (ret)
+		if (ret) {
+			dev_err_ratelimited(ctx->vdec->dev,
+				"HEVC slice setup failed: ret=%d index=%u type=%u refs=%u/%u temporal_mvp=%u poc=%d\n",
+				ret, i, slices[i].slice_type,
+				slices[i].num_ref_idx_l0_active_minus1 + 1,
+				slices[i].num_ref_idx_l1_active_minus1 + 1,
+				!!(slices[i].flags & V4L2_HEVC_SLICE_PARAMS_FLAG_SLICE_TEMPORAL_MVP_ENABLED),
+				slices[i].slice_pic_order_cnt);
 			return ret;
+		}
 	}
-
+	/* The VDH consumes the coherent message allocation.  Keep the expensive
+	 * construction cacheable and publish only the active HEVC slots. */
+	memcpy(dma_msg_base + HISTB_VDEC_UP_MSG_SLOT *
+		       HISTB_VDEC_HEVC_MSG_SLOT_SIZE,
+	       (u8 *)msg_base + HISTB_VDEC_UP_MSG_SLOT *
+		       HISTB_VDEC_HEVC_MSG_SLOT_SIZE,
+	       (HISTB_VDEC_SLICE_MSG_SLOT + num_slices) *
+	       HISTB_VDEC_HEVC_MSG_SLOT_SIZE);
 	return 0;
 }
 
@@ -10798,8 +11065,8 @@ static bool histb_vdec_vp9_up_message_valid(const struct histb_vdec_ctx *ctx,
 						     u32 smmu_state_secure,
 						     u32 smmu_state_nonsecure)
 {
-	u32 total_sbs = DIV_ROUND_UP(ctx->dst.pix.width, 64) *
-			DIV_ROUND_UP(ctx->dst.pix.height, 64);
+	u32 total_sbs = DIV_ROUND_UP(ctx->src.pix.width, 64) *
+			DIV_ROUND_UP(ctx->src.pix.height, 64);
 	u32 reports = state & GENMASK(16, 0);
 	u32 covered = 0;
 	unsigned int i;
@@ -11253,7 +11520,7 @@ static void histb_vdec_program_mpeg2_registers(
 	writel(0, vdec->regs + HISTB_VDEC_SCD_AVS_FLAG);
 	writel(1, vdec->regs + HISTB_VDEC_SCD_VDH_SELRST);
 	writel(HISTB_VDEC_SCD_EMAR_BASE |
-	       (DIV_ROUND_UP(ctx->dst.pix.width, 16) <= 256 ?
+	       (DIV_ROUND_UP(ctx->src.pix.width, 16) <= 256 ?
 		HISTB_VDEC_SCD_EMAR_ENABLE : 0),
 	       vdec->regs + HISTB_VDEC_SCD_EMAR_CFG);
 	for (offset = HISTB_VDEC_TIMEOUT_FIRST;
@@ -11261,10 +11528,10 @@ static void histb_vdec_program_mpeg2_registers(
 		writel(HISTB_VDEC_TIMEOUT_VALUE, vdec->regs + offset);
 	writel(lower_32_bits(round_down(decoded->tile.dma, 16)),
 	       vdec->regs + HISTB_VDEC_CURRENT_Y);
-	writel(histb_vdec_tile_stride(ctx->dst.pix.width) * 16,
+	writel(histb_vdec_tile_stride(ctx->src.pix.width) * 16,
 	       vdec->regs + HISTB_VDEC_Y_STRIDE);
-	writel(histb_vdec_tile_stride(ctx->dst.pix.width) *
-	       ALIGN(ctx->dst.pix.height,
+	writel(histb_vdec_tile_stride(ctx->src.pix.width) *
+	       ALIGN(ctx->src.pix.height,
 		     histb_vdec_surface_height_align(ctx)),
 	       vdec->regs + HISTB_VDEC_CHROMA_OFFSET);
 	writel(0, vdec->regs + HISTB_VDEC_HEAD_INFO_OFFSET);
@@ -11344,7 +11611,7 @@ static void histb_vdec_program_vc1_registers(
 	dma_addr_t msg_dma = histb_vdec_buffer_dma(ctx, HISTB_VDEC_BUF_MSG);
 	dma_addr_t bpd_dma = histb_vdec_buffer_dma(ctx, HISTB_VDEC_BUF_VC1_BPD);
 	u32 bpd_base = lower_32_bits(bpd_dma);
-	u32 height = ALIGN(ctx->dst.pix.height, 32);
+	u32 height = ALIGN(ctx->src.pix.height, 32);
 	u32 stride = histb_vdec_surface_stride(ctx);
 	u32 bpd_stride = ((DIV_ROUND_UP(ctx->vc1_pending_picture.coded_width, 16) +
 			   127) >> 7) << 4;
@@ -11368,7 +11635,7 @@ static void histb_vdec_program_vc1_registers(
 	writel(0, vdec->regs + HISTB_VDEC_SCD_AVS_FLAG);
 	writel(1, vdec->regs + HISTB_VDEC_SCD_VDH_SELRST);
 	writel(HISTB_VDEC_SCD_EMAR_BASE |
-	       (DIV_ROUND_UP(ctx->dst.pix.width, 16) <= 256 ?
+	       (DIV_ROUND_UP(ctx->src.pix.width, 16) <= 256 ?
 		HISTB_VDEC_SCD_EMAR_ENABLE : 0),
 	       vdec->regs + HISTB_VDEC_SCD_EMAR_CFG);
 	for (offset = HISTB_VDEC_TIMEOUT_FIRST;
@@ -11440,7 +11707,7 @@ static void histb_vdec_program_vp8_registers(
 	writel(0, vdec->regs + HISTB_VDEC_SCD_AVS_FLAG);
 	writel(1, vdec->regs + HISTB_VDEC_SCD_VDH_SELRST);
 	writel(HISTB_VDEC_SCD_EMAR_BASE |
-	       (DIV_ROUND_UP(ctx->dst.pix.width, 16) <= 256 ?
+	       (DIV_ROUND_UP(ctx->src.pix.width, 16) <= 256 ?
 		HISTB_VDEC_SCD_EMAR_ENABLE : 0),
 	       vdec->regs + HISTB_VDEC_SCD_EMAR_CFG);
 	for (offset = HISTB_VDEC_TIMEOUT_FIRST;
@@ -11448,10 +11715,10 @@ static void histb_vdec_program_vp8_registers(
 		writel(HISTB_VDEC_TIMEOUT_VALUE, vdec->regs + offset);
 	writel(lower_32_bits(round_down(decoded->tile.dma, 16)),
 	       vdec->regs + HISTB_VDEC_CURRENT_Y);
-	writel(histb_vdec_tile_stride(ctx->dst.pix.width) * 16,
+	writel(histb_vdec_tile_stride(ctx->src.pix.width) * 16,
 	       vdec->regs + HISTB_VDEC_Y_STRIDE);
-	writel(histb_vdec_tile_stride(ctx->dst.pix.width) *
-	       ALIGN(ctx->dst.pix.height, 16),
+	writel(histb_vdec_tile_stride(ctx->src.pix.width) *
+	       ALIGN(ctx->src.pix.height, 16),
 	       vdec->regs + HISTB_VDEC_CHROMA_OFFSET);
 	writel(0, vdec->regs + HISTB_VDEC_HEAD_INFO_OFFSET);
 	writel(0, vdec->regs + HISTB_VDEC_LINE_NUM_ADDR);
@@ -11504,20 +11771,20 @@ static void histb_vdec_program_vp9_registers(
 	writel(0, vdec->regs + HISTB_VDEC_SCD_AVS_FLAG);
 	writel(1, vdec->regs + HISTB_VDEC_SCD_VDH_SELRST);
 	writel(HISTB_VDEC_SCD_EMAR_BASE |
-	       (DIV_ROUND_UP(ctx->dst.pix.width, 8) <= 256 ?
+	       (DIV_ROUND_UP(ctx->src.pix.width, 8) <= 256 ?
 		HISTB_VDEC_SCD_EMAR_ENABLE : 0),
 	       vdec->regs + HISTB_VDEC_SCD_EMAR_CFG);
 	for (offset = HISTB_VDEC_TIMEOUT_FIRST;
 	     offset <= HISTB_VDEC_TIMEOUT_LAST; offset += 4)
 		writel(HISTB_VDEC_TIMEOUT_VALUE, vdec->regs + offset);
-	writel(ALIGN(ctx->dst.pix.height, 64),
+	writel(ALIGN(ctx->src.pix.height, 64),
 	       vdec->regs + HISTB_VDEC_STORE_PARAM);
 	writel(lower_32_bits(round_down(decoded->tile.dma, 16)),
 	       vdec->regs + HISTB_VDEC_CURRENT_Y);
 	writel(histb_vdec_surface_stride(ctx) * 16,
 	       vdec->regs + HISTB_VDEC_Y_STRIDE);
 	writel(histb_vdec_surface_stride(ctx) *
-	       ALIGN(ctx->dst.pix.height, histb_vdec_surface_height_align(ctx)),
+	       ALIGN(ctx->src.pix.height, histb_vdec_surface_height_align(ctx)),
 	       vdec->regs + HISTB_VDEC_CHROMA_OFFSET);
 	writel(0, vdec->regs + HISTB_VDEC_HEAD_INFO_OFFSET);
 	writel(0, vdec->regs + HISTB_VDEC_LINE_NUM_ADDR);
@@ -11574,7 +11841,7 @@ static void histb_vdec_program_registers(struct histb_vdec_ctx *ctx,
 	writel(0, vdec->regs + HISTB_VDEC_SCD_AVS_FLAG);
 	writel(1, vdec->regs + HISTB_VDEC_SCD_VDH_SELRST);
 	writel(HISTB_VDEC_SCD_EMAR_BASE |
-	       (DIV_ROUND_UP(ctx->dst.pix.width, 16) <= 256 ?
+	       (DIV_ROUND_UP(ctx->src.pix.width, 16) <= 256 ?
 		HISTB_VDEC_SCD_EMAR_ENABLE : 0),
 	       vdec->regs + HISTB_VDEC_SCD_EMAR_CFG);
 	for (offset = HISTB_VDEC_TIMEOUT_FIRST;
@@ -11583,10 +11850,10 @@ static void histb_vdec_program_registers(struct histb_vdec_ctx *ctx,
 
 	writel(lower_32_bits(round_down(decoded->tile.dma, 16)),
 	       vdec->regs + HISTB_VDEC_CURRENT_Y);
-	writel(histb_vdec_tile_stride(ctx->dst.pix.width) * 16,
+	writel(histb_vdec_tile_stride(ctx->src.pix.width) * 16,
 	       vdec->regs + HISTB_VDEC_Y_STRIDE);
-	writel(histb_vdec_tile_stride(ctx->dst.pix.width) *
-	       ALIGN(ctx->dst.pix.height, 16),
+	writel(histb_vdec_tile_stride(ctx->src.pix.width) *
+	       ALIGN(ctx->src.pix.height, 16),
 	       vdec->regs + HISTB_VDEC_CHROMA_OFFSET);
 	writel(0, vdec->regs + HISTB_VDEC_HEAD_INFO_OFFSET);
 	writel(0, vdec->regs + HISTB_VDEC_LINE_NUM_ADDR);
@@ -11627,7 +11894,7 @@ histb_vdec_program_avs_registers(struct histb_vdec_ctx *ctx,
 	u32 chroma_offset;
 	u32 offset;
 
-	chroma_offset = stride * ALIGN(ctx->dst.pix.height,
+	chroma_offset = stride * ALIGN(ctx->src.pix.height,
 					      histb_vdec_surface_height_align(ctx));
 	dnr_mbinfo = histb_vdec_buffer_dma(ctx, HISTB_VDEC_BUF_AVS_DNR_MBINFO);
 	writel(~0U, vdec->regs + HISTB_VDEC_INT_MASK);
@@ -11647,7 +11914,7 @@ histb_vdec_program_avs_registers(struct histb_vdec_ctx *ctx,
 	writel(1, vdec->regs + HISTB_VDEC_SCD_AVS_FLAG);
 	writel(1, vdec->regs + HISTB_VDEC_SCD_VDH_SELRST);
 	writel(HISTB_VDEC_SCD_EMAR_BASE |
-	       (DIV_ROUND_UP(ctx->dst.pix.width, 16) <= 120 ?
+	       (DIV_ROUND_UP(ctx->src.pix.width, 16) <= 120 ?
 		HISTB_VDEC_SCD_EMAR_ENABLE : 0),
 	       vdec->regs + HISTB_VDEC_SCD_EMAR_CFG);
 	for (offset = HISTB_VDEC_TIMEOUT_FIRST;
@@ -11712,7 +11979,7 @@ static void histb_vdec_program_hevc_registers(
 	writel(0, vdec->regs + HISTB_VDEC_SCD_AVS_FLAG);
 	writel(1, vdec->regs + HISTB_VDEC_SCD_VDH_SELRST);
 	writel(HISTB_VDEC_SCD_EMAR_BASE |
-	       (DIV_ROUND_UP(ctx->dst.pix.width, 16) <= 256 ?
+	       (DIV_ROUND_UP(ctx->src.pix.width, 16) <= 256 ?
 		HISTB_VDEC_SCD_EMAR_ENABLE : 0),
 	       vdec->regs + HISTB_VDEC_SCD_EMAR_CFG);
 	for (offset = HISTB_VDEC_TIMEOUT_FIRST;
@@ -11723,14 +11990,14 @@ static void histb_vdec_program_hevc_registers(
 	writel(histb_vdec_surface_stride(ctx) * 16,
 	       vdec->regs + HISTB_VDEC_Y_STRIDE);
 	writel(histb_vdec_surface_stride(ctx) *
-	       ALIGN(ctx->dst.pix.height, histb_vdec_surface_height_align(ctx)),
+	       ALIGN(ctx->src.pix.height, histb_vdec_surface_height_align(ctx)),
 	       vdec->regs + HISTB_VDEC_CHROMA_OFFSET);
 	writel(0, vdec->regs + HISTB_VDEC_HEAD_INFO_OFFSET);
 	writel(0, vdec->regs + HISTB_VDEC_STORE_PARAM);
 	writel(0, vdec->regs + HISTB_VDEC_LINE_NUM_ADDR);
 	if (ctx->hevc_main10) {
 		u32 stride = histb_vdec_surface_stride(ctx);
-		u32 height = ALIGN(ctx->dst.pix.height,
+		u32 height = ALIGN(ctx->src.pix.height,
 				   histb_vdec_surface_height_align(ctx));
 
 		writel(stride * 8,
@@ -11977,7 +12244,7 @@ static int histb_vdec_prepare_rv(
 	picture.slice_msg_addr = picture.pic_msg_addr;
 	picture.stream_base_addr = lower_32_bits(*src_dma);
 	picture.ddr_stride = stride * 16;
-	picture.uv_offset = stride * ALIGN(ctx->dst.pix.height, 32);
+	picture.uv_offset = stride * ALIGN(ctx->src.pix.height, 32);
 	/*
 	 * Fields RV-SPEC leaves open, kept at the values the sibling codecs use
 	 * rather than guessed: no compressed surfaces (Q4), no MMU translation in
@@ -12721,6 +12988,8 @@ static void histb_vdec_device_run(void *priv)
 						 V4L2_CID_STATELESS_HEVC_ENTRY_POINT_OFFSETS);
 		if (!hevc_decode || !hevc_slice || !num_slices || !hevc_sps ||
 		    !hevc_pps || !hevc_scaling) {
+			dev_err_ratelimited(vdec->dev,
+					    "HEVC request controls are incomplete\n");
 			ret = -EINVAL;
 			goto finish_request;
 		}
@@ -12732,7 +13001,8 @@ static void histb_vdec_device_run(void *priv)
 					      hevc_entry_ctrl->elems : 0,
 					      payload);
 		if (ret) {
-			dev_dbg(vdec->dev, "HEVC validation failed: %d\n", ret);
+			dev_err_ratelimited(vdec->dev,
+					    "HEVC validation failed: %d\n", ret);
 			goto finish_request;
 		}
 		ctx->hevc = true;
@@ -12746,9 +13016,14 @@ static void histb_vdec_device_run(void *priv)
 		ctx->cabac = false;
 		ctx->mbaff = false;
 		ret = histb_vdec_set_decoded_buffer_sizes(ctx, decoded);
-		if (ret)
+		if (ret) {
+			dev_err_ratelimited(vdec->dev,
+					    "HEVC surface setup failed: %d\n", ret);
 			goto finish_request;
+		}
 		if (!histb_vdec_dma_buffers_valid(ctx)) {
+			dev_err_ratelimited(vdec->dev,
+					    "HEVC DMA buffers are incomplete\n");
 			ret = -EINVAL;
 			goto finish_request;
 		}
@@ -12760,15 +13035,17 @@ static void histb_vdec_device_run(void *priv)
 		ret = histb_vdec_copy_hevc_bitstream(ctx, src, payload,
 						     hevc_slice, num_slices, &src_dma, hevc_streams);
 		if (ret) {
-			dev_dbg(vdec->dev, "HEVC bitstream copy failed: %d\n", ret);
+			dev_err_ratelimited(vdec->dev,
+					    "HEVC bitstream copy failed: %d\n", ret);
 			goto finish_request;
 		}
 		ret = histb_vdec_prepare_hevc_messages(ctx, decoded,
 						       hevc_decode, hevc_sps, hevc_pps, hevc_slice,
 				num_slices, hevc_scaling, src_dma, hevc_streams);
 		if (ret) {
-			dev_dbg(vdec->dev, "HEVC message preparation failed: %d\n",
-				ret);
+			dev_err_ratelimited(vdec->dev,
+					    "HEVC message preparation failed: %d\n",
+					    ret);
 			goto finish_request;
 		}
 		kfree(hevc_streams);
@@ -13201,10 +13478,9 @@ start_hardware:
 			histb_vdec_sync_mpeg4_anchor_for_device(
 				ctx, &ctx->mpeg4_ref[i]);
 		for (i = 0; ctx->vc1 && i < ARRAY_SIZE(ctx->vc1_ref); i++)
-			histb_vdec_sync_vc1_anchor_for_device(
-				ctx, &ctx->vc1_ref[i]);
+				histb_vdec_sync_vc1_anchor_for_device(
+					ctx, &ctx->vc1_ref[i]);
 	}
-
 	spin_lock_irqsave(&vdec->irqlock, flags);
 	if (WARN_ON(vdec->curr_ctx)) {
 		spin_unlock_irqrestore(&vdec->irqlock, flags);
@@ -13318,6 +13594,12 @@ static void histb_vdec_free_buffers(struct histb_vdec_ctx *ctx)
 				  ctx->bitstream.cpu, ctx->bitstream.dma);
 		memset(&ctx->bitstream, 0, sizeof(ctx->bitstream));
 	}
+	kvfree(ctx->hevc_stream_shadow);
+	ctx->hevc_stream_shadow = NULL;
+	ctx->hevc_stream_shadow_size = 0;
+	kvfree(ctx->hevc_msg_shadow);
+	ctx->hevc_msg_shadow = NULL;
+	ctx->hevc_msg_shadow_size = 0;
 	if (ctx->vc1_stream.cpu) {
 		dma_free_coherent(ctx->vdec->dev, ctx->vc1_stream.size,
 				  ctx->vc1_stream.cpu, ctx->vc1_stream.dma);
@@ -13668,6 +13950,9 @@ static int histb_vdec_queue_setup(struct vb2_queue *vq,
 	 * is exactly the kind of thing that hides a problem.
 	 */
 	if (!V4L2_TYPE_IS_OUTPUT(vq->type)) {
+		unsigned int max_large_buffers =
+			HISTB_VDEC_MAX_LARGE_CAPTURE_BUFFERS;
+
 		/*
 		 * The count arrives one buffer at a time through CREATE_BUFS,
 		 * so capping *nbuffers does not bound it - the queue's own
@@ -13678,16 +13963,16 @@ static int histb_vdec_queue_setup(struct vb2_queue *vq,
 		 * not fragmentation.  Bound it for the large geometries only.
 		 */
 		if (q_data->pix.sizeimage > SZ_8M &&
-		    vq->max_num_buffers > HISTB_VDEC_MAX_LARGE_CAPTURE_BUFFERS)
-			vq->max_num_buffers = HISTB_VDEC_MAX_LARGE_CAPTURE_BUFFERS;
+		    vq->max_num_buffers > max_large_buffers)
+			vq->max_num_buffers = max_large_buffers;
 
 		if (q_data->pix.sizeimage > SZ_8M &&
-		    *nbuffers > HISTB_VDEC_MAX_LARGE_CAPTURE_BUFFERS) {
+		    *nbuffers > max_large_buffers) {
 			dev_info_ratelimited(ctx->vdec->dev,
 					     "capture queue asks for %u buffers of %u bytes; limiting to %u to fit the 192 MiB CMA area\n",
 					     *nbuffers, q_data->pix.sizeimage,
-					     HISTB_VDEC_MAX_LARGE_CAPTURE_BUFFERS);
-			*nbuffers = HISTB_VDEC_MAX_LARGE_CAPTURE_BUFFERS;
+					     max_large_buffers);
+			*nbuffers = max_large_buffers;
 		}
 	}
 
@@ -14204,14 +14489,37 @@ static void histb_vdec_try_capture_format(struct histb_vdec_ctx *ctx,
 {
 	bool p010 = ctx->src.pix.pixelformat == V4L2_PIX_FMT_HEVC_SLICE &&
 		pix->pixelformat == V4L2_PIX_FMT_P010;
+	u32 width = pix->width ?: ctx->src.pix.width;
+	u32 height = pix->height ?: ctx->src.pix.height;
+	u32 min_width;
+	u32 min_height;
 
-	pix->width = ctx->src.pix.width;
-	pix->height = ctx->src.pix.height;
+	/*
+	 * The VPSS ZME accepts ratios strictly below 16:1. Keep unaligned coded
+	 * sizes at 1:1 because the tiled ZME input is four-pixel/even-line based.
+	 * Upscaling remains an internal VC-1 RESPIC operation, not a public
+	 * capture-format promise.
+	 */
+	if ((ctx->src.pix.width & 3) || (ctx->src.pix.height & 1)) {
+		width = ctx->src.pix.width;
+		height = ctx->src.pix.height;
+	} else {
+		min_width = max_t(u32, HISTB_VDEC_MIN_WIDTH,
+				  ALIGN(ctx->src.pix.width / 16 + 1, 4));
+		min_height = max_t(u32, HISTB_VDEC_MIN_HEIGHT,
+				   ALIGN(ctx->src.pix.height / 16 + 1, 2));
+		v4l_bound_align_image(&width, min_width, ctx->src.pix.width, 2,
+				      &height, min_height, ctx->src.pix.height, 1, 0);
+	}
+	pix->width = width;
+	pix->height = height;
 	pix->pixelformat = p010 ? V4L2_PIX_FMT_P010 : V4L2_PIX_FMT_NV12;
 	pix->field = V4L2_FIELD_NONE;
 	/* Both public capture formats are linear; CV200 tile storage is internal. */
 	pix->bytesperline = p010 ? pix->width * 2 : ALIGN(pix->width, 64);
 	pix->sizeimage = pix->bytesperline * pix->height * 3 / 2;
+	if (ctx->dei_field_rate && !p010)
+		pix->sizeimage *= 2;
 	pix->colorspace = ctx->src.pix.colorspace;
 	pix->ycbcr_enc = ctx->src.pix.ycbcr_enc;
 	pix->quantization = ctx->src.pix.quantization;
@@ -14277,8 +14585,17 @@ static int histb_vdec_s_fmt(struct file *file, void *priv,
 		histb_vdec_reset_h264_slices(ctx);
 		histb_vdec_reset_h264_field_pair(ctx);
 		histb_vdec_free_buffers(ctx);
+		capture.width = f->fmt.pix.width;
+		capture.height = f->fmt.pix.height;
 		histb_vdec_try_capture_format(ctx, &capture);
 		ctx->dst.pix = capture;
+	} else if (ctx->dst.pix.width != ctx->src.pix.width ||
+		   ctx->dst.pix.height != ctx->src.pix.height) {
+		dev_info(ctx->vdec->dev,
+			 "VPSS capture scaling negotiated: %ux%u -> %ux%u (%4.4s)\n",
+			 ctx->src.pix.width, ctx->src.pix.height,
+			 ctx->dst.pix.width, ctx->dst.pix.height,
+			 (char *)&ctx->dst.pix.pixelformat);
 	}
 
 	return 0;
@@ -14673,6 +14990,7 @@ static int histb_vdec_open(struct file *file)
 		return -ENOMEM;
 
 	ctx->vdec = vdec;
+	ctx->dei_field_rate = dei_field_rate;
 	mutex_init(&ctx->mpeg4_lock);
 	mutex_init(&ctx->vc1_lock);
 	mutex_init(&ctx->rv_lock);
@@ -14702,6 +15020,10 @@ free_ctrls:
 	v4l2_ctrl_handler_free(&ctx->ctrl_handler);
 free_fh:
 	v4l2_fh_exit(&ctx->fh);
+	if (ctx->dei_lin)
+		dma_free_noncoherent(ctx->vdec->dev, ctx->dei_lin_size,
+				     ctx->dei_lin, ctx->dei_lin_dma,
+				     DMA_BIDIRECTIONAL);
 	kfree(ctx);
 	return ret;
 }
@@ -14716,6 +15038,10 @@ static int histb_vdec_release(struct file *file)
 	v4l2_ctrl_handler_free(&ctx->ctrl_handler);
 	v4l2_fh_del(&ctx->fh);
 	v4l2_fh_exit(&ctx->fh);
+	if (ctx->dei_lin)
+		dma_free_noncoherent(ctx->vdec->dev, ctx->dei_lin_size,
+				     ctx->dei_lin, ctx->dei_lin_dma,
+				     DMA_BIDIRECTIONAL);
 	kfree(ctx);
 	return 0;
 }
