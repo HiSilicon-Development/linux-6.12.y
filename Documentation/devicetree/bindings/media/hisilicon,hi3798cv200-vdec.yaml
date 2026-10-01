@@ -1,0 +1,98 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/media/hisilicon,hi3798cv200-vdec.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: HiSilicon Hi3798CV200 video decoder
+
+maintainers:
+  - linux-media@vger.kernel.org
+
+description:
+  The Hi3798CV200 video decoder contains a video decoding hardware engine,
+  stream code detector, bit-plane decoder and a local memory management unit.
+
+properties:
+  compatible:
+    const: hisilicon,hi3798cv200-vdec
+
+  reg:
+    maxItems: 1
+
+  interrupts:
+    items:
+      - description: Video decoding hardware interrupt
+      - description: Stream code detector interrupt
+      - description: Decoder memory management unit interrupt
+
+  interrupt-names:
+    items:
+      - const: vdh
+      - const: scd
+      - const: mmu
+
+  clocks:
+    items:
+      - description: Video decoding hardware clock
+      - description: Video decoder DSP clock
+      - description: Bit-plane decoder clock
+
+  clock-names:
+    items:
+      - const: vdh
+      - const: dsp
+      - const: bpd
+
+  resets:
+    items:
+      - description: Video decoding hardware reset
+      - description: Stream code detector reset
+      - description: Main format decoding engine reset
+      - description: Bit-plane decoder reset
+
+  reset-names:
+    items:
+      - const: vdh
+      - const: scd
+      - const: mfd
+      - const: bpd
+
+  hisilicon,vpss:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: Video post-processing engine used for tile-to-linear output
+
+required:
+  - compatible
+  - reg
+  - interrupts
+  - interrupt-names
+  - clocks
+  - clock-names
+  - resets
+  - reset-names
+  - hisilicon,vpss
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/clock/histb-clock.h>
+    #include <dt-bindings/interrupt-controller/arm-gic.h>
+
+    video-codec@f8c30000 {
+        compatible = "hisilicon,hi3798cv200-vdec";
+        reg = <0xf8c30000 0x10000>;
+        interrupts = <GIC_SPI 95 IRQ_TYPE_LEVEL_HIGH>,
+                     <GIC_SPI 104 IRQ_TYPE_LEVEL_HIGH>,
+                     <GIC_SPI 149 IRQ_TYPE_LEVEL_HIGH>;
+        interrupt-names = "vdh", "scd", "mmu";
+        clocks = <&crg HISTB_VDH_CLK>,
+                 <&crg HISTB_VDH_DSP_CLK>,
+                 <&crg HISTB_BPD_CLK>;
+        clock-names = "vdh", "dsp", "bpd";
+        resets = <&crg 0x78 4>, <&crg 0x78 5>,
+                 <&crg 0x78 6>, <&crg 0x88 4>;
+        reset-names = "vdh", "scd", "mfd", "bpd";
+        hisilicon,vpss = <0x1>;
+    };
