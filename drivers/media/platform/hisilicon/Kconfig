@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+comment "HiSilicon media platform drivers"
+
+config VIDEO_HISTB_VPSS
+	tristate "HiSilicon Hi3798CV200 video post-processing engine"
+	depends on ARCH_HISI || COMPILE_TEST
+	depends on HAS_DMA && OF
+	help
+	  Support the VPSS engine used to convert native CV200 decoder tile
+	  surfaces into linear video frames. The engine is consumed by other
+	  media drivers and does not expose a userspace node of its own.
+
+	  To compile this driver as a module, choose M here. The module will be
+	  called histb-vpss.
