@@ -25,7 +25,6 @@
 #define MXL214_DEVICE_ID_COUNT	MXL_HRCLS_MAX_NUM_DEVICES
 #define MXL214_DEFAULT_TIMEOUT_MS	5000
 #define MXL214_STATS_INTERVAL_MS		500
-#define MXL214_LOCK_QUALIFY_MS		500
 #define MXL214_CODEWORD_BITS		(204U * 8U)
 #define MXL214_STRENGTH_MIN_DBUV_X10	50
 #define MXL214_STRENGTH_RANGE_DBUV_X10	1000
@@ -325,9 +324,7 @@ static void mxl214_stats_reset(struct mxl214_channel *channel)
 	channel->block_errors = 0;
 	channel->block_count = 0;
 	channel->stats_deadline = 0;
-	channel->lock_deadline = 0;
 	channel->stats_started = false;
-	channel->lock_candidate = false;
 	channel->retune_restart_done = false;
 	channel->demod_enabled = false;
 	channel->locked = false;
@@ -484,65 +481,6 @@ static void mxl214_update_stats_locked(struct mxl214_channel *channel,
 			"channel %u error counters unavailable\n", channel->id);
 }
 
-static int mxl214_qualify_lock_locked(struct mxl214_channel *channel,
-				      bool full_lock)
-{
-	struct mxl214_state *state = channel->state;
-	MXL_HRCLS_DMD_STAT_CNT_T counters = { };
-	MXL_STATUS_E status;
-
-	if (!full_lock) {
-		channel->lock_candidate = false;
-		channel->lock_deadline = 0;
-		channel->locked = false;
-		channel->stats_started = false;
-		channel->stats_deadline = 0;
-		return 0;
-	}
-
-	if (channel->locked)
-		return 0;
-
-	if (!channel->lock_candidate) {
-		status = MxLWare_HRCLS_API_CfgDemodErrorStatClear(
-			state->device_id, channel->id);
-		if (status != MXL_SUCCESS)
-			return -EREMOTEIO;
-
-		channel->lock_candidate = true;
-		channel->lock_deadline =
-			jiffies + msecs_to_jiffies(MXL214_LOCK_QUALIFY_MS);
-		return 0;
-	}
-
-	if (time_before(jiffies, channel->lock_deadline))
-		return 0;
-
-	/*
-	 * The demod can briefly report all lock bits before its first FEC
-	 * window settles.  Qualify lock only after one complete, error-free
-	 * codeword window; a dirty or empty window starts another bounded pass.
-	 */
-	status = MxLWare_HRCLS_API_ReqDemodErrorStat(state->device_id,
-		channel->id, &counters);
-	if (status != MXL_SUCCESS)
-		return -EREMOTEIO;
-
-	if (!counters.CwReceived || counters.CwErrCount) {
-		channel->lock_deadline =
-			jiffies + msecs_to_jiffies(MXL214_LOCK_QUALIFY_MS);
-		return 0;
-	}
-
-	channel->lock_candidate = false;
-	channel->lock_deadline = 0;
-	channel->locked = true;
-	channel->stats_started = true;
-	channel->stats_deadline =
-		jiffies + msecs_to_jiffies(MXL214_STATS_INTERVAL_MS);
-	mxl214_publish_counters(channel);
-	return 0;
-}
 
 static int mxl214_init(struct dvb_frontend *frontend)
 {
@@ -705,9 +643,6 @@ static int mxl214_read_status(struct dvb_frontend *frontend,
 	MXL_BOOL_E mpeg = MXL_FALSE;
 	MXL_BOOL_E retune = MXL_FALSE;
 	MXL_STATUS_E status;
-	bool full_lock;
-	bool qualified;
-	int ret;
 
 	*frontend_status = FE_NONE;
 	mutex_lock(&state->lock);
@@ -746,15 +681,19 @@ static int mxl214_read_status(struct dvb_frontend *frontend,
 			}
 		}
 	}
-	full_lock = qam && fec && mpeg && !retune;
-	ret = mxl214_qualify_lock_locked(channel, full_lock);
-	if (ret) {
-		mutex_unlock(&state->lock);
-		return ret;
+	/*
+	 * Match the original MxL214 BSP: acquisition is QAM/FEC/MPEG lock.
+	 * Uncorrectable codewords describe reception quality, not loss of
+	 * hardware lock; requiring a zero-error window can starve a locked mux
+	 * indefinitely. Preserve and publish those counters separately.
+	 */
+	channel->locked = qam && fec && mpeg && !retune;
+	if (!channel->locked) {
+		channel->stats_started = false;
+		channel->stats_deadline = 0;
 	}
 	if (qam && !retune)
 		mxl214_update_stats_locked(channel, channel->locked);
-	qualified = channel->locked;
 	mutex_unlock(&state->lock);
 	if (retune)
 		return 0;
@@ -762,7 +701,7 @@ static int mxl214_read_status(struct dvb_frontend *frontend,
 		*frontend_status |= FE_HAS_SIGNAL | FE_HAS_CARRIER;
 	if (fec)
 		*frontend_status |= FE_HAS_VITERBI | FE_HAS_SYNC;
-	if (qualified)
+	if (qam && fec && mpeg && !retune)
 		*frontend_status |= FE_HAS_LOCK;
 	return 0;
 }

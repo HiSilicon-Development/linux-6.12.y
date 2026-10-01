@@ -23,9 +23,7 @@ struct mxl214_channel {
 	u64 block_errors;
 	u64 block_count;
 	unsigned long stats_deadline;
-	unsigned long lock_deadline;
 	bool stats_started;
-	bool lock_candidate;
 	bool retune_restart_done;
 	bool demod_enabled;
 	bool locked;
