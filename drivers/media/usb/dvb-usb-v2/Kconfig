@@ -143,6 +143,18 @@ config DVB_USB_LME2510
 	help
 	  Say Y here to support the LME DM04/QQBOX DVB-S USB2.0
 
+config DVB_USB_LME2510_DTMB
+	tristate "LME2510C DTMB USB2.0 support"
+	depends on DVB_USB_V2
+	depends on !DVB_USB_LME2510
+	help
+	  Say Y here to support DTMB receivers using an LME2510C USB
+	  bridge, LGS8GL5 demodulator and MAX2165 tuner. The receiver
+	  requires firmware extracted from its Windows driver. Three
+	  firmware files are used for the boot ROM, normal runtime image
+	  and the alternate PID 0x22d0 runtime image. These files are not
+	  distributed with the kernel.
+
 config DVB_USB_MXL111SF
 	tristate "MxL111SF DTV USB2.0 support"
 	depends on DVB_USB_V2
