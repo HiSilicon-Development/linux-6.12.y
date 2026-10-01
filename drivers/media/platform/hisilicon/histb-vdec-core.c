@@ -377,6 +377,7 @@ enum histb_vdec_buffer_id {
 	HISTB_VDEC_BUF_MPEG4_DNR_MBINFO,
 	HISTB_VDEC_BUF_MPEG4_PMV_TOP,
 	HISTB_VDEC_BUF_MPEG4_SED_TOP,
+	HISTB_VDEC_BUF_RV_RCN_TOP,
 	HISTB_VDEC_BUF_VC1_BPD,
 	HISTB_VDEC_BUF_VC1_INTENSITY,
 	HISTB_VDEC_BUF_COUNT,
@@ -410,6 +411,7 @@ static const size_t histb_vdec_buffer_sizes[HISTB_VDEC_BUF_COUNT] = {
 	[HISTB_VDEC_BUF_MPEG4_DNR_MBINFO] = SZ_64K,
 	[HISTB_VDEC_BUF_MPEG4_PMV_TOP] = SZ_1M,
 	[HISTB_VDEC_BUF_MPEG4_SED_TOP] = SZ_1M,
+	[HISTB_VDEC_BUF_RV_RCN_TOP] = SZ_1M,
 	[HISTB_VDEC_BUF_VC1_BPD] = HISTB_VDEC_VC1_BPD_SIZE,
 	[HISTB_VDEC_BUF_VC1_INTENSITY] = HISTB_VDEC_VC1_INTENSITY_SIZE,
 };
@@ -607,6 +609,8 @@ struct histb_vdec_ctx {
 	bool mpeg4_pending_valid;
 	u16 mpeg4_slices;
 	struct histb_mpeg4_parser mpeg4_parser;
+	struct histb_rv_parser rv_parser;
+	struct histb_rv_display_state rv_display;
 	struct histb_mpeg4_parser mpeg4_pending_parser;
 	struct histb_mpeg4_frame mpeg4_pending_frame;
 	struct histb_mpeg4_regs mpeg4_pending_regs;
@@ -1176,6 +1180,13 @@ static const struct vb2_mem_ops histb_vdec_capture_memops = {
 	.mmap = histb_vdec_capture_mmap,
 };
 
+/* RealVideo 8 and 9, upstream fourccs (videodev2.h:771-772). */
+static bool histb_vdec_is_rv_format(u32 pixelformat)
+{
+	return pixelformat == V4L2_PIX_FMT_RV30 ||
+	       pixelformat == V4L2_PIX_FMT_RV40;
+}
+
 static bool histb_vdec_is_vc1_format(u32 pixelformat)
 {
 	return pixelformat == V4L2_PIX_FMT_VC1_ANNEX_G ||
@@ -1213,6 +1224,7 @@ static u32 histb_vdec_surface_stride(struct histb_vdec_ctx *ctx)
 	if (ctx->src.pix.pixelformat == V4L2_PIX_FMT_HEVC_SLICE ||
 	    ctx->src.pix.pixelformat == V4L2_PIX_FMT_AVS_SLICE ||
 	    ctx->src.pix.pixelformat == V4L2_PIX_FMT_MPEG4 ||
+	    histb_vdec_is_rv_format(ctx->src.pix.pixelformat) ||
 	    histb_vdec_is_vc1_format(ctx->src.pix.pixelformat) ||
 	    ctx->src.pix.pixelformat == V4L2_PIX_FMT_VP9_FRAME)
 		return ALIGN(ctx->dst.pix.width, 256);
@@ -1230,6 +1242,7 @@ static u32 histb_vdec_surface_height_align(struct histb_vdec_ctx *ctx)
 		return 64;
 	if (ctx->src.pix.pixelformat == V4L2_PIX_FMT_AVS_SLICE ||
 	    ctx->src.pix.pixelformat == V4L2_PIX_FMT_MPEG4 ||
+	    histb_vdec_is_rv_format(ctx->src.pix.pixelformat) ||
 	    histb_vdec_is_vc1_format(ctx->src.pix.pixelformat))
 		return 32;
 
@@ -14401,7 +14414,7 @@ module_platform_driver(histb_vdec_driver);
 MODULE_AUTHOR("HiSilicon Technologies Co., Ltd.");
 MODULE_DESCRIPTION("HiSilicon Hi3798CV200 VDH video decoder");
 /* Build tag so a deployment can be proven to have taken effect. */
-#define HISTB_VDEC_BUILD_TAG "dvbip-20260915-mvcprof"
+#define HISTB_VDEC_BUILD_TAG "dvbip-20260915-rvgeom2"
 MODULE_VERSION(HISTB_VDEC_BUILD_TAG);
 /* dma_buf_export() lives in the DMA_BUF symbol namespace. */
 MODULE_IMPORT_NS(DMA_BUF);
