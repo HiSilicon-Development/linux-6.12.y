@@ -26,4 +26,16 @@ config SOC_HI3798CV200
 	  so builds for other SoCs retain their upstream behavior. Runtime
 	  compatible data still selects each hardware-specific operation.
 
+config HISTB_RTL8211F_LED
+	bool "HiSTB RTL8211F link and activity LED wiring"
+	depends on SOC_HI3798CV200 && OF && PHYLIB=y
+	help
+	  Configure RTL8211F LEDs as link and activity indicators when the
+	  PHY node has realtek,led-link-activity. This requires the exact
+	  RTL8211F PHY ID at MDIO address 3 and does not disable EEE power
+	  saving or change the PHY driver or RGMII delays.
+
+	  The fixup is registered before MDIO probing and reapplied by PHY
+	  hardware initialization. PHY nodes without this property are ignored.
+
 endmenu

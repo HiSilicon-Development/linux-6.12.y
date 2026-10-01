@@ -211,6 +211,17 @@ properties:
       PHY's that have configurable TX internal delays. If this property is
       present then the PHY applies the TX delay.
 
+  realtek,led-link-activity:
+    type: boolean
+    description:
+      Select fixed RTL8211F LED wiring with LED0 and LED1 indicating link at
+      10/100/1000 Mbps and LED2 indicating activity independently of link
+      speed. Use Mode B and disable only EEE idle LED indication, not EEE
+      power saving. This wiring is supported only for the exact PHY ID
+      0x001cc916 at MDIO address 3. Without this property the LED registers
+      are left unchanged. The property does not override PHY identification
+      or select a PHY driver.
+
   leds:
     type: object
 
@@ -242,6 +253,15 @@ properties:
 
 required:
   - reg
+
+allOf:
+  - if:
+      required:
+        - realtek,led-link-activity
+    then:
+      properties:
+        reg:
+          const: 3
 
 additionalProperties: true
 
