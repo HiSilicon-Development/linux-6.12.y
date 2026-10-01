@@ -574,19 +574,94 @@ int histb_rv_parse_slices(const struct histb_rv_frame *frame,
 		return HISTB_RV_INVALID;
 
 	/*
-	 * Writing out one slice covering the whole picture is the degenerate
-	 * case and the one the MPEG-4 front-end uses when a stream carries
-	 * no per-slice framing.  Real slice-boundary parsing needs the
-	 * slice-header syntax, which is RV-SPEC Q1.
+	 * RV8_CB_GetSliceHeader (real8.S:878 ff.).  The bit sequence the
+	 * assembly performs is:
+	 *
+	 *   3 bits  tag, rejected when greater than 7
+	 *   2 bits  a field compared against a retained value
+	 *   5 bits  slice QP, rejected when greater than 31, stored at +6
+	 *   1 bit   deblocking-filter passthrough, stored at +5
+	 *   13 bits first_mb_in_slice, stored at +44
+	 *
+	 * `first_mb_in_slice` is what defines a slice boundary, and it is the
+	 * field this front-end needs: the hardware is told where each slice
+	 * starts and derives the end itself, and the message builder already
+	 * computes last_mb_in_slice from the following slice.
+	 *
+	 * Each slice is preceded by a start code; Real8_CB_FindNextSliceStartCode
+	 * (:709-760) is what locates them.
 	 */
-	if (histb_rv_make_single_slice(frame, buffer_dma, &slices[0]) !=
-	    HISTB_RV_OK)
-		return HISTB_RV_INVALID;
+	__u32 pos = 0;
+	__u32 count = 0;
 
-	*slice_count = 1;
+	while (pos + 4 < bytes && count < slice_capacity) {
+		struct histb_rv_bits br;
+		__u32 next, tag, qp, dblk, first_mb, bits_used;
 
-	(void)data;
-	(void)bytes;
+		next = rv_find_next_start_code(data, bytes, pos);
+		if (next >= bytes)
+			break;
+
+		/* step over the four-byte start code */
+		pos = next + 4;
+		if (pos >= bytes)
+			break;
+
+		rv_bits_init(&br, data + pos, bytes - pos);
+
+		tag = rv_bits_get(&br, 3);
+		if (br.overrun || tag > 7)
+			break;
+
+		(void)rv_bits_get(&br, 2);	/* compared, not stored */
+		qp = rv_bits_get(&br, 5);
+		if (br.overrun || qp > 31)
+			break;
+		dblk = rv_bits_get(&br, 1);
+		first_mb = rv_bits_get(&br, 13);
+		if (br.overrun)
+			break;
+
+		bits_used = br.pos;
+		(void)bits_used;
+
+		memset(&slices[count], 0, sizeof(slices[count]));
+		slices[count].sliceqp = (__u8)qp;
+		slices[count].dblk_filter_passthrough = (__u8)dblk;
+		slices[count].first_mb_in_slice = first_mb;
+		slices[count].dma_addr[0] = buffer_dma;
+		/*
+		 * The bit offset of the slice's macroblock data is not
+		 * established yet; the header length above is the best
+		 * available value and is an over-estimate by whatever
+		 * fields follow, so a consumer that needs the exact offset
+		 * must not rely on it.
+		 */
+		slices[count].bit_offset[0] = (__u8)(bits_used & 0x7f);
+		slices[count].bit_len[0] = 0;
+
+		count++;
+		pos = next + 4;
+	}
+
+	if (!count) {
+		/*
+		 * No slice header parsed.  Fall back to one slice covering
+		 * the whole picture, which is the degenerate case the MPEG-4
+		 * front-end uses for streams without per-slice framing - it
+		 * is wrong for a genuinely multi-slice stream but it does not
+		 * invent boundaries.
+		 */
+		if (histb_rv_make_single_slice(frame, buffer_dma, &slices[0]) !=
+		    HISTB_RV_OK)
+			return HISTB_RV_INVALID;
+
+		*slice_count = 1;
+
+		return HISTB_RV_OK;
+	}
+
+	*slice_count = count;
 
 	return HISTB_RV_OK;
 }
