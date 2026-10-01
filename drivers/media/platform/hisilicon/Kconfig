@@ -2,6 +2,32 @@
 
 comment "HiSilicon media platform drivers"
 
+config VIDEO_HISTB_VDEC
+	tristate "HiSilicon Hi3798CV200 video decoder"
+	depends on V4L_MEM2MEM_DRIVERS
+	depends on ARCH_HISI || COMPILE_TEST
+	depends on HAS_DMA && OF
+	select V4L2_MEM2MEM_DEV
+	select V4L2_VP9
+	select VIDEOBUF2_DMA_CONTIG
+	select VIDEOBUF2_VMALLOC
+	select VIDEO_HISTB_VPSS
+	help
+	  Support the VDH video decoder found in the HiSilicon Hi3798CV200
+	  SoC. The driver exposes stateless V4L2 request APIs for H.264, HEVC,
+	  MPEG-2, VP8, VP9 and frame/field AVS/AVS+, plus stateful
+	  MPEG-4 Part 2 and VC-1 Annex G decoding. VC-1 supports the validated
+	  Advanced Profile progressive and interlaced paths, and the Annex L
+	  Main profile path, including the
+	  supported B/BI and entry-point features. Capture output is linear video.
+	  H.264 supports the validated progressive and MBAFF coding tools. AVS2 is
+	  outside the Hi3798CV200 VDH contract and remains a software-only fallback.
+	  The driver rejects profiles, tools and damaged bitstreams outside the
+	  Hi3798CV200 hardware contract.
+
+	  To compile this driver as a module, choose M here. The module will be
+	  called histb-vdec.
+
 config VIDEO_HISTB_VPSS
 	tristate "HiSilicon Hi3798CV200 video post-processing engine"
 	depends on ARCH_HISI || COMPILE_TEST
