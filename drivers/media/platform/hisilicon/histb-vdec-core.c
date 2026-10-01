@@ -448,6 +448,8 @@ struct histb_vdec_dma_buffer {
 	void *cpu;
 	dma_addr_t dma;
 	size_t size;
+	/* CPU ownership moves with the surface when reference slots rotate. */
+	bool cpu_owned;
 };
 
 struct histb_vdec_hevc_stream {
@@ -2753,6 +2755,7 @@ histb_vdec_alloc_decoded_buffers(struct histb_vdec_ctx *ctx,
 		dma_sync_single_for_device(dev, decoded->tile.dma,
 					   decoded->tile.size,
 					   DMA_BIDIRECTIONAL);
+	decoded->tile.cpu_owned = false;
 	if (decoded->pmv.cpu) {
 		memset(decoded->pmv.cpu, 0, decoded->pmv.size);
 		if (decoded->pmv_noncoherent)
@@ -2847,14 +2850,24 @@ static void histb_vdec_commit_mpeg4_state(struct histb_vdec_ctx *ctx)
 	histb_vdec_discard_mpeg4_state(ctx);
 }
 
+static void histb_vdec_sync_surface_for_device(
+		struct histb_vdec_ctx *ctx, struct histb_vdec_dma_buffer *surface,
+		bool noncoherent)
+{
+	if (!surface->cpu_owned)
+		return;
+	if (noncoherent)
+		dma_sync_single_for_device(ctx->vdec->dev, surface->dma,
+					   surface->size, DMA_BIDIRECTIONAL);
+	surface->cpu_owned = false;
+}
+
 static void histb_vdec_sync_mpeg4_anchor_for_device(
 		struct histb_vdec_ctx *ctx,
-		const struct histb_vdec_mpeg4_anchor *anchor)
+		struct histb_vdec_mpeg4_anchor *anchor)
 {
-	if (anchor->tile.cpu && anchor->tile_noncoherent)
-			dma_sync_single_for_device(ctx->vdec->dev, anchor->tile.dma,
-						   anchor->tile.size,
-						   DMA_BIDIRECTIONAL);
+	histb_vdec_sync_surface_for_device(ctx, &anchor->tile,
+					    anchor->tile_noncoherent);
 }
 
 /*
@@ -2960,12 +2973,10 @@ static void histb_vdec_commit_rv_state(struct histb_vdec_ctx *ctx)
 
 static void histb_vdec_sync_rv_anchor_for_device(
 		struct histb_vdec_ctx *ctx,
-		const struct histb_vdec_rv_anchor *anchor)
+		struct histb_vdec_rv_anchor *anchor)
 {
-	if (anchor->tile.cpu && anchor->tile_noncoherent)
-		dma_sync_single_for_device(ctx->vdec->dev, anchor->tile.dma,
-					   anchor->tile.size,
-					   DMA_BIDIRECTIONAL);
+	histb_vdec_sync_surface_for_device(ctx, &anchor->tile,
+					    anchor->tile_noncoherent);
 }
 
 static void histb_vdec_free_vc1_anchor(
@@ -3123,22 +3134,19 @@ static bool histb_vdec_commit_vc1_first_field(struct histb_vdec_ctx *ctx)
 
 static void histb_vdec_sync_vc1_anchor_for_device(
 		struct histb_vdec_ctx *ctx,
-		const struct histb_vdec_vc1_anchor *anchor)
+		struct histb_vdec_vc1_anchor *anchor)
 {
-	if (anchor->tile.cpu && anchor->tile_noncoherent)
-		dma_sync_single_for_device(ctx->vdec->dev, anchor->tile.dma,
-					   anchor->tile.size,
-					   DMA_BIDIRECTIONAL);
+	histb_vdec_sync_surface_for_device(ctx, &anchor->tile,
+					    anchor->tile_noncoherent);
 }
 
 static void histb_vdec_sync_tile_for_device(
 		struct histb_vdec_ctx *ctx,
 		struct histb_vdec_decoded_buffer *decoded)
 {
-	if (decoded && decoded->tile.cpu && decoded->tile_noncoherent)
-		dma_sync_single_for_device(ctx->vdec->dev, decoded->tile.dma,
-					   decoded->tile.size,
-					   DMA_BIDIRECTIONAL);
+	if (decoded && decoded->tile.cpu)
+		histb_vdec_sync_surface_for_device(ctx, &decoded->tile,
+						    decoded->tile_noncoherent);
 }
 
 static int histb_vdec_copy_vc1_skipped_surface(
@@ -3167,6 +3175,8 @@ static int histb_vdec_copy_vc1_skipped_surface(
 	if (decoded->tile_noncoherent)
 		dma_sync_single_for_cpu(ctx->vdec->dev, decoded->tile.dma,
 					decoded->tile.size, DMA_BIDIRECTIONAL);
+	latest->tile.cpu_owned = true;
+	decoded->tile.cpu_owned = true;
 	memcpy(decoded->tile.cpu, latest->tile.cpu, decoded->tile.size);
 	memcpy(decoded->pmv.cpu, latest->pmv.cpu, decoded->pmv.size);
 	histb_vdec_sync_vc1_anchor_for_device(ctx, latest);
@@ -4216,12 +4226,10 @@ static int histb_vdec_copy_capture(struct histb_vdec_ctx *ctx,
 	 * VPSS instead.
 	 */
 	dma_rmb();
-	/* VC-1 reconstruction surfaces are allocated non-coherent.  The VDH
-	 * completion only orders the engine; it does not invalidate the VPSS
-	 * device view of the surface. */
-	if (decoded->tile_noncoherent)
-		dma_sync_single_for_device(ctx->vdec->dev, decoded->tile.dma,
-					decoded->tile.size, DMA_BIDIRECTIONAL);
+	/* VDH and VPSS share the DMA/device view. Only a real CPU access
+	 * needs cache ownership transfer; repeatedly cleaning all UHD
+	 * references here and at launch is unnecessary pixel-sized work. */
+	histb_vdec_sync_tile_for_device(ctx, decoded);
 	memset(&frame, 0, sizeof(frame));
 	frame.input_dma = decoded->tile.dma;
 	frame.input_size = decoded->tile.size;
@@ -4431,6 +4439,7 @@ static int histb_vdec_copy_capture(struct histb_vdec_ctx *ctx,
 		dma_sync_single_for_cpu(ctx->vdec->dev, decoded->tile.dma,
 					decoded->tile.size,
 					DMA_BIDIRECTIONAL);
+	decoded->tile.cpu_owned = true;
 	/* Order reconstruction-surface DMA writes after the observed VDH IRQ. */
 	dma_rmb();
 	if (ctx->dst.pix.pixelformat == V4L2_PIX_FMT_P010)
@@ -8602,6 +8611,7 @@ static int histb_vdec_prepare_mpeg2_messages(
 						   decoded->tile.dma,
 						   decoded->tile.size,
 						   DMA_BIDIRECTIONAL);
+			decoded->tile.cpu_owned = false;
 			memset(decoded->pmv.cpu, 0, decoded->pmv.size);
 		}
 	} else if (!decoded->tile.cpu || !decoded->pmv.cpu) {
@@ -9093,6 +9103,7 @@ histb_vdec_prepare_messages(struct histb_vdec_ctx *ctx,
 						   decoded->tile.dma,
 						   decoded->tile.size,
 						   DMA_BIDIRECTIONAL);
+			decoded->tile.cpu_owned = false;
 			memset(decoded->pmv.cpu, 0, decoded->pmv.size);
 		}
 	} else if (!decoded->tile.cpu || !decoded->pmv.cpu) {
