@@ -971,27 +971,8 @@ lme2510_dtmb_status_is_live(const struct lme2510_dtmb_status *status,
 			   msecs_to_jiffies(LME2510_DTMB_STREAM_STALE_MS));
 }
 
-static bool lme2510_dtmb_stream_is_live(struct lme2510_dtmb_state *state)
-{
-	unsigned long deadline;
-	unsigned long flags;
-	bool live;
 
-	spin_lock_irqsave(&state->stream_lock, flags);
-	if (!state->stream_validated) {
-		live = false;
-	} else {
-		deadline =
-			(state->stream_last_packet ?: state->stream_started) +
-			msecs_to_jiffies(LME2510_DTMB_STREAM_STALE_MS);
-		live = time_before(jiffies, deadline);
-	}
-	spin_unlock_irqrestore(&state->stream_lock, flags);
-
-	return live;
-}
-
-static bool lme2510_dtmb_stream_is_stale(struct lme2510_dtmb_state *state)
+static bool __maybe_unused lme2510_dtmb_stream_is_stale(struct lme2510_dtmb_state *state)
 {
 	unsigned long last_packet;
 	unsigned long flags;
@@ -1065,48 +1046,16 @@ static int lme2510_dtmb_set_frontend(struct dvb_frontend *frontend)
 {
 	struct lme2510_dtmb_state *state = frontend->demodulator_priv;
 	u32 frequency = frontend->dtv_property_cache.frequency;
-	bool restart_stream;
-	int stop_ret;
 	int ret;
 
-	cancel_delayed_work_sync(&state->stream_work);
 	ret = mutex_lock_interruptible(&state->tune_lock);
 	if (ret)
 		return ret;
-	restart_stream = state->stream_requested;
-	if (restart_stream) {
-		stop_ret = lme2510_dtmb_stop_stream_locked(state);
-		if (stop_ret) {
-			dev_warn(&state->d->udev->dev,
-				 "stream stop failed before retune: %d\n",
-				 stop_ret);
-			WRITE_ONCE(state->stream_requested, false);
-			ret = stop_ret;
-			goto unlock;
-		}
-	}
+
 	ret = lme2510_dtmb_tune(state, frequency);
-	if (ret)
-		goto tune_failed;
-	if (restart_stream) {
-		state->stream_recovery_failures = 0;
-		state->stream_next_recovery = 0;
-		ret = lme2510_dtmb_start_stream_locked(frontend);
-		if (ret)
-			goto tune_failed;
-	}
 
-unlock:
 	mutex_unlock(&state->tune_lock);
-	if (!ret && restart_stream)
-		mod_delayed_work(system_wq, &state->stream_work,
-				 msecs_to_jiffies(LME2510_DTMB_STREAM_VALIDATE_MS));
 	return ret;
-
-tune_failed:
-	if (restart_stream)
-		WRITE_ONCE(state->stream_requested, false);
-	goto unlock;
 }
 
 static int lme2510_dtmb_read_status(struct dvb_frontend *frontend,
@@ -1124,6 +1073,10 @@ static int lme2510_dtmb_read_status(struct dvb_frontend *frontend,
 	bool status_live;
 	bool locked = false;
 	int ret = 0;
+	if (!state->tuned) {
+		*status = 0;
+		return 0;
+	}
 
 	lme2510_dtmb_status_snapshot(state, &stream_status, &status_updated);
 	status_live = lme2510_dtmb_status_is_live(&stream_status,
@@ -1136,9 +1089,9 @@ static int lme2510_dtmb_read_status(struct dvb_frontend *frontend,
 			   stream_status.extra == 0xff);
 	} else {
 		/*
-		 * EP 0x8a has repeatedly completed with -EOVERFLOW on this host.
-		 * Read the demodulator's own signal and FEC registers instead of
-		 * inferring lock from a stale status packet or an active TS URB.
+		 * EP 0x8a may complete with -EOVERFLOW.  Read the demodulator's
+		 * own signal and FEC registers instead of inferring lock from a
+		 * stale status packet or an active TS URB.
 		 */
 		stream_status.valid = false;
 		ret = mutex_lock_interruptible(&state->tune_lock);
@@ -1167,7 +1120,6 @@ static int lme2510_dtmb_read_status(struct dvb_frontend *frontend,
 	if (locked)
 		*status = FE_HAS_SIGNAL | FE_HAS_CARRIER | FE_HAS_VITERBI |
 			  FE_HAS_SYNC | FE_HAS_LOCK;
-
 	if (locked && state->detected_parameters)
 		lme2510_dtmb_decode_parameters(properties,
 					       state->detected_parameters);
@@ -1327,7 +1279,7 @@ static int lme2510_dtmb_start_status(struct lme2510_dtmb_state *state)
 	int i;
 
 	if (!state->status_urb)
-		return -ENOMEM;
+		return 0;
 
 	for (i = 0; i < alt->desc.bNumEndpoints; i++) {
 		if (alt->endpoint[i].desc.bEndpointAddress ==
@@ -1392,6 +1344,8 @@ static void lme2510_dtmb_stream_complete(struct usb_data_stream *stream,
 
 	spin_lock_irqsave(&state->stream_lock, flags);
 	state->stream_bytes += length;
+	state->stream_packets += length / LME2510_DTMB_TS_PACKET_SIZE;
+	state->stream_last_packet = jiffies;
 	spin_unlock_irqrestore(&state->stream_lock, flags);
 
 	dvb_dmx_swfilter(&adapter->demux, data, length);
@@ -1416,7 +1370,7 @@ static int lme2510_dtmb_stream_command(struct lme2510_dtmb_state *state,
 	return 0;
 }
 
-static bool lme2510_dtmb_stream_has_structure(struct lme2510_dtmb_state *state)
+static bool __maybe_unused lme2510_dtmb_stream_has_structure(struct lme2510_dtmb_state *state)
 {
 	unsigned long flags;
 	bool valid;
@@ -1428,7 +1382,7 @@ static bool lme2510_dtmb_stream_has_structure(struct lme2510_dtmb_state *state)
 	return valid;
 }
 
-static unsigned long
+static unsigned long __maybe_unused
 lme2510_dtmb_stream_backoff(unsigned int failures)
 {
 	unsigned int shift = min_t(unsigned int, failures ? failures - 1 : 0, 3);
@@ -1463,7 +1417,7 @@ static int lme2510_dtmb_stop_transport(struct lme2510_dtmb_state *state)
 	 */
 	return 0;
 }
-static void lme2510_dtmb_mark_stream_valid(struct lme2510_dtmb_state *state)
+static void __maybe_unused lme2510_dtmb_mark_stream_valid(struct lme2510_dtmb_state *state)
 {
 	unsigned long flags;
 
@@ -1509,7 +1463,6 @@ static int lme2510_dtmb_start_stream_locked(struct dvb_frontend *frontend)
 		if (ret)
 			goto err_stop_streaming;
 	}
-	return 0;
 
 err_stop_streaming:
 	atomic_set(&state->streaming, 0);
@@ -1524,104 +1477,6 @@ err_stop_streaming:
 
 static void lme2510_dtmb_stream_work(struct work_struct *work)
 {
-	struct delayed_work *stream_work = to_delayed_work(work);
-	struct lme2510_dtmb_state *state;
-	struct device *dev;
-	unsigned long delay = msecs_to_jiffies(LME2510_DTMB_STREAM_VALIDATE_MS);
-	unsigned long now;
-	unsigned long retune_deadline;
-	u32 frequency;
-	bool reacquire = false;
-	bool requeue = false;
-	int ret;
-
-	state = container_of(stream_work, struct lme2510_dtmb_state,
-			     stream_work);
-	dev = &state->d->udev->dev;
-	mutex_lock(&state->tune_lock);
-	if (!READ_ONCE(state->stream_requested))
-		goto unlock;
-
-	if (atomic_read(&state->streaming) &&
-	    !READ_ONCE(state->stream_validated) &&
-	    lme2510_dtmb_stream_has_structure(state)) {
-		lme2510_dtmb_mark_stream_valid(state);
-		delay = msecs_to_jiffies(LME2510_DTMB_STREAM_MONITOR_MS);
-		requeue = true;
-		goto unlock;
-	}
-
-	if (atomic_read(&state->streaming) &&
-	    !lme2510_dtmb_stream_is_stale(state)) {
-		delay = READ_ONCE(state->stream_validated) ?
-			msecs_to_jiffies(LME2510_DTMB_STREAM_MONITOR_MS) :
-			msecs_to_jiffies(LME2510_DTMB_STREAM_VALIDATE_MS);
-		requeue = true;
-		goto unlock;
-	}
-
-	now = jiffies;
-	if (state->stream_next_recovery &&
-	    time_before(now, state->stream_next_recovery)) {
-		delay = min_t(unsigned long,
-			      state->stream_next_recovery - now,
-			      msecs_to_jiffies(LME2510_DTMB_STREAM_MONITOR_MS));
-		requeue = true;
-		goto unlock;
-	}
-
-	if (atomic_read(&state->streaming)) {
-		ret = lme2510_dtmb_stop_stream_locked(state);
-		if (ret) {
-			dev_warn_ratelimited(dev,
-					     "TS recovery stop failed: %d\n",
-					     ret);
-			WRITE_ONCE(state->stream_requested, false);
-			goto unlock;
-		}
-	}
-
-	if (state->stream_recovery_failures < UINT_MAX)
-		state->stream_recovery_failures++;
-	delay = lme2510_dtmb_stream_backoff(state->stream_recovery_failures);
-	state->stream_next_recovery = jiffies + delay;
-
-	retune_deadline = state->stream_last_reacquire +
-		msecs_to_jiffies(LME2510_DTMB_STREAM_RETUNE_INTERVAL_MS);
-	if (state->stream_recovery_failures >=
-			LME2510_DTMB_STREAM_RETUNE_FAILURES &&
-	    (!state->stream_last_reacquire ||
-	     time_after_eq(jiffies, retune_deadline)))
-		reacquire = true;
-
-	if (reacquire) {
-		state->stream_last_reacquire = jiffies;
-		frequency = READ_ONCE(state->frontend.dtv_property_cache.frequency);
-		ret = lme2510_dtmb_tune(state, frequency);
-		if (ret) {
-			dev_warn_ratelimited(dev,
-					     "TS frontend reacquisition failed: %d\n",
-					     ret);
-			requeue = true;
-			goto unlock;
-		}
-	}
-
-	ret = lme2510_dtmb_start_stream_locked(&state->frontend);
-	if (ret) {
-		dev_warn_ratelimited(dev, "TS recovery start failed: %d\n",
-				     ret);
-		WRITE_ONCE(state->stream_requested, false);
-		requeue = false;
-		goto unlock;
-	}
-	delay = msecs_to_jiffies(LME2510_DTMB_STREAM_VALIDATE_MS);
-	requeue = true;
-
-unlock:
-	mutex_unlock(&state->tune_lock);
-	if (requeue && READ_ONCE(state->stream_requested))
-		mod_delayed_work(system_wq, &state->stream_work, delay);
 }
 
 static int lme2510_dtmb_streaming_ctrl(struct dvb_frontend *frontend,
@@ -1632,7 +1487,6 @@ static int lme2510_dtmb_streaming_ctrl(struct dvb_frontend *frontend,
 	u32 frequency_khz = frequency / 1000;
 	int ret;
 
-	cancel_delayed_work_sync(&state->stream_work);
 	ret = mutex_lock_interruptible(&state->tune_lock);
 	if (ret)
 		return ret;
@@ -1644,14 +1498,14 @@ static int lme2510_dtmb_streaming_ctrl(struct dvb_frontend *frontend,
 	}
 
 	WRITE_ONCE(state->stream_requested, true);
-	state->stream_recovery_failures = 0;
-	state->stream_next_recovery = 0;
 	frequency_khz = frequency_khz / 1000 * 1000;
-	if (!state->tuned || state->tuned_frequency != frequency_khz * 1000) {
-		ret = lme2510_dtmb_tune(state, frequency);
-		if (ret) {
-			WRITE_ONCE(state->stream_requested, false);
-			goto unlock;
+	if (frequency_khz >= 450000 && frequency_khz <= 880000) {
+		if (!state->tuned || state->tuned_frequency != frequency_khz * 1000) {
+			ret = lme2510_dtmb_tune(state, frequency);
+			if (ret) {
+				WRITE_ONCE(state->stream_requested, false);
+				goto unlock;
+			}
 		}
 	}
 	ret = lme2510_dtmb_start_stream_locked(frontend);
@@ -1659,9 +1513,6 @@ static int lme2510_dtmb_streaming_ctrl(struct dvb_frontend *frontend,
 		WRITE_ONCE(state->stream_requested, false);
 unlock:
 	mutex_unlock(&state->tune_lock);
-	if (enable && !ret)
-		mod_delayed_work(system_wq, &state->stream_work,
-				 msecs_to_jiffies(LME2510_DTMB_STREAM_VALIDATE_MS));
 	return ret;
 }
 
