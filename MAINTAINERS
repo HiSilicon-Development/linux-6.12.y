@@ -10246,6 +10246,13 @@ F:	Documentation/ABI/testing/sysfs-driver-histb-vdec
 F:	Documentation/devicetree/bindings/media/hisilicon,hi3798cv200-vdec.yaml
 F:	drivers/media/platform/hisilicon/histb-vdec*
 
+HISILICON HISTB VIDEO ENCODER DRIVER
+L:	linux-media@vger.kernel.org
+S:	Supported
+F:	Documentation/ABI/testing/sysfs-driver-histb-venc
+F:	Documentation/devicetree/bindings/media/hisilicon,hi3798cv200-venc.yaml
+F:	drivers/media/platform/hisilicon/histb-venc-*.c
+
 HISILICON HISTB VIDEO POST-PROCESSING DRIVER
 L:	linux-media@vger.kernel.org
 S:	Supported
