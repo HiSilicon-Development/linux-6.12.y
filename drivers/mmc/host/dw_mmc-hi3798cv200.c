@@ -201,11 +201,33 @@ static int hi3798cv200_mmc_capture_boot_tuning(struct dw_mci *host)
 	return 0;
 }
 
+/*
+ * The DDR52 receive phase this board uses comes from the I/O voltage alone,
+ * with no eye scan (tuning exists in this driver, but only for HS400).  At
+ * the resulting 225 degrees the controller reports intermittent "Unexpected
+ * command timeout, state 3" under load.  Allow an explicit index so the eye
+ * can be measured, and leave the derived value as the default.
+ *
+ * The value is read in set_ios only.  Do not apply it from a parameter
+ * callback: changing the phase while a request is in flight desynchronises
+ * the controller, and has been observed to panic in dw_mci_request_end().
+ * To re-apply it, go through the core - writing the mmc debugfs ios file
+ * calls set_ios with the host acquired.
+ */
+static int ddr52_sample_phase = -1;
+
+module_param(ddr52_sample_phase, int, 0644);
+MODULE_PARM_DESC(ddr52_sample_phase,
+	"override the DDR52 sample phase index 0..7 (0,45,...,315 degrees); -1 derives it from the I/O voltage");
+
 static int hi3798cv200_mmc_ddr52_sample_phase(struct dw_mci *host)
 {
 	struct hi3798cv200_priv *priv = host->priv;
 	unsigned int val;
 	int ret;
+
+	if (ddr52_sample_phase >= 0)
+		return (ddr52_sample_phase & 7) * 45;
 
 	if (!priv->sysctrl)
 		return 225;
