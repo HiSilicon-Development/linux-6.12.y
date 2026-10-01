@@ -1320,7 +1320,8 @@ static void lme2510_dtmb_frontend_release(struct dvb_frontend *frontend)
 }
 
 static const struct dvb_frontend_ops lme2510_dtmb_frontend_ops = {
-	.delsys = { SYS_DTMB },
+	/* Keep the terrestrial ABI expected by existing DVB applications. */
+	.delsys = { SYS_DVBT },
 	.info = {
 		.name = "LME2510C LGS8GL5 DTMB",
 		.frequency_min_hz = 450 * MHz,
