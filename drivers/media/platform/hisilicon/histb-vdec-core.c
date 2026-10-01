@@ -334,6 +334,26 @@ static const struct v4l2_event histb_vdec_eos_event = {
 	ALIGN(HISTB_VDEC_VC1_SLICE_MSG_OFFSET + \
 	      HISTB_VC1_MAX_SLICES * HISTB_VC1_SLICE_MSG_WORDS * \
 	      sizeof(__le32), SZ_4K)
+/*
+ * RealVideo 8/9 (RV-SPEC.md 2.1 and 2.4).  The HAL takes the picture-message
+ * base from message slot 4 and the VAM base from slot 0 - the two indices the
+ * port already names HISTB_VDEC_PIC_MSG_SLOT and HISTB_VDEC_UP_MSG_SLOT - and
+ * places the slice-message area exactly 256 bytes after the picture message,
+ * which is what picture-message word 63 reports back (2.2).  One 256-byte
+ * slot per slice, plus the one extra slot the HAL may prepend, so the buffer
+ * has to hold 1 + 256 slots.
+ */
+#define HISTB_VDEC_RV_PIC_MSG_OFFSET	\
+	(HISTB_VDEC_PIC_MSG_SLOT * HISTB_VDEC_H264_MSG_SLOT_SIZE)
+#define HISTB_VDEC_RV_SLICE_MSG_OFFSET	\
+	(HISTB_VDEC_RV_PIC_MSG_OFFSET + HISTB_RV_SLICE_MSG_OFFSET)
+#define HISTB_VDEC_RV_MSG_SIZE		\
+	ALIGN(HISTB_VDEC_RV_SLICE_MSG_OFFSET + \
+	      HISTB_RV_MAX_SLICE_MSGS * HISTB_RV_SLICE_MSG_SIZE, SZ_4K)
+/* RealVideo's DNR macroblock-info table (register 0x90, RV-SPEC.md 3.3).
+ * RV-SPEC Q4 leaves the RealVideo workspace sizes unstated; this one is sized
+ * like the MPEG-4 table, which covers the same 1088-line limit. */
+#define HISTB_VDEC_RV_DNR_MBINFO_SIZE	SZ_64K
 #define HISTB_VDEC_VC1_BPD_SIZE		SZ_16K
 #define HISTB_VDEC_VC1_INTENSITY_SIZE	HISTB_VC1_INTENSITY_WORK_SIZE
 #define HISTB_VDEC_VP8_PROB_SIZE	2752
@@ -382,6 +402,7 @@ enum histb_vdec_buffer_id {
 	HISTB_VDEC_BUF_MPEG4_PMV_TOP,
 	HISTB_VDEC_BUF_MPEG4_SED_TOP,
 	HISTB_VDEC_BUF_RV_RCN_TOP,
+	HISTB_VDEC_BUF_RV_DNR_MBINFO,
 	HISTB_VDEC_BUF_VC1_BPD,
 	HISTB_VDEC_BUF_VC1_INTENSITY,
 	HISTB_VDEC_BUF_COUNT,
@@ -416,6 +437,7 @@ static const size_t histb_vdec_buffer_sizes[HISTB_VDEC_BUF_COUNT] = {
 	[HISTB_VDEC_BUF_MPEG4_PMV_TOP] = SZ_1M,
 	[HISTB_VDEC_BUF_MPEG4_SED_TOP] = SZ_1M,
 	[HISTB_VDEC_BUF_RV_RCN_TOP] = SZ_1M,
+	[HISTB_VDEC_BUF_RV_DNR_MBINFO] = HISTB_VDEC_RV_DNR_MBINFO_SIZE,
 	[HISTB_VDEC_BUF_VC1_BPD] = HISTB_VDEC_VC1_BPD_SIZE,
 	[HISTB_VDEC_BUF_VC1_INTENSITY] = HISTB_VDEC_VC1_INTENSITY_SIZE,
 };
@@ -487,6 +509,18 @@ struct histb_vdec_avs_reference {
 };
 
 struct histb_vdec_mpeg4_anchor {
+	struct histb_vdec_dma_buffer tile;
+	struct histb_vdec_dma_buffer pmv;
+	bool tile_noncoherent;
+};
+
+/*
+ * RealVideo keeps exactly two reference planes alive (RV-SPEC.md 4.1/4.3:
+ * picture-message words 17 and 18), and they must always hold decodable
+ * addresses.  Same shape as the MPEG-4 anchor, which drives the same
+ * earlier/latest reordering.
+ */
+struct histb_vdec_rv_anchor {
 	struct histb_vdec_dma_buffer tile;
 	struct histb_vdec_dma_buffer pmv;
 	bool tile_noncoherent;
@@ -615,6 +649,17 @@ struct histb_vdec_ctx {
 	struct histb_mpeg4_parser mpeg4_parser;
 	struct histb_rv_parser rv_parser;
 	struct histb_rv_display_state rv_display;
+	/* Serializes RealVideo reference and pending-picture ownership. */
+	struct mutex rv_lock;
+	struct completion rv_setup_idle;
+	bool rv;
+	bool rv_pending_valid;
+	u16 rv_slices;
+	u8 rv_pending_qp;
+	struct histb_rv_frame rv_pending_frame;
+	struct histb_rv_regs rv_pending_regs;
+	struct histb_vdec_decoded_buffer *rv_pending_output;
+	struct histb_vdec_rv_anchor rv_ref[2];
 	struct histb_mpeg4_parser mpeg4_pending_parser;
 	struct histb_mpeg4_frame mpeg4_pending_frame;
 	struct histb_mpeg4_regs mpeg4_pending_regs;
@@ -2712,6 +2757,117 @@ static void histb_vdec_sync_mpeg4_anchor_for_device(
 			dma_sync_single_for_device(ctx->vdec->dev, anchor->tile.dma,
 						   anchor->tile.size,
 						   DMA_BIDIRECTIONAL);
+}
+
+/*
+ * ---- RealVideo reference state ---------------------------------------
+ *
+ * RV-SPEC.md 4.3 makes the rule explicit: the two reference addresses in the
+ * picture message must always be decodable, so the two most recent anchors are
+ * kept alive exactly the way the MPEG-4 front-end keeps mpeg4_ref[].  A picture
+ * that becomes a reference takes the decoded surface over on commit; the older
+ * anchor's tile moves down and its PMV plane (only ever read as the current
+ * picture's co-located plane) is released.
+ *
+ * TRUEBPIC and FRUPIC never become anchors: the front-end's own display plan
+ * (histb_rv_plan_display) groups FRUPIC with TRUEBPIC, and RV-SPEC.md 4.1
+ * lists only P and B as reference consumers.  RV-SPEC does not settle FRUPIC's
+ * role, so the front-end's reading is followed rather than a new one invented.
+ */
+static void histb_vdec_free_rv_anchor(struct histb_vdec_ctx *ctx,
+				      struct histb_vdec_rv_anchor *anchor)
+{
+	struct histb_vdec_decoded_buffer decoded = {
+		.tile = anchor->tile,
+		.pmv = anchor->pmv,
+		.tile_noncoherent = anchor->tile_noncoherent,
+	};
+
+	histb_vdec_free_decoded_buffers(ctx, &decoded);
+	memset(anchor, 0, sizeof(*anchor));
+}
+
+static void histb_vdec_discard_rv_state(struct histb_vdec_ctx *ctx)
+{
+	ctx->rv_pending_valid = false;
+	ctx->rv_pending_output = NULL;
+	ctx->rv_slices = 0;
+}
+
+static void histb_vdec_reset_rv_state(struct histb_vdec_ctx *ctx)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(ctx->rv_ref); i++)
+		histb_vdec_free_rv_anchor(ctx, &ctx->rv_ref[i]);
+	histb_rv_parser_reset(&ctx->rv_parser, 0);
+	memset(&ctx->rv_display, 0, sizeof(ctx->rv_display));
+	histb_vdec_discard_rv_state(ctx);
+}
+
+static void histb_vdec_fail_rv_state_locked(struct histb_vdec_ctx *ctx)
+{
+	lockdep_assert_held(&ctx->rv_lock);
+	histb_vdec_reset_rv_state(ctx);
+}
+
+static void histb_vdec_fail_rv_state(struct histb_vdec_ctx *ctx)
+{
+	mutex_lock(&ctx->rv_lock);
+	histb_vdec_fail_rv_state_locked(ctx);
+	mutex_unlock(&ctx->rv_lock);
+}
+
+static void histb_vdec_commit_rv_state(struct histb_vdec_ctx *ctx)
+{
+	struct histb_vdec_decoded_buffer *decoded = ctx->rv_pending_output;
+	struct histb_vdec_rv_anchor *earlier = &ctx->rv_ref[0];
+	struct histb_vdec_rv_anchor *latest = &ctx->rv_ref[1];
+	struct histb_vdec_dma_buffer old_latest_tile = latest->tile;
+	bool old_latest_noncoherent = latest->tile_noncoherent;
+	u8 coding_type = ctx->rv_pending_frame.header.pic_coding_type;
+
+	lockdep_assert_held(&ctx->rv_lock);
+	if (!ctx->rv_pending_valid || !decoded)
+		return;
+
+	/* Picture message word 5 carries the previous picture's PQUANT. */
+	ctx->rv_parser.have_prev_qp = 1;
+	ctx->rv_parser.prev_pic_qp = ctx->rv_pending_qp;
+
+	if (coding_type == HISTB_RV_TRUEBPIC || coding_type == HISTB_RV_FRUPIC) {
+		histb_vdec_discard_rv_state(ctx);
+		return;
+	}
+
+	histb_vdec_free_rv_anchor(ctx, earlier);
+	if (latest->pmv.cpu) {
+		dma_free_coherent(ctx->vdec->dev, latest->pmv.size,
+				  latest->pmv.cpu, latest->pmv.dma);
+		memset(&latest->pmv, 0, sizeof(latest->pmv));
+	}
+	earlier->tile = old_latest_tile;
+	earlier->tile_noncoherent = old_latest_noncoherent;
+
+	memset(latest, 0, sizeof(*latest));
+	latest->tile = decoded->tile;
+	latest->pmv = decoded->pmv;
+	latest->tile_noncoherent = decoded->tile_noncoherent;
+	memset(&decoded->tile, 0, sizeof(decoded->tile));
+	memset(&decoded->pmv, 0, sizeof(decoded->pmv));
+	decoded->tile_noncoherent = false;
+
+	histb_vdec_discard_rv_state(ctx);
+}
+
+static void histb_vdec_sync_rv_anchor_for_device(
+		struct histb_vdec_ctx *ctx,
+		const struct histb_vdec_rv_anchor *anchor)
+{
+	if (anchor->tile.cpu && anchor->tile_noncoherent)
+		dma_sync_single_for_device(ctx->vdec->dev, anchor->tile.dma,
+					   anchor->tile.size,
+					   DMA_BIDIRECTIONAL);
 }
 
 static void histb_vdec_free_vc1_anchor(
@@ -10108,6 +10264,8 @@ static const char *histb_vdec_codec_name(const struct histb_vdec_ctx *ctx)
 {
 	if (ctx->avs)
 		return "AVS";
+	if (ctx->rv)
+		return "RealVideo";
 	if (ctx->vc1)
 		return "VC-1";
 	if (ctx->vp9)
@@ -10164,6 +10322,8 @@ static void histb_vdec_watchdog(struct work_struct *work)
 	}
 	if (ctx->mpeg4)
 		histb_vdec_fail_mpeg4_state(ctx);
+	if (ctx->rv)
+		histb_vdec_fail_rv_state(ctx);
 	if (ctx->vc1)
 		histb_vdec_discard_vc1_runtime_error(ctx, cancelled);
 	histb_vdec_account_job(vdec, true);
@@ -10325,6 +10485,21 @@ static void histb_vdec_postprocess(struct work_struct *work)
 	}
 	if (ctx->mpeg4)
 		mutex_unlock(&ctx->mpeg4_lock);
+	/*
+	 * RealVideo keeps the same discipline as MPEG-4: the capture copy above
+	 * has already read the decoded surface, so a good picture can take it
+	 * over as the newest reference and a failed one leaves the references
+	 * where they were.
+	 */
+	if (ctx->rv) {
+		if (!ret && !aborted) {
+			mutex_lock(&ctx->rv_lock);
+			histb_vdec_commit_rv_state(ctx);
+			mutex_unlock(&ctx->rv_lock);
+		} else {
+			histb_vdec_fail_rv_state(ctx);
+		}
+	}
 	histb_vdec_finish_job(ctx, !ret && !aborted ?
 				      VB2_BUF_STATE_DONE : VB2_BUF_STATE_ERROR);
 	spin_lock_irqsave(&vdec->irqlock, flags);
@@ -10477,6 +10652,8 @@ static bool histb_vdec_h264_slice_message_valid(struct histb_vdec_ctx *ctx,
 
 static unsigned int histb_vdec_slice_count(const struct histb_vdec_ctx *ctx)
 {
+	if (ctx->rv)
+		return ctx->rv_slices;
 	if (ctx->avs)
 		return ctx->avs_slices;
 	if (ctx->mpeg2)
@@ -10661,6 +10838,8 @@ static irqreturn_t histb_vdec_irq_thread(int irq, void *data)
 			histb_vdec_discard_vp9_state(ctx);
 		if (ctx->mpeg4)
 			histb_vdec_fail_mpeg4_state(ctx);
+		if (ctx->rv)
+			histb_vdec_fail_rv_state(ctx);
 		if (ctx->vc1)
 			histb_vdec_discard_vc1_current(ctx, true);
 		histb_vdec_account_job(vdec, true);
@@ -10678,6 +10857,8 @@ static irqreturn_t histb_vdec_irq_thread(int irq, void *data)
 			histb_vdec_discard_vp9_state(ctx);
 		if (ctx->mpeg4)
 			histb_vdec_fail_mpeg4_state(ctx);
+		if (ctx->rv)
+			histb_vdec_fail_rv_state(ctx);
 		if (ctx->vc1)
 			histb_vdec_discard_vc1_current(ctx, true);
 		histb_vdec_account_job(vdec, true);
@@ -10789,6 +10970,8 @@ static irqreturn_t histb_vdec_irq_thread(int irq, void *data)
 				histb_vdec_discard_vp9_state(ctx);
 			if (ctx->mpeg4)
 				histb_vdec_fail_mpeg4_state(ctx);
+			if (ctx->rv)
+				histb_vdec_fail_rv_state(ctx);
 			if (ctx->vc1)
 				histb_vdec_discard_vc1_runtime_error(ctx, false);
 			if (ctx->vc1)
@@ -10824,6 +11007,8 @@ static irqreturn_t histb_vdec_irq_thread(int irq, void *data)
 		}
 		if (ctx->mpeg4)
 			histb_vdec_fail_mpeg4_state(ctx);
+		if (ctx->rv)
+			histb_vdec_fail_rv_state(ctx);
 		if (ctx->vc1)
 			histb_vdec_discard_vc1_runtime_error(ctx, false);
 		if (ctx->vc1)
@@ -10862,6 +11047,12 @@ static void histb_vdec_abort(struct histb_vdec_ctx *ctx)
 		wait_for_completion(&ctx->vc1_setup_idle);
 		/* Both queues may stream off; keep the completed barrier observable. */
 		complete(&ctx->vc1_setup_idle);
+	}
+	if (ctx->rv) {
+		/* histb_vdec_run_rv_job() completes this on every exit path, so the
+		 * setup cannot still be assembling messages once it returns. */
+		wait_for_completion(&ctx->rv_setup_idle);
+		complete(&ctx->rv_setup_idle);
 	}
 	/* The synchronous BPD caller is the sole buffer and PM owner. */
 	if (active && phase == HISTB_VDEC_PHASE_BPD) {
@@ -10912,6 +11103,8 @@ static void histb_vdec_abort(struct histb_vdec_ctx *ctx)
 				histb_vdec_discard_vp9_state(ctx);
 			if (ctx->mpeg4)
 				histb_vdec_fail_mpeg4_state(ctx);
+			if (ctx->rv)
+				histb_vdec_fail_rv_state(ctx);
 			if (ctx->vc1)
 				histb_vdec_reset_vc1_state(ctx);
 			histb_vdec_finish_job(ctx, VB2_BUF_STATE_ERROR);
@@ -10928,6 +11121,8 @@ static void histb_vdec_abort(struct histb_vdec_ctx *ctx)
 		histb_vdec_discard_vp9_state(ctx);
 	if (ctx->mpeg4)
 		histb_vdec_fail_mpeg4_state(ctx);
+	if (ctx->rv)
+		histb_vdec_fail_rv_state(ctx);
 	if (ctx->vc1)
 		histb_vdec_reset_vc1_state(ctx);
 	/* Do not let a stale threaded IRQ observe the next m2m job. */
@@ -11481,6 +11676,501 @@ static void histb_vdec_complete_request(struct histb_vdec_ctx *ctx,
 		v4l2_ctrl_request_complete(request, &ctx->ctrl_handler);
 }
 
+/*
+ * Locate the picture header inside one queued output buffer.
+ *
+ * RV-SPEC.md 5.1 recovers the RealVideo picture header as beginning with a
+ * 24-bit start code, so a buffer carrying the picture directly parses at
+ * offset 0.  The userspace consumer that can hand this driver RealVideo at all
+ * does not send that: libavformat's RealMedia demuxer prepends a table to every
+ * frame - rmdec.c:818-821 writes slice_count-1, then one little-endian 1
+ * followed by a 32-bit offset per slice, then the slice data - and both
+ * libavcodec's rv34 parser and its rv34 decoder step over exactly
+ * 1 + 8*slice_count bytes before the picture data (rv34_parser.c:48-54,
+ * rv34.c:1655-1658).  The marker of four bytes that are exactly 1
+ * little-endian identifies that layout and cannot collide with a picture
+ * header, whose first two bytes are zero because the 24-bit start code is 1.
+ *
+ * RV-SPEC does not describe this framing: it is read from the userspace side,
+ * so it is applied only when the marker is present, and a buffer that carries
+ * the picture directly is still parsed from offset 0.
+ */
+static u32 histb_vdec_rv_frame_offset(const u8 *data, u32 bytes)
+{
+	u32 table;
+
+	if (bytes < 9)
+		return 0;
+	if (data[1] != 1 || data[2] || data[3] || data[4])
+		return 0;
+	table = 1 + 8 * ((u32)data[0] + 1);
+	if (table >= bytes)
+		return 0;
+
+	return table;
+}
+
+/*
+ * Assemble one RealVideo picture: parse the frame, keep the reference rule of
+ * RV-SPEC.md 4.3, build the 64-word picture message, the register set and the
+ * slice slots, and stage them in ctx->rv_pending_regs / the message buffer.
+ * The launch itself is histb_vdec_run_rv_job(), the same split as VC-1's
+ * histb_vdec_prepare_vc1_syntax() against histb_vdec_run_vc1_job().
+ */
+static int histb_vdec_prepare_rv(
+		struct histb_vdec_ctx *ctx,
+		struct histb_vdec_decoded_buffer *decoded,
+		struct vb2_v4l2_buffer *src, unsigned long payload,
+		dma_addr_t *src_dma)
+{
+	struct histb_rv_hw_picture picture = { };
+	struct histb_rv_frame frame;
+	struct histb_rv_pic_msg pic_msg;
+	struct histb_rv_slice *slices = NULL;
+	struct histb_rv_slice_msg *slice_msgs = NULL;
+	struct histb_vdec_rv_anchor *earlier = &ctx->rv_ref[0];
+	struct histb_vdec_rv_anchor *latest = &ctx->rv_ref[1];
+	__le32 *pic_words;
+	__le32 *slice_words;
+	dma_addr_t msg_dma;
+	u32 bytes, frame_offset, slice_count = 0, message_count = 0;
+	u32 stride;
+	u8 coding_type, std;
+	unsigned int i, j;
+	bool is_b;
+	int ret;
+
+	lockdep_assert_held(&ctx->rv_lock);
+
+	if (!payload || payload > U32_MAX)
+		return -EINVAL;
+
+	ret = histb_vdec_copy_raw_bitstream(ctx, src, payload, src_dma);
+	if (ret)
+		return ret;
+
+	bytes = payload;
+	std = ctx->src.pix.pixelformat == V4L2_PIX_FMT_RV40 ?
+		HISTB_RV_STD_REAL9 : HISTB_RV_STD_REAL8;
+	if (ctx->rv_parser.std != std)
+		histb_rv_parser_reset(&ctx->rv_parser, std);
+
+	frame_offset = histb_vdec_rv_frame_offset(ctx->bitstream.cpu, bytes);
+	ret = histb_rv_parse_frame_at(&ctx->rv_parser, ctx->bitstream.cpu, bytes,
+				      frame_offset, &frame, NULL);
+	if (ret != HISTB_RV_OK) {
+		dev_err_ratelimited(ctx->vdec->dev,
+			"RealVideo picture header not found at offset %u of %u bytes: parse result %d\n",
+			frame_offset, bytes, ret);
+		return -EINVAL;
+	}
+
+	ret = histb_rv_validate_stateful_frame(&ctx->rv_parser,
+					       ctx->bitstream.cpu, bytes, &frame);
+	if (ret != HISTB_RV_OK) {
+		dev_err_ratelimited(ctx->vdec->dev,
+				    "RealVideo feature blocked: %u (parse result %d)\n",
+				    ctx->rv_parser.blocker, ret);
+		return -EINVAL;
+	}
+
+	if (ALIGN(frame.header.pic_width_in_pixel, 16) !=
+		ALIGN(ctx->src.pix.width, 16) ||
+	    ALIGN(frame.header.pic_height_in_pixel, 16) !=
+		ALIGN(ctx->src.pix.height, 16)) {
+		dev_err_ratelimited(ctx->vdec->dev,
+				    "RealVideo size mismatch: picture %ux%u vs format %ux%u\n",
+				    frame.header.pic_width_in_pixel,
+				    frame.header.pic_height_in_pixel,
+				    ctx->src.pix.width, ctx->src.pix.height);
+		return -EINVAL;
+	}
+
+	/*
+	 * RV-SPEC.md 4.1/4.3: P consumes the forward reference only, B both, and
+	 * neither address may be zero.  The port's MPEG-4 front-end answers the
+	 * same requirement by refusing to launch a picture whose references are
+	 * not resident, so a P or B picture before its anchor fails here instead
+	 * of reaching the hardware.
+	 */
+	coding_type = frame.header.pic_coding_type;
+	is_b = coding_type == HISTB_RV_TRUEBPIC ||
+	       coding_type == HISTB_RV_FRUPIC;
+	if (coding_type == HISTB_RV_INTERPIC && !latest->tile.cpu) {
+		dev_err_ratelimited(ctx->vdec->dev,
+				    "RealVideo P picture with no forward reference\n");
+		return -EINVAL;
+	}
+	if (is_b && (!earlier->tile.cpu || !latest->tile.cpu || !latest->pmv.cpu)) {
+		dev_err_ratelimited(ctx->vdec->dev,
+				    "RealVideo B picture refs: earlier %d latest %d pmv %d\n",
+				    !!earlier->tile.cpu, !!latest->tile.cpu,
+				    !!latest->pmv.cpu);
+		return -EINVAL;
+	}
+
+	ret = histb_vdec_set_decoded_buffer_sizes(ctx, decoded);
+	if (ret)
+		return ret;
+	histb_vdec_reclaim_decoded_buffers(ctx, decoded);
+	ret = histb_vdec_alloc_decoded_buffers(ctx, decoded);
+	if (ret)
+		return ret;
+	if (!histb_vdec_dma_buffers_valid(ctx)) {
+		dev_err_ratelimited(ctx->vdec->dev,
+				    "RealVideo DMA buffers invalid for %ux%u\n",
+				    frame.header.pic_width_in_pixel,
+				    frame.header.pic_height_in_pixel);
+		return -EINVAL;
+	}
+
+	msg_dma = histb_vdec_buffer_dma(ctx, HISTB_VDEC_BUF_MSG);
+	stride = histb_vdec_surface_stride(ctx);
+	/* The picture message plus 256-byte slots has to fit the message buffer
+	 * the format negotiated, so a stale smaller allocation fails here instead
+	 * of overrunning. */
+	if (ctx->buffers[HISTB_VDEC_BUF_MSG].size < HISTB_VDEC_RV_MSG_SIZE) {
+		dev_err_ratelimited(ctx->vdec->dev,
+				    "RealVideo message buffer is %zu bytes, need %zu\n",
+				    ctx->buffers[HISTB_VDEC_BUF_MSG].size,
+				    HISTB_VDEC_RV_MSG_SIZE);
+		return -EINVAL;
+	}
+
+	picture.frame = frame;
+	picture.std = std;
+	/*
+	 * Word 17/18 (RV-SPEC.md 2.2): the forward reference is the newest anchor
+	 * for P and the older one for B, and an I picture points both slots at the
+	 * surface it is decoding - the degenerate form §4.3 prescribes, which the
+	 * MPEG-4 front-end uses for the same case.  None of these can be zero.
+	 */
+	switch (coding_type) {
+	case HISTB_RV_INTERPIC:
+		picture.fwd_ref_phy_addr = lower_32_bits(latest->tile.dma);
+		break;
+	case HISTB_RV_TRUEBPIC:
+	case HISTB_RV_FRUPIC:
+		picture.fwd_ref_phy_addr = lower_32_bits(earlier->tile.dma);
+		break;
+	default:
+		picture.fwd_ref_phy_addr = lower_32_bits(decoded->tile.dma);
+		break;
+	}
+	picture.bwd_ref_phy_addr = lower_32_bits(is_b ?
+						 latest->tile.dma :
+						 decoded->tile.dma);
+	picture.disp_frame_phy_addr = lower_32_bits(decoded->tile.dma);
+	picture.cur_pic_phy_addr = lower_32_bits(decoded->tile.dma);
+	picture.curr_pmv_phy_addr = lower_32_bits(decoded->pmv.dma);
+	picture.col_pmv_phy_addr = lower_32_bits(is_b ?
+						 latest->pmv.dma :
+						 decoded->pmv.dma);
+	picture.sed_top_addr = lower_32_bits(histb_vdec_buffer_dma(
+		ctx, HISTB_VDEC_BUF_SED_TOP));
+	picture.pmv_top_addr = lower_32_bits(histb_vdec_buffer_dma(
+		ctx, HISTB_VDEC_BUF_PMV_TOP));
+	picture.rcn_top_addr = lower_32_bits(histb_vdec_buffer_dma(
+		ctx, HISTB_VDEC_BUF_RV_RCN_TOP));
+	picture.dblk_top_addr = lower_32_bits(histb_vdec_buffer_dma(
+		ctx, HISTB_VDEC_BUF_DBLK_TOP));
+	picture.dnr_mbinfo_addr = lower_32_bits(histb_vdec_buffer_dma(
+		ctx, HISTB_VDEC_BUF_RV_DNR_MBINFO));
+	picture.pic_msg_addr = lower_32_bits(msg_dma +
+					     HISTB_VDEC_RV_PIC_MSG_OFFSET);
+	picture.vam_addr = lower_32_bits(msg_dma);
+	/*
+	 * Picture-message word 63 is the slice area, which the HAL places at the
+	 * picture message plus one slot (RV-SPEC.md 2.2), and the front-end
+	 * performs that addition itself.
+	 */
+	picture.slice_msg_addr = picture.pic_msg_addr;
+	picture.stream_base_addr = lower_32_bits(*src_dma);
+	picture.ddr_stride = stride * 16;
+	picture.uv_offset = stride * ALIGN(ctx->dst.pix.height, 32);
+	/*
+	 * Fields RV-SPEC leaves open, kept at the values the sibling codecs use
+	 * rather than guessed: no compressed surfaces (Q4), no MMU translation in
+	 * the message (the driver runs inside the SMMU identity window, as
+	 * HISTB_VDEC_BASIC_CFG1_* shows for every other codec here), a single
+	 * slice group (Q2) and no head-info block - VC-1 writes the same zero to
+	 * HEAD_INFO_OFFSET.
+	 */
+	picture.compress_en = 0;
+	picture.vdh_mmu_en = 0;
+	picture.fst_slc_grp = 0;
+	picture.linear_en = 0;
+	picture.head_info_size = 0;
+	/* RPR resizing (RV-SPEC.md 4.5, Q4) is not implemented: no sizes. */
+	picture.rpr_num_sizes = 0;
+
+	slices = kcalloc(HISTB_RV_MAX_SLICES, sizeof(*slices), GFP_KERNEL);
+	slice_msgs = kcalloc(HISTB_RV_MAX_SLICE_MSGS, sizeof(*slice_msgs),
+			     GFP_KERNEL);
+	if (!slices || !slice_msgs) {
+		ret = -ENOMEM;
+		goto free_slices;
+	}
+
+	/*
+	 * The slice scan runs over the picture, not over the container framing,
+	 * and the addresses it builds are offsets into the copied stream.
+	 */
+	ret = histb_rv_parse_slices(&frame,
+				    ctx->bitstream.cpu + frame_offset,
+				    bytes - frame_offset,
+				    lower_32_bits(*src_dma) + frame_offset,
+				    slices, HISTB_RV_MAX_SLICES, &slice_count);
+	if (ret != HISTB_RV_OK) {
+		ret = -EINVAL;
+		goto free_slices;
+	}
+
+	ret = histb_rv_build_pic_msg(&picture, &pic_msg);
+	if (ret != HISTB_RV_OK) {
+		ret = -EINVAL;
+		goto free_slices;
+	}
+	/*
+	 * Words 5 and 6 are PrevPicQP and PrevPicMb0QP (RV-SPEC.md 2.2).  The
+	 * builder takes no parser argument, so the carried state is applied here.
+	 * PrevPicMb0QP has no producer in this tree - the hardware reports the
+	 * macroblock-0 quantiser back in the RealVideo UP report (RV-SPEC.md 5.3)
+	 * and that report is not decoded here - so it stays zero rather than being
+	 * guessed.  The mask preserves bit 5, which the builder sets for RV9
+	 * pictures of 99 macroblocks or fewer (Q6).
+	 */
+	if (ctx->rv_parser.have_prev_qp) {
+		pic_msg.d[5] = ctx->rv_parser.prev_pic_qp & 0x1f;
+		pic_msg.d[6] = (pic_msg.d[6] & ~0x1fU) |
+			       (ctx->rv_parser.prev_pic_mb0_qp & 0x1f);
+	}
+
+	ret = histb_rv_build_regs(&picture, slices, slice_count,
+				  &ctx->rv_pending_regs);
+	if (ret != HISTB_RV_OK) {
+		ret = -EINVAL;
+		goto free_slices;
+	}
+
+	ret = histb_rv_build_slice_messages(
+		&frame, slices, slice_count,
+		lower_32_bits(msg_dma + HISTB_VDEC_RV_SLICE_MSG_OFFSET),
+		slice_msgs, HISTB_RV_MAX_SLICE_MSGS, &message_count);
+	if (ret != HISTB_RV_OK) {
+		ret = -EINVAL;
+		goto free_slices;
+	}
+
+	memset(ctx->buffers[HISTB_VDEC_BUF_MSG].cpu, 0,
+	       ctx->buffers[HISTB_VDEC_BUF_MSG].size);
+	pic_words = ctx->buffers[HISTB_VDEC_BUF_MSG].cpu +
+		    HISTB_VDEC_RV_PIC_MSG_OFFSET;
+	slice_words = ctx->buffers[HISTB_VDEC_BUF_MSG].cpu +
+		      HISTB_VDEC_RV_SLICE_MSG_OFFSET;
+	for (i = 0; i < ARRAY_SIZE(pic_msg.d); i++)
+		pic_words[i] = cpu_to_le32(pic_msg.d[i]);
+	for (i = 0; i < message_count; i++)
+		for (j = 0; j < ARRAY_SIZE(slice_msgs[i].d); j++)
+			slice_words[i * HISTB_RV_SLICE_MSG_WORDS + j] =
+				cpu_to_le32(slice_msgs[i].d[j]);
+
+	ctx->total_mbs = frame.header.total_mbs;
+	switch (coding_type) {
+	case HISTB_RV_INTERPIC:
+		ctx->frame_flags = V4L2_H264_DECODE_PARAM_FLAG_PFRAME;
+		break;
+	case HISTB_RV_TRUEBPIC:
+	case HISTB_RV_FRUPIC:
+		ctx->frame_flags = V4L2_H264_DECODE_PARAM_FLAG_BFRAME;
+		break;
+	default:
+		ctx->frame_flags = 0;
+		break;
+	}
+	ctx->rv_slices = slice_count;
+	ctx->rv_pending_frame = frame;
+	ctx->rv_pending_qp = frame.header.pquant;
+	ctx->rv_pending_output = decoded;
+	ctx->rv_pending_valid = true;
+
+	kfree(slice_msgs);
+	kfree(slices);
+
+	return 0;
+
+free_slices:
+	kfree(slice_msgs);
+	kfree(slices);
+	return ret;
+}
+
+/*
+ * The register set of RV-SPEC.md 3.3, in the same order and with the same
+ * block prologue as the MPEG-4 and VC-1 programmers.
+ */
+static void histb_vdec_program_rv_registers(struct histb_vdec_ctx *ctx)
+{
+	const struct histb_rv_regs *regs = &ctx->rv_pending_regs;
+	struct histb_vdec_dev *vdec = ctx->vdec;
+	u32 offset;
+
+	writel(~0U, vdec->regs + HISTB_VDEC_INT_MASK);
+	writel(~0U, vdec->regs + HISTB_VDEC_INT_STATE);
+	writel(0, vdec->regs + HISTB_VDEC_SMMU_CTRL);
+	writel(7, vdec->regs + HISTB_VDEC_SMMU_INT_MASK_NS);
+	writel(7, vdec->regs + HISTB_VDEC_SMMU_INT_CLEAR_S);
+	writel(7, vdec->regs + HISTB_VDEC_SMMU_INT_CLEAR_NS);
+	writel(regs->basic_cfg0, vdec->regs + HISTB_VDEC_BASIC_CFG0);
+	writel(regs->basic_cfg1, vdec->regs + HISTB_VDEC_BASIC_CFG1);
+	writel(regs->avm_addr, vdec->regs + HISTB_VDEC_AVM_ADDR);
+	writel(regs->vam_addr, vdec->regs + HISTB_VDEC_VAM_ADDR);
+	writel(regs->stream_base, vdec->regs + HISTB_VDEC_STREAM_BASE);
+	writel(0, vdec->regs + HISTB_VDEC_SCD_AVS_FLAG);
+	writel(1, vdec->regs + HISTB_VDEC_SCD_VDH_SELRST);
+	/*
+	 * SCD register 4.  RV-SPEC.md 3.3 records the HAL's value as the
+	 * comparison "PicWidthInMb < 256", which is what the front-end returns in
+	 * regs->scd_emar; the encoding below is the one every sibling codec here
+	 * writes to the same register.
+	 */
+	writel(HISTB_VDEC_SCD_EMAR_BASE |
+	       (regs->scd_emar ? HISTB_VDEC_SCD_EMAR_ENABLE : 0),
+	       vdec->regs + HISTB_VDEC_SCD_EMAR_CFG);
+	for (offset = HISTB_VDEC_TIMEOUT_FIRST;
+	     offset <= HISTB_VDEC_TIMEOUT_LAST; offset += 4)
+		writel(regs->fixed_cfg, vdec->regs + offset);
+	writel(0, vdec->regs + HISTB_VDEC_STORE_PARAM);
+	writel(regs->current_picture_addr, vdec->regs + HISTB_VDEC_CURRENT_Y);
+	writel(regs->y_stride, vdec->regs + HISTB_VDEC_Y_STRIDE);
+	writel(regs->uv_offset, vdec->regs + HISTB_VDEC_CHROMA_OFFSET);
+	writel(regs->head_info_size, vdec->regs + HISTB_VDEC_HEAD_INFO_OFFSET);
+	writel(0, vdec->regs + HISTB_VDEC_LINE_NUM_ADDR);
+	writel(0, vdec->regs + HISTB_VDEC_Y_STRIDE_2BIT);
+	writel(0, vdec->regs + HISTB_VDEC_Y_OFFSET_2BIT);
+	writel(0, vdec->regs + HISTB_VDEC_CHROMA_OFFSET_2BIT);
+	writel(regs->dnr_mbinfo_addr,
+	       vdec->regs + HISTB_VDEC_DNR_MBINFO_ADDR);
+	writel(0, vdec->regs + HISTB_VDEC_REF_PIC_TYPE);
+	writel(0, vdec->regs + HISTB_VDEC_FF_APT_ENABLE);
+	/* Register 0x20, the vendor HAL's last write before the doorbell.
+	 * RV-SPEC Q8 does not establish what it is for. */
+	writel(regs->int_state_reset, vdec->regs + HISTB_VDEC_INT_STATE);
+	writel(0xaaaaaaaa, vdec->regs + HISTB_VDEC_DOWN_CLK_CFG);
+	writel(HISTB_VDEC_INT_ENABLE_DONE, vdec->regs + HISTB_VDEC_INT_MASK);
+	writel(3, vdec->regs + HISTB_VDEC_SCD_CLOCK_GATE);
+	usleep_range(30, 60);
+	/* Publish the coherent message and bitstream contents before VDH starts. */
+	wmb();
+	writel(0, vdec->regs + HISTB_VDEC_START);
+	writel(1, vdec->regs + HISTB_VDEC_START);
+	writel(0, vdec->regs + HISTB_VDEC_START);
+}
+
+/*
+ * The RealVideo launch, in the order VC-1 uses: claim the job under
+ * launch_lock, take the power reference and the VDH clock, assemble the
+ * messages, move the job to the VDH phase and hand it to the engine, then
+ * release the setup handshake.
+ */
+static void histb_vdec_run_rv_job(struct histb_vdec_ctx *ctx,
+		struct histb_vdec_decoded_buffer *decoded,
+		struct vb2_v4l2_buffer *src, unsigned long payload)
+{
+	struct histb_vdec_dev *vdec = ctx->vdec;
+	dma_addr_t src_dma = 0;
+	unsigned long flags;
+	unsigned int i;
+	bool active = false, pm_active = false;
+	int ret;
+
+	ctx->rv = true;
+	ctx->vc1 = false;
+	ctx->vc1_annex_l = false;
+	ctx->hevc = false;
+	ctx->hevc_main10 = false;
+	ctx->hevc_scaling_list = false;
+	ctx->hevc_slices = 0;
+	ctx->mpeg2 = false;
+	ctx->mpeg2_slices = 0;
+	ctx->mpeg4 = false;
+	ctx->vp8 = false;
+	ctx->vp9 = false;
+	ctx->cabac = false;
+	ctx->mbaff = false;
+
+	reinit_completion(&ctx->rv_setup_idle);
+	mutex_lock(&vdec->launch_lock);
+	spin_lock_irqsave(&vdec->irqlock, flags);
+	if (!vdec->curr_ctx) {
+		vdec->curr_ctx = ctx;
+		vdec->phase = HISTB_VDEC_PHASE_BPD;
+		vdec->job_cancelled = false;
+		vdec->job_count_pending = true;
+		active = true;
+	} else {
+		ret = -EBUSY;
+	}
+	spin_unlock_irqrestore(&vdec->irqlock, flags);
+	mutex_unlock(&vdec->launch_lock);
+	if (!active)
+		goto finish_no_pm;
+
+	ret = pm_runtime_resume_and_get(vdec->dev);
+	if (ret < 0)
+		goto finish_active;
+	pm_active = true;
+	ret = histb_vdec_configure_vdh_clock(vdec);
+	if (ret) {
+		dev_err(vdec->dev, "failed to configure RealVideo VDH clock: %d\n",
+			ret);
+		goto finish_active;
+	}
+
+	mutex_lock(&ctx->rv_lock);
+	ret = histb_vdec_prepare_rv(ctx, decoded, src, payload, &src_dma);
+	mutex_unlock(&ctx->rv_lock);
+	if (ret)
+		goto finish_active;
+
+	histb_vdec_sync_tile_for_device(ctx, decoded);
+	for (i = 0; i < ARRAY_SIZE(ctx->rv_ref); i++)
+		histb_vdec_sync_rv_anchor_for_device(ctx, &ctx->rv_ref[i]);
+	mutex_lock(&vdec->launch_lock);
+	/* Keep the job in BPD phase while acknowledging any VDH status left by
+	 * the previous job.  The IRQ thread takes launch_lock before sampling it. */
+	writel(~0U, vdec->regs + HISTB_VDEC_INT_STATE);
+	writel(~0U, vdec->regs + HISTB_VDEC_INT_MASK);
+	ret = histb_vdec_switch_job_phase(vdec, ctx,
+			HISTB_VDEC_PHASE_BPD, HISTB_VDEC_PHASE_VDH);
+	if (!ret) {
+		schedule_delayed_work(&vdec->watchdog_work,
+				      msecs_to_jiffies(HISTB_VDEC_WATCHDOG_MS));
+		histb_vdec_program_rv_registers(ctx);
+	}
+	mutex_unlock(&vdec->launch_lock);
+	if (ret)
+		goto finish_active;
+	complete(&ctx->rv_setup_idle);
+	return;
+
+	finish_active:
+	mutex_lock(&vdec->launch_lock);
+	histb_vdec_take_job(vdec, ctx);
+	mutex_unlock(&vdec->launch_lock);
+	mutex_lock(&ctx->rv_lock);
+	histb_vdec_fail_rv_state_locked(ctx);
+	mutex_unlock(&ctx->rv_lock);
+	if (pm_active) {
+		pm_runtime_mark_last_busy(vdec->dev);
+		pm_runtime_put_autosuspend(vdec->dev);
+	}
+finish_no_pm:
+	dev_err_ratelimited(vdec->dev, "RealVideo setup failed: %d\n", ret);
+	histb_vdec_finish_job_no_pm(ctx, VB2_BUF_STATE_ERROR);
+	complete(&ctx->rv_setup_idle);
+}
+
 static void histb_vdec_run_vc1_job(struct histb_vdec_ctx *ctx,
 		struct histb_vdec_decoded_buffer *decoded,
 		struct vb2_v4l2_buffer *src, unsigned long payload)
@@ -11707,6 +12397,7 @@ static void histb_vdec_device_run(void *priv)
 		if (ret)
 			goto finish_request;
 	} else if (ctx->src.pix.pixelformat != V4L2_PIX_FMT_MPEG4 &&
+		   !histb_vdec_is_rv_format(ctx->src.pix.pixelformat) &&
 		   !histb_vdec_is_vc1_format(ctx->src.pix.pixelformat)) {
 		ret = -EINVAL;
 		goto finish_request;
@@ -11729,6 +12420,7 @@ static void histb_vdec_device_run(void *priv)
 	ctx->vp9 = false;
 	ctx->mpeg4 = false;
 	ctx->vc1 = false;
+	ctx->rv = false;
 	/*
 	 * Isolating stale VDH/FSP state between HEVC pictures.
 	 *
@@ -11768,6 +12460,11 @@ static void histb_vdec_device_run(void *priv)
 	 * timeouts and a decoded frame hash identical to the previous
 	 * behaviour.
 	 */
+	if (histb_vdec_is_rv_format(ctx->src.pix.pixelformat)) {
+		histb_vdec_complete_request(ctx, request);
+		histb_vdec_run_rv_job(ctx, decoded, src, payload);
+		return;
+	}
 	if (histb_vdec_is_vc1_format(ctx->src.pix.pixelformat)) {
 		histb_vdec_complete_request(ctx, request);
 		histb_vdec_run_vc1_job(ctx, decoded, src, payload);
@@ -12525,6 +13222,7 @@ static void histb_vdec_free_buffers(struct histb_vdec_ctx *ctx)
 
 	histb_vdec_reset_mpeg4_state(ctx);
 	histb_vdec_reset_vc1_state(ctx);
+	histb_vdec_reset_rv_state(ctx);
 	if (ctx->bitstream.cpu) {
 		dma_free_coherent(ctx->vdec->dev, ctx->bitstream.size,
 				  ctx->bitstream.cpu, ctx->bitstream.dma);
@@ -12567,6 +13265,10 @@ static size_t histb_vdec_buffer_size(struct histb_vdec_ctx *ctx,
 	     id == HISTB_VDEC_BUF_VC1_INTENSITY) &&
 	    !histb_vdec_is_vc1_format(ctx->src.pix.pixelformat))
 		return 0;
+	if ((id == HISTB_VDEC_BUF_RV_RCN_TOP ||
+	     id == HISTB_VDEC_BUF_RV_DNR_MBINFO) &&
+	    !histb_vdec_is_rv_format(ctx->src.pix.pixelformat))
+		return 0;
 	if (id == HISTB_VDEC_BUF_AVS_DNR_MBINFO &&
 	    ctx->src.pix.pixelformat != V4L2_PIX_FMT_AVS_SLICE)
 		return 0;
@@ -12586,6 +13288,9 @@ static size_t histb_vdec_buffer_size(struct histb_vdec_ctx *ctx,
 	if (ctx->src.pix.pixelformat == V4L2_PIX_FMT_MPEG4 &&
 	    id == HISTB_VDEC_BUF_MSG)
 		return HISTB_VDEC_MPEG4_MSG_SIZE;
+	if (histb_vdec_is_rv_format(ctx->src.pix.pixelformat) &&
+	    id == HISTB_VDEC_BUF_MSG)
+		return HISTB_VDEC_RV_MSG_SIZE;
 	if (histb_vdec_is_vc1_format(ctx->src.pix.pixelformat) &&
 	    id == HISTB_VDEC_BUF_MSG)
 		return HISTB_VDEC_VC1_MSG_SIZE;
@@ -13070,6 +13775,8 @@ static int histb_vdec_start_streaming(struct vb2_queue *vq,
 	}
 	if (!ret && V4L2_TYPE_IS_OUTPUT(vq->type))
 		histb_vdec_reset_vc1_state(ctx);
+	if (!ret && V4L2_TYPE_IS_OUTPUT(vq->type))
+		histb_vdec_reset_rv_state(ctx);
 	if (!ret && V4L2_TYPE_IS_OUTPUT(vq->type) &&
 	    ctx->src.pix.pixelformat == V4L2_PIX_FMT_AVS_SLICE) {
 		ctx->avs = false;
@@ -13119,6 +13826,8 @@ static void histb_vdec_stop_streaming(struct vb2_queue *vq)
 	}
 	if (histb_vdec_is_vc1_format(ctx->src.pix.pixelformat))
 		histb_vdec_reset_vc1_state(ctx);
+	if (histb_vdec_is_rv_format(ctx->src.pix.pixelformat))
+		histb_vdec_reset_rv_state(ctx);
 	histb_vdec_return_buffers(ctx, vq->type);
 	if (V4L2_TYPE_IS_CAPTURE(vq->type))
 		histb_vdec_reset_apc(ctx);
@@ -13876,8 +14585,11 @@ static int histb_vdec_open(struct file *file)
 	ctx->vdec = vdec;
 	mutex_init(&ctx->mpeg4_lock);
 	mutex_init(&ctx->vc1_lock);
+	mutex_init(&ctx->rv_lock);
 	init_completion(&ctx->vc1_setup_idle);
 	complete(&ctx->vc1_setup_idle);
+	init_completion(&ctx->rv_setup_idle);
+	complete(&ctx->rv_setup_idle);
 	histb_vdec_set_default_formats(ctx);
 	v4l2_fh_init(&ctx->fh, video_devdata(file));
 	file->private_data = &ctx->fh;
