@@ -44,6 +44,7 @@
 
 #include "histb-vdec-mpeg4.h"
 #include "histb-vdec-vc1.h"
+#include "histb-vdec-rv.h"
 #include "histb-vpss.h"
 
 static const struct v4l2_event histb_vdec_eos_event = {
@@ -230,6 +231,9 @@ static const struct v4l2_event histb_vdec_eos_event = {
 #define HISTB_VDEC_MPEG2_MAX_HEIGHT	1152U
 #define HISTB_VDEC_MPEG4_MAX_WIDTH	1920U
 #define HISTB_VDEC_MPEG4_MAX_HEIGHT	1088U
+/* RealVideo 8/9: 1080p@60 per the datasheet. */
+#define HISTB_VDEC_RV_MAX_WIDTH		1920U
+#define HISTB_VDEC_RV_MAX_HEIGHT	1088U
 #define HISTB_VDEC_VC1_MAX_WIDTH	2048U
 #define HISTB_VDEC_VC1_MAX_HEIGHT	2048U
 #define HISTB_VDEC_VP8_MAX_WIDTH		1920U
@@ -13367,6 +13371,10 @@ static void histb_vdec_try_output_format(struct v4l2_pix_format *pix)
 		max_height = HISTB_VDEC_VP9_MAX_HEIGHT;
 		/* VP9 controls carry the exact frame size; storage is aligned later. */
 		alignment = 0;
+	} else if (pixelformat == V4L2_PIX_FMT_RV30 ||
+		   pixelformat == V4L2_PIX_FMT_RV40) {
+		max_width = HISTB_VDEC_RV_MAX_WIDTH;
+		max_height = HISTB_VDEC_RV_MAX_HEIGHT;
 	} else if (histb_vdec_is_vc1_format(pixelformat)) {
 		max_width = HISTB_VDEC_VC1_MAX_WIDTH;
 		max_height = HISTB_VDEC_VC1_MAX_HEIGHT;
@@ -14414,7 +14422,7 @@ module_platform_driver(histb_vdec_driver);
 MODULE_AUTHOR("HiSilicon Technologies Co., Ltd.");
 MODULE_DESCRIPTION("HiSilicon Hi3798CV200 VDH video decoder");
 /* Build tag so a deployment can be proven to have taken effect. */
-#define HISTB_VDEC_BUILD_TAG "dvbip-20260915-rvgeom2"
+#define HISTB_VDEC_BUILD_TAG "dvbip-20260915-rvwire"
 MODULE_VERSION(HISTB_VDEC_BUILD_TAG);
 /* dma_buf_export() lives in the DMA_BUF symbol namespace. */
 MODULE_IMPORT_NS(DMA_BUF);
