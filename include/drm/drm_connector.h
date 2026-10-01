@@ -397,6 +397,37 @@ enum drm_hdmi_broadcast_rgb {
 	DRM_HDMI_BROADCAST_RGB_LIMITED,
 };
 
+/**
+ * enum drm_connector_color_format - Connector color format request
+ *
+ * This enum is used by the generic "color format" connector property. AUTO
+ * lets the display protocol helper choose a format, while the other values
+ * request an exact wire format that must pass the atomic check.
+ */
+enum drm_connector_color_format {
+	DRM_CONNECTOR_COLOR_FORMAT_AUTO = 0,
+	DRM_CONNECTOR_COLOR_FORMAT_RGB444,
+	DRM_CONNECTOR_COLOR_FORMAT_YCBCR444,
+	DRM_CONNECTOR_COLOR_FORMAT_YCBCR422,
+	DRM_CONNECTOR_COLOR_FORMAT_YCBCR420,
+	DRM_CONNECTOR_COLOR_FORMAT_COUNT,
+};
+
+static inline bool __pure
+drm_connector_color_format_valid(enum drm_connector_color_format fmt)
+{
+	switch (fmt) {
+	case DRM_CONNECTOR_COLOR_FORMAT_AUTO:
+	case DRM_CONNECTOR_COLOR_FORMAT_RGB444:
+	case DRM_CONNECTOR_COLOR_FORMAT_YCBCR444:
+	case DRM_CONNECTOR_COLOR_FORMAT_YCBCR422:
+	case DRM_CONNECTOR_COLOR_FORMAT_YCBCR420:
+		return true;
+	default:
+		return false;
+	}
+}
+
 const char *
 drm_hdmi_connector_get_broadcast_rgb_name(enum drm_hdmi_broadcast_rgb broadcast_rgb);
 const char *
@@ -1096,6 +1127,12 @@ struct drm_connector_state {
 	 * to wider color gamuts like BT2020.
 	 */
 	enum drm_colorspace colorspace;
+
+	/**
+	 * @color_format: State variable for the generic "color format"
+	 * connector property.
+	 */
+	enum drm_connector_color_format color_format;
 
 	/**
 	 * @writeback_job: Writeback job for writeback connectors
@@ -1884,6 +1921,12 @@ struct drm_connector {
 	struct drm_property *colorspace_property;
 
 	/**
+	 * @color_format_property: Connector property used to request an output
+	 * color format.
+	 */
+	struct drm_property *color_format_property;
+
+	/**
 	 * @path_blob_ptr:
 	 *
 	 * DRM blob property data for the DP MST path property. This should only
@@ -2260,6 +2303,8 @@ int drm_connector_attach_vrr_capable_property(
 		struct drm_connector *connector);
 int drm_connector_attach_broadcast_rgb_property(struct drm_connector *connector);
 int drm_connector_attach_colorspace_property(struct drm_connector *connector);
+int drm_connector_attach_color_format_property(struct drm_connector *connector,
+					       unsigned long supported_formats);
 int drm_connector_attach_hdr_output_metadata_property(struct drm_connector *connector);
 bool drm_connector_atomic_hdr_metadata_equal(struct drm_connector_state *old_state,
 					     struct drm_connector_state *new_state);

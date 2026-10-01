@@ -114,6 +114,13 @@ sink_supports_format_bpc(const struct drm_connector *connector,
 		return false;
 	}
 
+	if (connector->color_format_property &&
+	    drm_mode_is_420_only(info, mode) &&
+	    format != HDMI_COLORSPACE_YUV420) {
+		drm_dbg_kms(dev, "Mode can be only supported in YUV420 format.\n");
+		return false;
+	}
+
 	switch (format) {
 	case HDMI_COLORSPACE_RGB:
 		drm_dbg_kms(dev, "RGB Format, checking the constraints.\n");
@@ -144,9 +151,33 @@ sink_supports_format_bpc(const struct drm_connector *connector,
 		return true;
 
 	case HDMI_COLORSPACE_YUV420:
-		/* TODO: YUV420 is unsupported at the moment. */
-		drm_dbg_kms(dev, "YUV420 format isn't supported yet.\n");
-		return false;
+		drm_dbg_kms(dev, "YUV420 format, checking the constraints.\n");
+
+		if (!(info->color_formats & DRM_COLOR_FORMAT_YCBCR420)) {
+			drm_dbg_kms(dev, "Sink doesn't support YUV420.\n");
+			return false;
+		}
+
+		if (!drm_mode_is_420(info, mode)) {
+			drm_dbg_kms(dev, "Mode cannot be supported in YUV420 format.\n");
+			return false;
+		}
+
+		if (bpc == 10 &&
+		    !(info->hdmi.y420_dc_modes & DRM_EDID_YCBCR420_DC_30)) {
+			drm_dbg_kms(dev, "10 BPC but sink doesn't support Deep Color 30.\n");
+			return false;
+		}
+
+		if (bpc == 12 &&
+		    !(info->hdmi.y420_dc_modes & DRM_EDID_YCBCR420_DC_36)) {
+			drm_dbg_kms(dev, "12 BPC but sink doesn't support Deep Color 36.\n");
+			return false;
+		}
+
+		drm_dbg_kms(dev, "YUV420 format supported in that configuration.\n");
+
+		return true;
 
 	case HDMI_COLORSPACE_YUV422:
 		drm_dbg_kms(dev, "YUV422 format, checking the constraints.\n");
@@ -285,11 +316,9 @@ hdmi_compute_format(const struct drm_connector *connector,
 {
 	struct drm_device *dev = connector->dev;
 
-	/*
-	 * TODO: Add support for YCbCr420 output for HDMI 2.0 capable
-	 * devices, for modes that only support YCbCr420.
-	 */
-	if (hdmi_try_format_bpc(connector, conn_state, mode, bpc, HDMI_COLORSPACE_RGB)) {
+	/* Preserve 6.12.100 behavior for connectors that did not opt in. */
+	if (hdmi_try_format_bpc(connector, conn_state, mode, bpc,
+				HDMI_COLORSPACE_RGB)) {
 		conn_state->hdmi.output_format = HDMI_COLORSPACE_RGB;
 		return 0;
 	}
@@ -300,35 +329,131 @@ hdmi_compute_format(const struct drm_connector *connector,
 }
 
 static int
+hdmi_compute_format_bpc(const struct drm_connector *connector,
+			struct drm_connector_state *conn_state,
+			const struct drm_display_mode *mode,
+			unsigned int max_bpc, enum hdmi_colorspace fmt)
+{
+	struct drm_device *dev = connector->dev;
+	unsigned int bpc;
+
+	for (bpc = max_bpc; bpc >= 8; bpc -= 2) {
+		if (!hdmi_try_format_bpc(connector, conn_state, mode, bpc, fmt))
+			continue;
+
+		conn_state->hdmi.output_bpc = bpc;
+		conn_state->hdmi.output_format = fmt;
+
+				drm_dbg_kms(dev,
+					    "Mode %ux%u @ %uHz: Found configuration: bpc: %u, fmt: %s, clock: %llu\n",
+			    mode->hdisplay, mode->vdisplay, drm_mode_vrefresh(mode),
+			    conn_state->hdmi.output_bpc,
+					    drm_hdmi_connector_get_output_format_name(
+						    conn_state->hdmi.output_format),
+			    conn_state->hdmi.tmds_char_rate);
+
+		return 0;
+	}
+
+	drm_dbg_kms(dev, "Failed. %s output format not supported for any bpc count.\n",
+		    drm_hdmi_connector_get_output_format_name(fmt));
+
+	return -EINVAL;
+}
+
+static int
 hdmi_compute_config(const struct drm_connector *connector,
 		    struct drm_connector_state *conn_state,
 		    const struct drm_display_mode *mode)
 {
 	struct drm_device *dev = connector->dev;
-	unsigned int max_bpc = clamp_t(unsigned int,
-				       conn_state->max_bpc,
-				       8, connector->max_bpc);
+	const char *format_name;
+	unsigned int max_bpc;
 	unsigned int bpc;
 	int ret;
 
-	for (bpc = max_bpc; bpc >= 8; bpc -= 2) {
-		drm_dbg_kms(dev, "Trying with a %d bpc output\n", bpc);
+	if (!connector->color_format_property) {
+		max_bpc = clamp_t(unsigned int, conn_state->max_bpc,
+				  8, connector->max_bpc);
 
-		ret = hdmi_compute_format(connector, conn_state, mode, bpc);
-		if (ret)
-			continue;
+		for (bpc = max_bpc; bpc >= 8; bpc -= 2) {
+			drm_dbg_kms(dev, "Trying with a %d bpc output\n", bpc);
 
-		conn_state->hdmi.output_bpc = bpc;
+			ret = hdmi_compute_format(connector, conn_state, mode, bpc);
+			if (ret)
+				continue;
 
-		drm_dbg_kms(dev,
-			    "Mode %ux%u @ %uHz: Found configuration: bpc: %u, fmt: %s, clock: %llu\n",
-			    mode->hdisplay, mode->vdisplay, drm_mode_vrefresh(mode),
-			    conn_state->hdmi.output_bpc,
-			    drm_hdmi_connector_get_output_format_name(conn_state->hdmi.output_format),
-			    conn_state->hdmi.tmds_char_rate);
+			conn_state->hdmi.output_bpc = bpc;
+			format_name = drm_hdmi_connector_get_output_format_name(
+				conn_state->hdmi.output_format);
 
-		return 0;
+			drm_dbg_kms(dev,
+				    "Mode %ux%u @ %uHz: Found configuration: bpc: %u, fmt: %s, clock: %llu\n",
+				    mode->hdisplay, mode->vdisplay,
+				    drm_mode_vrefresh(mode),
+				    conn_state->hdmi.output_bpc,
+				    format_name,
+				    conn_state->hdmi.tmds_char_rate);
+
+			return 0;
+		}
+
+		return -EINVAL;
 	}
+
+	max_bpc = clamp_t(unsigned int, conn_state->max_requested_bpc,
+				8, connector->max_bpc);
+
+	switch (conn_state->color_format) {
+	case DRM_CONNECTOR_COLOR_FORMAT_RGB444:
+		return hdmi_compute_format_bpc(connector, conn_state, mode,
+					       max_bpc, HDMI_COLORSPACE_RGB);
+	case DRM_CONNECTOR_COLOR_FORMAT_YCBCR444:
+		return hdmi_compute_format_bpc(connector, conn_state, mode,
+					       max_bpc, HDMI_COLORSPACE_YUV444);
+	case DRM_CONNECTOR_COLOR_FORMAT_YCBCR422:
+		return hdmi_compute_format_bpc(connector, conn_state, mode,
+					       max_bpc, HDMI_COLORSPACE_YUV422);
+	case DRM_CONNECTOR_COLOR_FORMAT_YCBCR420:
+		if (!connector->ycbcr_420_allowed)
+			return -EINVAL;
+
+		return hdmi_compute_format_bpc(connector, conn_state, mode,
+					       max_bpc, HDMI_COLORSPACE_YUV420);
+	case DRM_CONNECTOR_COLOR_FORMAT_AUTO:
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	/*
+	 * Preserve full chroma first, choosing the highest valid color depth
+	 * across RGB and YUV 4:4:4. Subsample only when no full-chroma
+	 * configuration can carry the selected mode.
+	 */
+	for (bpc = max_bpc; bpc >= 8; bpc -= 2) {
+		if (hdmi_try_format_bpc(connector, conn_state, mode, bpc,
+					HDMI_COLORSPACE_RGB)) {
+			conn_state->hdmi.output_bpc = bpc;
+			conn_state->hdmi.output_format = HDMI_COLORSPACE_RGB;
+			return 0;
+		}
+
+		if (hdmi_try_format_bpc(connector, conn_state, mode, bpc,
+					HDMI_COLORSPACE_YUV444)) {
+			conn_state->hdmi.output_bpc = bpc;
+			conn_state->hdmi.output_format = HDMI_COLORSPACE_YUV444;
+			return 0;
+		}
+	}
+
+	if (!hdmi_compute_format_bpc(connector, conn_state, mode,
+				     max_bpc, HDMI_COLORSPACE_YUV422))
+		return 0;
+
+	if (connector->ycbcr_420_allowed)
+		return hdmi_compute_format_bpc(connector, conn_state, mode,
+					       max_bpc, HDMI_COLORSPACE_YUV420);
 
 	return -EINVAL;
 }
@@ -355,12 +480,14 @@ static int hdmi_generate_avi_infoframe(const struct drm_connector *connector,
 
 	frame->colorspace = conn_state->hdmi.output_format;
 
-	/*
-	 * FIXME: drm_hdmi_avi_infoframe_quant_range() doesn't handle
-	 * YUV formats at all at the moment, so if we ever support YUV
-	 * formats this needs to be revised.
-	 */
-	drm_hdmi_avi_infoframe_quant_range(frame, connector, mode, rgb_quant_range);
+	if (conn_state->hdmi.output_format == HDMI_COLORSPACE_RGB) {
+		drm_hdmi_avi_infoframe_quant_range(frame, connector, mode,
+						   rgb_quant_range);
+	} else {
+		frame->quantization_range = HDMI_QUANTIZATION_RANGE_DEFAULT;
+		frame->ycc_quantization_range =
+			HDMI_YCC_QUANTIZATION_RANGE_LIMITED;
+	}
 	drm_hdmi_avi_infoframe_colorimetry(frame, conn_state);
 	drm_hdmi_avi_infoframe_bars(frame, conn_state);
 
@@ -502,11 +629,17 @@ int drm_atomic_helper_connector_hdmi_check(struct drm_connector *connector,
 		connector_state_get_mode(new_conn_state);
 	int ret;
 
-	new_conn_state->hdmi.is_limited_range = hdmi_is_limited_range(connector, new_conn_state);
+	if (!connector->color_format_property)
+		new_conn_state->hdmi.is_limited_range =
+			hdmi_is_limited_range(connector, new_conn_state);
 
 	ret = hdmi_compute_config(connector, new_conn_state, mode);
 	if (ret)
 		return ret;
+
+	if (connector->color_format_property)
+		new_conn_state->hdmi.is_limited_range =
+			hdmi_is_limited_range(connector, new_conn_state);
 
 	ret = hdmi_generate_infoframes(connector, new_conn_state);
 	if (ret)
