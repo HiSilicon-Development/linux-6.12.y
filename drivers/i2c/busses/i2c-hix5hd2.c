@@ -93,6 +93,7 @@ struct hix5hd2_i2c_priv {
 	unsigned int freq;
 	enum hix5hd2_i2c_state state;
 	bool is_hi3798cv200;
+	bool force_polling;
 	struct reset_control *rst;
 	u32 failure_status;
 	const char *failure_reason;
@@ -359,6 +360,34 @@ stop:
 	return IRQ_HANDLED;
 }
 
+static unsigned long hix5hd2_i2c_wait_complete(struct hix5hd2_i2c_priv *priv)
+{
+	unsigned long deadline;
+	u32 status;
+
+	if (!priv->force_polling)
+		return wait_for_completion_timeout(&priv->msg_complete,
+						   priv->adap.timeout);
+
+	deadline = jiffies + priv->adap.timeout;
+	do {
+		if (try_wait_for_completion(&priv->msg_complete))
+			return 1;
+
+		status = readl_relaxed(priv->regs + HIX5I2C_SR);
+		if (status & (I2C_ACK_INTR | I2C_ARBITRATE_INTR |
+			      I2C_OVER_INTR))
+			hix5hd2_i2c_irq(priv->irq, priv);
+
+		if (try_wait_for_completion(&priv->msg_complete))
+			return 1;
+
+		usleep_range(50, 100);
+	} while (time_before(jiffies, deadline));
+
+	return 0;
+}
+
 static void hix5hd2_i2c_message_start(struct hix5hd2_i2c_priv *priv, int stop)
 {
 	unsigned long flags;
@@ -393,8 +422,7 @@ static int hix5hd2_i2c_xfer_msg(struct hix5hd2_i2c_priv *priv,
 	reinit_completion(&priv->msg_complete);
 	hix5hd2_i2c_message_start(priv, stop);
 
-	time_left = wait_for_completion_timeout(&priv->msg_complete,
-						priv->adap.timeout);
+	time_left = hix5hd2_i2c_wait_complete(priv);
 	if (time_left == 0) {
 		unsigned long flags;
 
@@ -494,6 +522,11 @@ static int hix5hd2_i2c_probe(struct platform_device *pdev)
 	priv->dev = &pdev->dev;
 	priv->is_hi3798cv200 = of_device_is_compatible(
 		np, "hisilicon,hi3798cv200-i2c");
+	priv->force_polling = of_property_read_bool(np,
+						     "hisilicon,force-polling");
+	if (priv->force_polling)
+		dev_warn(&pdev->dev,
+			 "completion IRQ unavailable, using status polling\n");
 
 	if (of_property_read_u32(np, "clock-frequency", &freq)) {
 		/* use 100k as default value */
