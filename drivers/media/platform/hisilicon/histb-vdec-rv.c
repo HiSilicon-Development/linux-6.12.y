@@ -226,14 +226,29 @@ static int rv_parse_picture_header(struct histb_rv_parser *parser,
 		return HISTB_RV_NEED_MORE;
 
 	/*
-	 * The coding type is selected from the VLC tag; Real8_CB_GetPictureHeader
-	 * maps three tag values onto it (:1229-1240, :1260-1280).  The tag is now
-	 * decodable, but which of the three values means which type is still not
-	 * pinned down, so the frame stays blocked on that point alone rather than
-	 * guessing an interpretation.
+	 * The tag-to-coding-type map, from Real8_CB_GetPictureHeader
+	 * (real8.S:1195-1205 for tags 1 and 5, :1236-1243 for tag 3):
+	 *
+	 *   tag 1 -> 1  RV8_INTERPIC   (P)
+	 *   tag 3 -> 0  RV8_INTRAPIC   (I)
+	 *   tag 5 -> 2  RV8_TRUEBPIC   (B)
+	 *
+	 * anything else is rejected.  RV8_FRUPIC (3) is not produced by this
+	 * path; it comes from the slice header.
 	 */
-	h->pic_coding_type = tag & 0x3;
-	h->pic_coding_type = HISTB_RV_INTRAPIC;
+	switch (tag) {
+	case 1:
+		h->pic_coding_type = HISTB_RV_INTERPIC;
+		break;
+	case 3:
+		h->pic_coding_type = HISTB_RV_INTRAPIC;
+		break;
+	case 5:
+		h->pic_coding_type = HISTB_RV_TRUEBPIC;
+		break;
+	default:
+		return HISTB_RV_INVALID;
+	}
 
 	/* Dimension fields, widths from the ubfx at :1222-1226. */
 	{
@@ -263,7 +278,13 @@ static int rv_parse_picture_header(struct histb_rv_parser *parser,
 	h->pic_height_in_mb = (__u16)((h->pic_height_in_pixel + 15) >> 4);
 	h->total_mbs = (__u16)(h->pic_width_in_mb * h->pic_height_in_mb);
 
-	parser->blocker = HISTB_RV_BLOCK_CODING_TYPE;
+	/*
+	 * Geometry is the remaining gap: the dimension fields are read with
+	 * the widths the assembly uses, but which bit selects the CPFMT
+	 * default is still not pinned down, so height stays zero and the
+	 * frame is blocked on geometry rather than on the coding type.
+	 */
+	parser->blocker = HISTB_RV_BLOCK_GEOMETRY;
 
 	return HISTB_RV_OK;
 }
