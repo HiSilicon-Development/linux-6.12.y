@@ -30,6 +30,7 @@ obj-$(CONFIG_RC_MAP) += \
 			rc-cinergy.o \
 			rc-ct-90405.o \
 			rc-d680-dmb.o \
+			rc-dvbip-1001.o \
 			rc-delock-61959.o \
 			rc-dib0700-nec.o \
 			rc-dib0700-rc5.o \
