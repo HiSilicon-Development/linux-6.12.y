@@ -1,0 +1,69 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/cpufreq/hisilicon,hi3798cv200-avs.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: HiSilicon Hi3798CV200 CPU HPM monitor
+
+maintainers:
+  - linux-pm@vger.kernel.org
+
+description: |
+  Access to the CPU HPM records and AVS enable control used by cpufreq-dt.
+  Voltage and frequency operating points remain board policy in the CPU
+  operating-points-v2 table.
+
+properties:
+  compatible:
+    const: hisilicon,hi3798cv200-avs
+
+  reg:
+    maxItems: 2
+
+  reg-names:
+    items:
+      - const: hpm
+      - const: control
+
+  hisilicon,hpm-targets:
+    description: |
+      Board-characterized CPU HPM policy. Each row contains the CPU frequency
+      in Hz, the 10-bit HPM target and a boolean indicating whether software
+      voltage feedback is enabled at that frequency.
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    minItems: 1
+    maxItems: 16
+    items:
+      items:
+        - description: CPU frequency in Hz
+        - description: HPM target
+          maximum: 1017
+        - description: Enable software voltage feedback
+          enum: [0, 1]
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - hisilicon,hpm-targets
+
+additionalProperties: false
+
+examples:
+  - |
+    soc {
+        #address-cells = <1>;
+        #size-cells = <1>;
+
+        cpu-avs@8a23078 {
+            compatible = "hisilicon,hi3798cv200-avs";
+            reg = <0x8a23078 0x10>, <0x8a23368 0x4>;
+            reg-names = "hpm", "control";
+            hisilicon,hpm-targets = <400000000 0xc9 0>,
+                                     <600000000 0xc9 0>,
+                                     <800000000 0xe5 1>,
+                                     <1200000000 0x110 1>;
+        };
+    };
+...

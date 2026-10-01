@@ -86,6 +86,17 @@ config ARM_HIGHBANK_CPUFREQ
 
 	  If in doubt, say N.
 
+config ARM_HISTB_CPUFREQ
+	bool "HiSilicon Hi3798CV200 HPM feedback"
+	depends on CPUFREQ_DT
+	depends on SOC_HI3798CV200
+	depends on REGULATOR && THERMAL
+	help
+	  Enable verified CPU clock transitions and bounded software HPM voltage
+	  feedback used with cpufreq-dt. The hardware AVS controller remains
+	  disabled until its complete tuning state is described. Board operating
+	  points and electrical policy remain in the device tree.
+
 config ARM_IMX6Q_CPUFREQ
 	tristate "Freescale i.MX6 cpufreq support"
 	depends on ARCH_MXC
