@@ -206,7 +206,18 @@ static const struct v4l2_event histb_vdec_eos_event = {
 #define HISTB_VDEC_SLICE_BETA		GENMASK(11, 8)
 #define HISTB_VDEC_SLICE_ALPHA		GENMASK(19, 16)
 
-#define HISTB_VDEC_H264_DPB_SIZE	16
+/*
+ * H.264 allows at most 16 reference frames, but MVC decodes one view per
+ * picture with both views sharing this DPB, so the APC has to hold both
+ * views' references: the vendor's MVC_MAX_FRAME_STORE is 40.  The array is
+ * one of pointers, so the extra slots cost nothing worth counting, and the
+ * loops that walk it treat an empty slot as absent.
+ *
+ * dpb_to_apc stays sized by the H.264 limit, because that array maps the
+ * client's DPB entries, which the standard caps at 16 regardless of view.
+ */
+#define HISTB_VDEC_H264_DPB_SIZE	40
+#define HISTB_VDEC_H264_DPB_MAP_SIZE	16
 #define HISTB_VDEC_APC_INVALID		(-1)
 
 #define HISTB_VDEC_UP_CABAC_END_ERROR	0x14230000
@@ -3106,7 +3117,7 @@ static bool histb_vdec_h264_current_apc_valid(
 		const struct histb_vdec_ctx *ctx,
 		const struct histb_vdec_decoded_buffer *decoded,
 		const struct v4l2_ctrl_h264_decode_params *decode,
-		const s8 dpb_to_apc[HISTB_VDEC_H264_DPB_SIZE])
+		const s8 dpb_to_apc[HISTB_VDEC_H264_DPB_MAP_SIZE])
 {
 	unsigned int i, matches = 0;
 
@@ -3131,7 +3142,7 @@ static int
 histb_vdec_sync_apc(struct histb_vdec_ctx *ctx,
 		    struct histb_vdec_decoded_buffer *decoded,
 		    const struct v4l2_ctrl_h264_decode_params *decode,
-		    s8 dpb_to_apc[HISTB_VDEC_H264_DPB_SIZE])
+		    s8 dpb_to_apc[HISTB_VDEC_H264_DPB_MAP_SIZE])
 {
 	struct histb_vdec_decoded_buffer *active[HISTB_VDEC_H264_DPB_SIZE] = {};
 	bool keep[HISTB_VDEC_H264_DPB_SIZE] = {};
@@ -14383,7 +14394,7 @@ module_platform_driver(histb_vdec_driver);
 MODULE_AUTHOR("HiSilicon Technologies Co., Ltd.");
 MODULE_DESCRIPTION("HiSilicon Hi3798CV200 VDH video decoder");
 /* Build tag so a deployment can be proven to have taken effect. */
-#define HISTB_VDEC_BUILD_TAG "dvbip-20260916-align2"
+#define HISTB_VDEC_BUILD_TAG "dvbip-20260915-dpb40"
 MODULE_VERSION(HISTB_VDEC_BUILD_TAG);
 /* dma_buf_export() lives in the DMA_BUF symbol namespace. */
 MODULE_IMPORT_NS(DMA_BUF);
