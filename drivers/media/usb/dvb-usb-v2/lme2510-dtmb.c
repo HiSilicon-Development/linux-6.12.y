@@ -5,6 +5,7 @@
  * Copyright (C) 2026 wwek <licoolgo@gmail.com>
  */
 
+#include <linux/bitmap.h>
 #include <linux/delay.h>
 #include <linux/firmware.h>
 #include <linux/usb.h>
@@ -47,6 +48,7 @@
 #define LME2510_DTMB_COMMAND_BUFFER_SIZE 64
 #define LME2510_DTMB_FIRMWARE_PAYLOAD_SIZE 50
 #define LME2510_DTMB_TS_PACKET_SIZE 188
+#define LME2510_DTMB_TS_PID_COUNT 8192
 #define LME2510_DTMB_TS_BUFFER_SIZE 4096
 #define LME2510_DTMB_TS_CARRY_SIZE (2 * LME2510_DTMB_TS_PACKET_SIZE - 1)
 #define LME2510_DTMB_STREAM_DELAY_MS 325
@@ -76,6 +78,16 @@ struct lme2510_dtmb_state {
 			 LME2510_DTMB_TS_CARRY_SIZE];
 	size_t stream_carry;
 	struct lme2510_dtmb_status stream_status;
+	u64 stream_urbs;
+	u64 stream_bytes;
+	u64 stream_packets;
+	u64 stream_discarded;
+	u64 stream_tei;
+	u64 stream_cc_errors;
+	u8 stream_cc[LME2510_DTMB_TS_PID_COUNT];
+	DECLARE_BITMAP(stream_cc_valid, LME2510_DTMB_TS_PID_COUNT);
+	size_t stream_start_reply_length;
+	u8 stream_start_reply_first;
 
 	u8 tuner_calibration[5];
 	u8 tuner_fraction_high;
@@ -1183,7 +1195,79 @@ static void lme2510_dtmb_reset_stream(struct lme2510_dtmb_state *state)
 	spin_lock_irqsave(&state->stream_lock, flags);
 	state->stream_carry = 0;
 	memset(&state->stream_status, 0, sizeof(state->stream_status));
+	state->stream_urbs = 0;
+	state->stream_bytes = 0;
+	state->stream_packets = 0;
+	state->stream_discarded = 0;
+	state->stream_tei = 0;
+	state->stream_cc_errors = 0;
+	bitmap_zero(state->stream_cc_valid, LME2510_DTMB_TS_PID_COUNT);
 	spin_unlock_irqrestore(&state->stream_lock, flags);
+}
+
+static void lme2510_dtmb_report_stream(struct lme2510_dtmb_state *state)
+{
+	unsigned long flags;
+	u64 discarded;
+	u64 packets;
+	u64 bytes;
+	u64 urbs;
+	u64 tei;
+	u64 cc_errors;
+
+	spin_lock_irqsave(&state->stream_lock, flags);
+	urbs = state->stream_urbs;
+	bytes = state->stream_bytes;
+	packets = state->stream_packets;
+	discarded = state->stream_discarded;
+	tei = state->stream_tei;
+	cc_errors = state->stream_cc_errors;
+	spin_unlock_irqrestore(&state->stream_lock, flags);
+
+	if (!packets) {
+		dev_warn(&state->d->udev->dev,
+			 "stream stopped without aligned TS: ep88_urbs=%llu bytes=%llu discarded=%llu start_reply=%zu/%02x\n",
+			 (unsigned long long)urbs, (unsigned long long)bytes,
+			 (unsigned long long)discarded,
+			 state->stream_start_reply_length,
+			 state->stream_start_reply_first);
+	} else {
+		dev_info(&state->d->udev->dev,
+			 "stream stopped: ep88_urbs=%llu bytes=%llu ts_packets=%llu discarded=%llu tei=%llu cc_errors=%llu start_reply=%zu/%02x\n",
+			 (unsigned long long)urbs, (unsigned long long)bytes,
+			 (unsigned long long)packets,
+			 (unsigned long long)discarded,
+			 (unsigned long long)tei,
+			 (unsigned long long)cc_errors,
+			 state->stream_start_reply_length,
+			 state->stream_start_reply_first);
+	}
+}
+
+static void lme2510_dtmb_count_packet(struct lme2510_dtmb_state *state,
+				      const u8 *packet)
+{
+	u16 pid = ((packet[1] & 0x1f) << 8) | packet[2];
+	u8 adaptation = (packet[3] >> 4) & 0x03;
+	u8 counter = packet[3] & 0x0f;
+	bool discontinuity = false;
+
+	if (packet[1] & BIT(7))
+		state->stream_tei++;
+	if (pid == 0x1fff || !adaptation)
+		return;
+	if ((adaptation & 0x02) && packet[4] &&
+	    packet[4] < LME2510_DTMB_TS_PACKET_SIZE - 5)
+		discontinuity = packet[5] & BIT(7);
+	if (discontinuity)
+		clear_bit(pid, state->stream_cc_valid);
+	if (!(adaptation & 0x01))
+		return;
+	if (test_bit(pid, state->stream_cc_valid) &&
+	    counter != ((state->stream_cc[pid] + 1) & 0x0f))
+		state->stream_cc_errors++;
+	state->stream_cc[pid] = counter;
+	set_bit(pid, state->stream_cc_valid);
 }
 
 static size_t lme2510_dtmb_find_sync(const u8 *buffer, size_t length,
@@ -1209,11 +1293,15 @@ static void lme2510_dtmb_stream_complete(struct usb_data_stream *stream,
 	size_t output = 0;
 	size_t sync;
 	size_t keep;
+	size_t i;
 
-	if (!length || length > LME2510_DTMB_TS_BUFFER_SIZE)
+	if (!atomic_read(&state->streaming) || !length ||
+	    length > LME2510_DTMB_TS_BUFFER_SIZE)
 		return;
 
 	spin_lock_irqsave(&state->stream_lock, flags);
+	state->stream_urbs++;
+	state->stream_bytes += length;
 	total = state->stream_carry + length;
 	memcpy(state->stream_buffer + state->stream_carry, data, length);
 
@@ -1222,10 +1310,12 @@ static void lme2510_dtmb_stream_complete(struct usb_data_stream *stream,
 					      scan);
 		if (sync == total)
 			break;
-		if (sync > scan)
+		if (sync > scan) {
 			lme2510_dtmb_parse_status(state,
 						  state->stream_buffer + scan,
 						  sync - scan);
+			state->stream_discarded += sync - scan;
+		}
 
 		while (sync + LME2510_DTMB_TS_PACKET_SIZE < total &&
 		       state->stream_buffer[sync] == 0x47 &&
@@ -1240,10 +1330,14 @@ static void lme2510_dtmb_stream_complete(struct usb_data_stream *stream,
 		scan = sync;
 	}
 
+	state->stream_packets += output / LME2510_DTMB_TS_PACKET_SIZE;
+	for (i = 0; i < output; i += LME2510_DTMB_TS_PACKET_SIZE)
+		lme2510_dtmb_count_packet(state, state->stream_buffer + i);
 	if (output)
 		dvb_dmx_swfilter(&adapter->demux, state->stream_buffer, output);
 
 	keep = min_t(size_t, total - scan, LME2510_DTMB_TS_CARRY_SIZE);
+	state->stream_discarded += total - scan - keep;
 	if (keep)
 		memmove(state->stream_buffer,
 			state->stream_buffer + total - keep, keep);
@@ -1252,8 +1346,10 @@ static void lme2510_dtmb_stream_complete(struct usb_data_stream *stream,
 }
 
 static int lme2510_dtmb_stream_command(struct lme2510_dtmb_state *state,
-				       const u8 *command, size_t length,
-				       size_t response_length)
+					       const u8 *command, size_t length,
+					       size_t response_length,
+					       size_t *response_actual,
+					       u8 *response_first)
 {
 	u8 response[LME2510_DTMB_COMMAND_BUFFER_SIZE] = {};
 	size_t actual = 0;
@@ -1263,6 +1359,14 @@ static int lme2510_dtmb_stream_command(struct lme2510_dtmb_state *state,
 				    response_length, &actual);
 	if (ret)
 		return ret;
+	if (response_actual)
+		*response_actual = actual;
+	if (response_first)
+		*response_first = actual ? response[0] : 0;
+	if (lme2510_dtmb_debug)
+		dev_info(&state->d->udev->dev,
+			 "stream command %02x reply: length=%zu first=%02x\n",
+			 command[0], actual, actual ? response[0] : 0);
 	return actual ? 0 : -EREMOTEIO;
 }
 
@@ -1270,7 +1374,6 @@ static int lme2510_dtmb_streaming_ctrl(struct dvb_frontend *frontend,
 				       int enable)
 {
 	struct lme2510_dtmb_state *state = frontend->demodulator_priv;
-	struct dvb_usb_adapter *adapter = fe_to_adap(frontend);
 	struct device *dev = &state->d->udev->dev;
 	static const u8 all_pids[] = { 0x03, 0x06, 0x00, 0xff,
 				       0x01, 0x1f, 0x20, 0x81 };
@@ -1281,32 +1384,43 @@ static int lme2510_dtmb_streaming_ctrl(struct dvb_frontend *frontend,
 	if (!enable) {
 		atomic_set(&state->streaming, 0);
 		usb_kill_urb(state->status_urb);
-		ret = lme2510_dtmb_stream_command(state, stop, sizeof(stop), 1);
+		ret = lme2510_dtmb_stream_command(state, stop, sizeof(stop), 1,
+						  NULL, NULL);
+		lme2510_dtmb_report_stream(state);
 		lme2510_dtmb_reset_stream(state);
 		return ret;
 	}
 
 	lme2510_dtmb_reset_stream(state);
-	adapter->stream.complete = lme2510_dtmb_stream_complete;
-	ret = lme2510_dtmb_stream_command(state, all_pids, sizeof(all_pids), 1);
+	state->stream_start_reply_length = 0;
+	state->stream_start_reply_first = 0;
+	atomic_set(&state->streaming, 1);
+	ret = lme2510_dtmb_stream_command(state, all_pids, sizeof(all_pids), 1,
+					  NULL, NULL);
 	if (ret)
-		return ret;
-	ret = lme2510_dtmb_stream_command(state, all_pids, sizeof(all_pids), 1);
+		goto err_stop_streaming;
+	ret = lme2510_dtmb_stream_command(state, all_pids, sizeof(all_pids), 1,
+					  NULL, NULL);
 	if (ret)
-		return ret;
+		goto err_stop_streaming;
 	ret = lme2510_dtmb_stream_command(state, start, sizeof(start),
-					  LME2510_DTMB_COMMAND_BUFFER_SIZE);
+						  LME2510_DTMB_COMMAND_BUFFER_SIZE,
+						  &state->stream_start_reply_length,
+						  &state->stream_start_reply_first);
 	if (ret)
-		return ret;
+		goto err_stop_streaming;
 
 	msleep(LME2510_DTMB_STREAM_DELAY_MS);
-	atomic_set(&state->streaming, 1);
 	ret = lme2510_dtmb_start_status(state);
 	if (ret)
 		dev_warn(dev,
-			 "status endpoint failed (%d); metrics unavailable\n",
-			 ret);
+				 "status endpoint failed (%d); metrics unavailable\n",
+				 ret);
 	return 0;
+
+err_stop_streaming:
+	atomic_set(&state->streaming, 0);
+	return ret;
 }
 
 static void lme2510_dtmb_frontend_release(struct dvb_frontend *frontend)
@@ -1377,8 +1491,9 @@ static const struct dvb_usb_device_properties lme2510_dtmb_properties = {
 	.streaming_ctrl = lme2510_dtmb_streaming_ctrl,
 	.num_adapters = 1,
 	.adapter = {
-		{
-			.stream = DVB_USB_STREAM_BULK(LME2510_DTMB_EP_TS_IN, 10,
+			{
+				.stream_complete = lme2510_dtmb_stream_complete,
+				.stream = DVB_USB_STREAM_BULK(LME2510_DTMB_EP_TS_IN, 10,
 						     LME2510_DTMB_TS_BUFFER_SIZE),
 		},
 	},
