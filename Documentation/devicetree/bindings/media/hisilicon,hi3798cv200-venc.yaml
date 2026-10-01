@@ -1,0 +1,68 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/media/hisilicon,hi3798cv200-venc.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: HiSilicon Hi3798CV200 video encoder
+
+maintainers:
+  - linux-media@vger.kernel.org
+
+description:
+  The Hi3798CV200 video encoder is the first-generation VEDU engine used for
+  H.264 encoding. It has separate core and AXI clock gates. JPEG encoding is
+  handled by a separate JPGE hardware block.
+
+properties:
+  compatible:
+    const: hisilicon,hi3798cv200-venc
+
+  reg:
+    maxItems: 1
+
+  interrupts:
+    maxItems: 1
+
+  clocks:
+    items:
+      - description: Video encoder core clock
+      - description: Video encoder AXI clock
+
+  clock-names:
+    items:
+      - const: core
+      - const: axi
+
+  resets:
+    maxItems: 1
+
+  reset-names:
+    const: venc
+
+required:
+  - compatible
+  - reg
+  - interrupts
+  - clocks
+  - clock-names
+  - resets
+  - reset-names
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/clock/histb-clock.h>
+    #include <dt-bindings/interrupt-controller/arm-gic.h>
+
+    video-codec@f8c80000 {
+        compatible = "hisilicon,hi3798cv200-venc";
+        reg = <0xf8c80000 0x10000>;
+        interrupts = <GIC_SPI 101 IRQ_TYPE_LEVEL_HIGH>;
+        clocks = <&crg HISTB_VENC_CORE_CLK>,
+                 <&crg HISTB_VENC_AXI_CLK>;
+        clock-names = "core", "axi";
+        resets = <&crg 0x8c 4>;
+        reset-names = "venc";
+    };

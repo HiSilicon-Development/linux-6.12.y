@@ -1,0 +1,13 @@
+What:		/sys/bus/platform/devices/*/histb_venc_jobs
+Date:		August 2026
+KernelVersion:	6.12
+Contact:	linux-media@vger.kernel.org
+Description:
+		Read-only number of completed VEDU encoding jobs.
+
+What:		/sys/bus/platform/devices/*/histb_venc_errors
+Date:		August 2026
+KernelVersion:	6.12
+Contact:	linux-media@vger.kernel.org
+Description:
+		Read-only number of VEDU encoding jobs completed with an error.
