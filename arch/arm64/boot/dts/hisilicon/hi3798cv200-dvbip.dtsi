@@ -1,4 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Device Tree Source for HiSilicon Hi3798CV200 DVB-IP common platform.
+ *
+ * Copyright (c) 2026 HiSilicon Technologies Co., Ltd.
+ */
 
 #include <dt-bindings/gpio/gpio.h>
 #include <dt-bindings/pinctrl/hisi.h>
@@ -15,6 +20,17 @@
 
 / {
 	/delete-node/ psci;
+	aliases {
+		mmc0 = &emmc;
+		serial0 = &uart0;
+		serial2 = &uart2;
+	};
+
+	memory@0 {
+		device_type = "memory";
+		reg = <0x0 0x0 0x0 0x80000000>;
+	};
+
 
 	hdmi-connector {
 		compatible = "hdmi-connector";
@@ -146,6 +162,17 @@
 			 * check (kernel/iomem.c) - panfrost does exactly that
 			 * while udev probes it.
 			 */
+			no-map;
+		};
+		/*
+		 * Dedicated H.264 encoder DMA pool.  Keep V4L2 M2M capture
+		 * buffers out of the shared display/eMMC CMA area: a 4K decoder
+		 * plus a 1080i DEI/VENC session can leave free CMA pages without
+		 * leaving a sufficiently large contiguous encoder buffer.
+		 */
+		venc_pool: venc-pool@3c000000 {
+			compatible = "shared-dma-pool";
+			reg = <0x0 0x3c000000 0x0 0x04000000>;
 			no-map;
 		};
 	};
@@ -366,6 +393,10 @@
 	status = "disabled";
 };
 
+&vdd_cpu {
+	status = "okay";
+};
+
 &vdd_gpu {
 	status = "okay";
 };
@@ -410,10 +441,20 @@
 };
 
 &venc {
+	memory-region = <&venc_pool>;
 	status = "okay";
 };
 
 &vdp {
+	clocks = <&crg HISTB_VO_BUS_CLK>,
+		 <&crg HISTB_VO_HD_CLK>,
+		 <&crg HISTB_VDP_CFG_CLK>,
+		 <&crg HISTB_VDP_HD_CLK>,
+		 <&crg HISTB_VDP_V0_CLK>,
+		 <&crg HISTB_VDP_G0_CLK>,
+		 <&crg HISTB_VO_BP_CLK>;
+	clock-names = "bus", "hd", "config", "core", "video",
+		      "graphics", "bp";
 	status = "okay";
 };
 

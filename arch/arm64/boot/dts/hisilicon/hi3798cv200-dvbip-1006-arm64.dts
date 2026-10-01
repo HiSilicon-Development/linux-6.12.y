@@ -1,0 +1,304 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Device Tree Source for HiSilicon Hi3798CV200 DVBIP-1006 board.
+ *
+ * Copyright (c) 2026 HiSilicon Technologies Co., Ltd.
+ */
+
+/dts-v1/;
+
+#include "hi3798cv200-dvbip.dtsi"
+
+/ {
+	model = "DVBIP 1006 ARM64";
+	compatible = "dvbip,1006", "hisilicon,hi3798cv200";
+
+
+	chosen {
+		bootargs = "console=tty0 console=ttyAMA0,115200n8 earlycon=pl011,mmio32,0xf8b00000,115200n8 root=/dev/mmcblk0p5 rootfstype=ext4 rootwait rw blkdevparts=mmcblk0:4M(fastboot),4M(bootargs),212M(deviceinfo),10M(trustedcore),-(rootfs) mem=2G loglevel=7 ignore_loglevel clk_ignore_unused fw_devlink=off dvbip.model=1006";
+		stdout-path = "serial0:115200n8";
+	};
+
+};
+
+&dvbip_sound {
+	simple-audio-card,name = "DVBIP-1006";
+};
+
+/*
+ * Original 1006 Fastboot and Linux both operate the H8G4a eMMC in HS400,
+ * 1.8 V, 8-bit mode at 150 MHz. Preserve the trained sample/strobe handoff
+ * and let the CV200 driver validate or retune it.
+ */
+&emmc {
+	pinctrl-names = "default", "hs200", "hs400";
+	pinctrl-0 = <&ip1006_emmc_default_pins
+		     &ip1006_emmc_reset_pin &ip1006_emmc_strobe_pin>;
+	pinctrl-1 = <&ip1006_emmc_hs200_data_cmd_pins
+		     &ip1006_emmc_hs200_clk_pin
+		     &ip1006_emmc_reset_pin &ip1006_emmc_strobe_pin>;
+	pinctrl-2 = <&ip1006_emmc_hs400_pins
+		     &ip1006_emmc_reset_pin &ip1006_emmc_strobe_pin>;
+	hisilicon,io-voltage-reg = <&sysctrl 0xf4>;
+	hisilicon,hs400-strobe-reg = <&crg 0x290>;
+	hisilicon,inherit-boot-tuning;
+	fifo-depth = <256>;
+	clock-frequency = <100000000>;
+	max-frequency = <150000000>;
+	cap-mmc-highspeed;
+	cap-mmc-hw-reset;
+	mmc-ddr-1_8v;
+	mmc-hs200-1_8v;
+	mmc-hs400-1_8v;
+	no-sd;
+	no-sdio;
+	non-removable;
+	bus-width = <8>;
+	status = "okay";
+};
+
+&gmac1 {
+	phy-mode = "rgmii";
+	hisilicon,phy-reset-delays-us = <10000 20000 50000>;
+};
+
+&ir {
+	linux,rc-map-name = "rc-empty";
+	/* The board leaves this controller floating; do not enable IRQ 36. */
+	status = "disabled";
+};
+
+/*
+ * The original IP1006 user-space probe uses the HRCLS path at wire address
+ * 0xa0 (Linux address 0x50), with the CV200 GPIO7_4 active-low reset route.
+ * The SDA/SCL pair is GPIO8_2/GPIO8_3, which is the CV200 I2C1 MUX_M2
+ * route (pad offsets 0xe0/0xe4), rather than the generic I2C2 route.
+ * Historical device records identify the fitted part as MxL214C_4wire.
+ * Keep the four-output graph explicit so histb-dmx binds the channels in the
+ * same order as the vendor stack.
+ *
+ */
+&demux {
+	pinctrl-names = "default";
+	pinctrl-0 = <&ip1006_mxl214_tsi_pins>;
+	status = "okay";
+};
+
+&dvbip_demux_input0 {
+	status = "okay";
+	hisilicon,cv200-legacy-ts-tuning;
+	hisilicon,hardware-pid-filtering;
+
+	port {
+		ip1006_demux_input0: endpoint {
+			remote-endpoint = <&ip1006_mxl214_output0>;
+		};
+	};
+};
+
+&dvbip_demux_input1 {
+	status = "okay";
+	hisilicon,cv200-legacy-ts-tuning;
+	hisilicon,hardware-pid-filtering;
+
+	port {
+		ip1006_demux_input1: endpoint {
+			remote-endpoint = <&ip1006_mxl214_output1>;
+		};
+	};
+};
+
+&dvbip_demux_input2 {
+	status = "okay";
+	hisilicon,cv200-legacy-ts-tuning;
+	hisilicon,hardware-pid-filtering;
+
+	port {
+		ip1006_demux_input2: endpoint {
+			remote-endpoint = <&ip1006_mxl214_output2>;
+		};
+	};
+};
+
+&dvbip_demux_input3 {
+	status = "okay";
+	hisilicon,cv200-legacy-ts-tuning;
+	hisilicon,hardware-pid-filtering;
+
+	port {
+		ip1006_demux_input3: endpoint {
+			remote-endpoint = <&ip1006_mxl214_output3>;
+		};
+	};
+};
+
+&pmx0 {
+	ip1006_emmc_default_pins: ip1006-emmc-default-pins {
+		pinctrl-single,pins = <
+			0x000 MUX_M0
+			0x004 MUX_M0
+			0x008 MUX_M0
+			0x00c MUX_M0
+			0x010 MUX_M0
+			0x014 MUX_M0
+			0x018 MUX_M0
+			0x01c MUX_M0
+			0x024 MUX_M0
+			0x028 MUX_M0
+		>;
+		pinctrl-single,bias-pulldown = <PINCTRL_PULLDOWN(0, 1, 0, 1)>;
+		pinctrl-single,bias-pullup = <PINCTRL_PULLUP(0, 1, 0, 1)>;
+		pinctrl-single,slew-rate = <PINCTRL_SLEW_RATE(1, 1)>;
+		pinctrl-single,drive-strength = <PINCTRL_DRV_STRENGTH(0xd, 0xf)>;
+	};
+
+	ip1006_emmc_hs200_data_cmd_pins: ip1006-emmc-hs200-data-cmd-pins {
+		pinctrl-single,pins = <
+			0x000 MUX_M0
+			0x004 MUX_M0
+			0x008 MUX_M0
+			0x00c MUX_M0
+			0x010 MUX_M0
+			0x014 MUX_M0
+			0x018 MUX_M0
+			0x01c MUX_M0
+			0x024 MUX_M0
+		>;
+		pinctrl-single,bias-pulldown = <PINCTRL_PULLDOWN(0, 1, 0, 1)>;
+		pinctrl-single,bias-pullup = <PINCTRL_PULLUP(0, 1, 0, 1)>;
+		pinctrl-single,slew-rate = <PINCTRL_SLEW_RATE(1, 1)>;
+		pinctrl-single,drive-strength = <PINCTRL_DRV_STRENGTH(0xb, 0xf)>;
+	};
+
+	ip1006_emmc_hs200_clk_pin: ip1006-emmc-hs200-clk-pin {
+		pinctrl-single,pins = <0x028 MUX_M0>;
+		pinctrl-single,bias-pulldown = <PINCTRL_PULLDOWN(0, 1, 0, 1)>;
+		pinctrl-single,bias-pullup = <PINCTRL_PULLUP(0, 1, 0, 1)>;
+		pinctrl-single,slew-rate = <PINCTRL_SLEW_RATE(0, 1)>;
+		pinctrl-single,drive-strength = <PINCTRL_DRV_STRENGTH(0x9, 0xf)>;
+	};
+
+	ip1006_emmc_hs400_pins: ip1006-emmc-hs400-pins {
+		pinctrl-single,pins = <
+			0x000 MUX_M0
+			0x004 MUX_M0
+			0x008 MUX_M0
+			0x00c MUX_M0
+			0x010 MUX_M0
+			0x014 MUX_M0
+			0x018 MUX_M0
+			0x01c MUX_M0
+			0x024 MUX_M0
+			0x028 MUX_M0
+		>;
+		pinctrl-single,bias-pulldown = <PINCTRL_PULLDOWN(0, 1, 0, 1)>;
+		pinctrl-single,bias-pullup = <PINCTRL_PULLUP(0, 1, 0, 1)>;
+		pinctrl-single,slew-rate = <PINCTRL_SLEW_RATE(0, 1)>;
+		pinctrl-single,drive-strength = <PINCTRL_DRV_STRENGTH(0x9, 0xf)>;
+	};
+
+	ip1006_emmc_reset_pin: ip1006-emmc-reset-pin {
+		pinctrl-single,pins = <0x02c MUX_M0>;
+		pinctrl-single,bias-pulldown = <PINCTRL_PULLDOWN(0, 1, 0, 1)>;
+		pinctrl-single,bias-pullup = <PINCTRL_PULLUP(0, 1, 0, 1)>;
+		pinctrl-single,slew-rate = <PINCTRL_SLEW_RATE(1, 1)>;
+		pinctrl-single,drive-strength = <PINCTRL_DRV_STRENGTH(0x3, 0xf)>;
+	};
+
+	ip1006_emmc_strobe_pin: ip1006-emmc-strobe-pin {
+		pinctrl-single,pins = <0x030 MUX_M2>;
+		pinctrl-single,bias-pulldown = <PINCTRL_PULLDOWN(1, 1, 0, 1)>;
+		pinctrl-single,bias-pullup = <PINCTRL_PULLUP(0, 1, 0, 1)>;
+		pinctrl-single,slew-rate = <PINCTRL_SLEW_RATE(1, 1)>;
+		pinctrl-single,drive-strength = <PINCTRL_DRV_STRENGTH(0x3, 0xf)>;
+	};
+
+	ip1006_mxl214_i2c1_pins: ip1006-mxl214-i2c1-pins {
+		pinctrl-single,pins = <
+			0x0e0 MUX_M2 /* I2C1_SDA / GPIO8_2 */
+			0x0e4 MUX_M2 /* I2C1_SCL / GPIO8_3 */
+		>;
+		/* The board relies on the CV200 internal pull-ups. */
+		pinctrl-single,bias-pulldown = <PINCTRL_PULLDOWN(0, 1, 0, 1)>;
+		pinctrl-single,bias-pullup = <PINCTRL_PULLUP(1, 1, 0, 1)>;
+		pinctrl-single,slew-rate = <PINCTRL_SLEW_RATE(1, 1)>;
+		pinctrl-single,drive-strength = <PINCTRL_DRV_STRENGTH(0x3, 0xf)>;
+	};
+
+	ip1006_mxl214_reset_pin: ip1006-mxl214-reset-pin {
+		pinctrl-single,pins = <
+			0x0c8 MUX_M0 /* GPIO7_4, active-low demodulator reset */
+		>;
+	};
+
+	/* Four serial TS outputs on the CV200 MxL214C pin group. */
+	ip1006_mxl214_tsi_pins: ip1006-mxl214-tsi-pins {
+		pinctrl-single,pins = <
+			0x0b4 MUX_M0 /* unused TSI3-B_VALID */
+			0x0b8 MUX_M0 /* unused TSI3-B_D0 */
+			0x0bc MUX_M0 /* unused TSI3-B_CLK */
+			0x0cc MUX_M2 /* TSI3_VALID */
+			0x0d0 MUX_M2 /* TSI3_D0 */
+			0x0d4 MUX_M2 /* TSI2_VALID */
+			0x0d8 MUX_M2 /* TSI2_D0 */
+			0x0dc MUX_M2 /* TSI2_CLK */
+			0x0e8 MUX_M2 /* TSI1_VALID */
+			0x0ec MUX_M2 /* TSI1_CLK */
+			0x0f0 MUX_M2 /* TSI1_D0 */
+			0x0f4 MUX_M2 /* TSI0_VALID */
+			0x0f8 MUX_M2 /* TSI0_D0 */
+			0x0fc MUX_M2 /* TSI0_CLK */
+		>;
+	};
+};
+
+
+&i2c1 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&ip1006_mxl214_i2c1_pins>;
+	/* The original boot handoff leaves this completion IRQ unavailable. */
+	hisilicon,force-polling;
+	status = "okay";
+
+	ip1006_mxl214: demodulator@50 {
+		compatible = "maxlinear,mxl214c", "maxlinear,mxl214";
+		reg = <0x50>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&ip1006_mxl214_reset_pin>;
+		reset-gpios = <&gpio9 7 GPIO_ACTIVE_LOW>;
+		maxlinear,ts-mode = "serial-4wire";
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+				ip1006_mxl214_output0: endpoint {
+					remote-endpoint = <&ip1006_demux_input0>;
+				};
+			};
+
+			port@1 {
+				reg = <1>;
+				ip1006_mxl214_output1: endpoint {
+					remote-endpoint = <&ip1006_demux_input1>;
+				};
+			};
+
+			port@2 {
+				reg = <2>;
+				ip1006_mxl214_output2: endpoint {
+					remote-endpoint = <&ip1006_demux_input2>;
+				};
+			};
+
+			port@3 {
+				reg = <3>;
+				ip1006_mxl214_output3: endpoint {
+					remote-endpoint = <&ip1006_demux_input3>;
+				};
+			};
+		};
+	};
+};

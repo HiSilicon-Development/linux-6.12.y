@@ -1,3 +1,7 @@
+dtb-$(CONFIG_ARCH_HISI_HISTB) += hi3798cv200-dvbip-1001-arm64.dtb
+dtb-$(CONFIG_ARCH_HISI_HISTB) += hi3798cv200-dvbip-1002-arm64.dtb
+dtb-$(CONFIG_ARCH_HISI_HISTB) += hi3798cv200-dvbip-1004-arm64.dtb
+dtb-$(CONFIG_ARCH_HISI_HISTB) += hi3798cv200-dvbip-1006-arm64.dtb
 # SPDX-License-Identifier: GPL-2.0
 dtb-$(CONFIG_ARCH_HISI) += hi3660-hikey960.dtb
 dtb-$(CONFIG_ARCH_HISI) += hi3670-hikey970.dtb

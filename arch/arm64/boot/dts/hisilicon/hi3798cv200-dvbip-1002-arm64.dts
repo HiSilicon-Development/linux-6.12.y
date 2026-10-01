@@ -1,0 +1,405 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Device Tree Source for HiSilicon Hi3798CV200 DVBIP-1002 board.
+ *
+ * Copyright (c) 2026 HiSilicon Technologies Co., Ltd.
+ */
+
+/dts-v1/;
+
+#include "hi3798cv200-dvbip.dtsi"
+
+/ {
+	model = "DVBIP 1002 ARM64";
+	compatible = "dvbip,1002", "hisilicon,hi3798cv200";
+
+	aliases {
+		mmc1 = &sd0;
+	};
+
+	chosen {
+		bootargs = "console=tty0 console=ttyAMA0,115200n8 earlycon=pl011,mmio32,0xf8b00000,115200n8 root=/dev/mmcblk0p5 rootfstype=ext4 rootwait rw blkdevparts=mmcblk0:4M(fastboot),4M(bootargs),4M(hwconfig),16M(kernel),-(rootfs) mem=2G loglevel=7 clk_ignore_unused fw_devlink=off dvbip.model=1002";
+		stdout-path = "serial0:115200n8";
+	};
+
+
+	ip1002_cpu_opp_table: opp-table-cpu {
+		compatible = "operating-points-v2";
+		opp-shared;
+
+		opp-400000000 {
+			opp-hz = /bits/ 64 <400000000>;
+			/* Safe transition voltage, board floor, safety ceiling. */
+			opp-microvolt = <1000000 840000 1000000>;
+			clock-latency-ns = <110000000>;
+		};
+
+		opp-600000000 {
+			opp-hz = /bits/ 64 <600000000>;
+			opp-microvolt = <1000000 840000 1000000>;
+			clock-latency-ns = <110000000>;
+		};
+
+		opp-800000000 {
+			opp-hz = /bits/ 64 <800000000>;
+			opp-microvolt = <1000000 805000 1000000>;
+			clock-latency-ns = <110000000>;
+		};
+
+		opp-1200000000 {
+			opp-hz = /bits/ 64 <1200000000>;
+			opp-microvolt = <1050000 900000 1050000>;
+			clock-latency-ns = <110000000>;
+		};
+	};
+
+};
+
+&soc {
+	cpu-avs@8a23078 {
+		compatible = "hisilicon,hi3798cv200-avs";
+		reg = <0x8a23078 0x10>, <0x8a23368 0x4>;
+		reg-names = "hpm", "control";
+		hisilicon,hpm-targets = <400000000 0xc9 0>,
+					 <600000000 0xc9 0>,
+					 <800000000 0xe5 1>,
+					 <1200000000 0x110 1>;
+	};
+};
+
+&cpu0 {
+	cpu-supply = <&vdd_cpu>;
+	operating-points-v2 = <&ip1002_cpu_opp_table>;
+	#cooling-cells = <2>;
+};
+
+&cpu1 {
+	cpu-supply = <&vdd_cpu>;
+	operating-points-v2 = <&ip1002_cpu_opp_table>;
+};
+
+&cpu2 {
+	cpu-supply = <&vdd_cpu>;
+	operating-points-v2 = <&ip1002_cpu_opp_table>;
+};
+
+&cpu3 {
+	cpu-supply = <&vdd_cpu>;
+	operating-points-v2 = <&ip1002_cpu_opp_table>;
+};
+
+&dvbip_cooling_maps {
+	map-cpu {
+		trip = <&soc_passive>;
+		cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+	};
+};
+
+&dvbip_sound {
+	simple-audio-card,name = "DVBIP-1002";
+};
+
+&sci0 {
+	/* Original runtime and card-present tests use active-high detection. */
+	hisilicon,card-detect-active-high;
+};
+
+&pmx0 {
+	/* CV200 BSP timing policy at the board's proven 1.8 V I/O voltage. */
+	ip1002_emmc_default_pins: ip1002-emmc-default-pins {
+		pinctrl-single,pins = <
+			0x000 MUX_M0
+			0x004 MUX_M0
+			0x008 MUX_M0
+			0x00c MUX_M0
+			0x010 MUX_M0
+			0x014 MUX_M0
+			0x018 MUX_M0
+			0x01c MUX_M0
+			0x024 MUX_M0
+			0x028 MUX_M0
+		>;
+		pinctrl-single,bias-pulldown = <
+			PINCTRL_PULLDOWN(0, 1, 0, 1)
+		>;
+		pinctrl-single,bias-pullup = <
+			PINCTRL_PULLUP(0, 1, 0, 1)
+		>;
+		pinctrl-single,slew-rate = <PINCTRL_SLEW_RATE(1, 1)>;
+		pinctrl-single,drive-strength = <PINCTRL_DRV_STRENGTH(0xd, 0xf)>;
+	};
+
+	ip1002_emmc_hs200_data_cmd_pins: ip1002-emmc-hs200-data-cmd-pins {
+		pinctrl-single,pins = <
+			0x000 MUX_M0
+			0x004 MUX_M0
+			0x008 MUX_M0
+			0x00c MUX_M0
+			0x010 MUX_M0
+			0x014 MUX_M0
+			0x018 MUX_M0
+			0x01c MUX_M0
+			0x024 MUX_M0
+		>;
+		pinctrl-single,bias-pulldown = <
+			PINCTRL_PULLDOWN(0, 1, 0, 1)
+		>;
+		pinctrl-single,bias-pullup = <
+			PINCTRL_PULLUP(0, 1, 0, 1)
+		>;
+		pinctrl-single,slew-rate = <PINCTRL_SLEW_RATE(1, 1)>;
+		pinctrl-single,drive-strength = <PINCTRL_DRV_STRENGTH(0xb, 0xf)>;
+	};
+
+	ip1002_emmc_hs200_clk_pin: ip1002-emmc-hs200-clk-pin {
+		pinctrl-single,pins = <0x028 MUX_M0>;
+		pinctrl-single,bias-pulldown = <
+			PINCTRL_PULLDOWN(0, 1, 0, 1)
+		>;
+		pinctrl-single,bias-pullup = <
+			PINCTRL_PULLUP(0, 1, 0, 1)
+		>;
+		pinctrl-single,slew-rate = <PINCTRL_SLEW_RATE(0, 1)>;
+		pinctrl-single,drive-strength = <PINCTRL_DRV_STRENGTH(0x9, 0xf)>;
+	};
+
+	ip1002_emmc_hs400_pins: ip1002-emmc-hs400-pins {
+		pinctrl-single,pins = <
+			0x000 MUX_M0
+			0x004 MUX_M0
+			0x008 MUX_M0
+			0x00c MUX_M0
+			0x010 MUX_M0
+			0x014 MUX_M0
+			0x018 MUX_M0
+			0x01c MUX_M0
+			0x024 MUX_M0
+			0x028 MUX_M0
+		>;
+		pinctrl-single,bias-pulldown = <
+			PINCTRL_PULLDOWN(0, 1, 0, 1)
+		>;
+		pinctrl-single,bias-pullup = <
+			PINCTRL_PULLUP(0, 1, 0, 1)
+		>;
+		pinctrl-single,slew-rate = <PINCTRL_SLEW_RATE(0, 1)>;
+		pinctrl-single,drive-strength = <PINCTRL_DRV_STRENGTH(0x9, 0xf)>;
+	};
+
+	ip1002_emmc_reset_pin: ip1002-emmc-reset-pin {
+		pinctrl-single,pins = <0x02c MUX_M0>;
+		pinctrl-single,bias-pulldown = <
+			PINCTRL_PULLDOWN(0, 1, 0, 1)
+		>;
+		pinctrl-single,bias-pullup = <
+			PINCTRL_PULLUP(0, 1, 0, 1)
+		>;
+		pinctrl-single,slew-rate = <PINCTRL_SLEW_RATE(1, 1)>;
+		pinctrl-single,drive-strength = <PINCTRL_DRV_STRENGTH(0x3, 0xf)>;
+	};
+
+	ip1002_emmc_strobe_pin: ip1002-emmc-strobe-pin {
+		pinctrl-single,pins = <0x030 MUX_M2>;
+		pinctrl-single,bias-pulldown = <
+			PINCTRL_PULLDOWN(1, 1, 0, 1)
+		>;
+		pinctrl-single,bias-pullup = <
+			PINCTRL_PULLUP(0, 1, 0, 1)
+		>;
+		pinctrl-single,slew-rate = <PINCTRL_SLEW_RATE(1, 1)>;
+		pinctrl-single,drive-strength = <PINCTRL_DRV_STRENGTH(0x3, 0xf)>;
+	};
+
+	ip1002_i2c1_pins: ip1002-i2c1-pins {
+		pinctrl-single,pins = <
+			0x0e0 MUX_M2 /* I2C1_SDA, pin 56 */
+			0x0e4 MUX_M2 /* I2C1_SCL, pin 57 */
+		>;
+	};
+
+	ip1002_mxl214_reset_pin: ip1002-mxl214-reset-pin {
+		pinctrl-single,pins = <
+			0x0c8 MUX_M0 /* GPIO7_4, MxL214 reset, pin 50 */
+		>;
+	};
+
+	ip1002_tsi_pins: ip1002-tsi-pins {
+		pinctrl-single,pins = <
+			0x0b4 MUX_M0 /* Unused TSI3-B_VALID, pin 45 */
+			0x0b8 MUX_M0 /* Unused TSI3-B_D0, pin 46 */
+			0x0bc MUX_M0 /* Unused TSI3-B_CLK, pin 47 */
+			0x0cc MUX_M2 /* TSI3_VALID, pin 51 */
+			0x0d0 MUX_M2 /* TSI3_D0, pin 52 */
+			0x0d4 MUX_M2 /* TSI2_VALID, pin 53 */
+			0x0d8 MUX_M2 /* TSI2_D0, pin 54 */
+			0x0dc MUX_M2 /* TSI2_CLK, pin 55 */
+			0x0e8 MUX_M2 /* TSI1_VALID, pin 58 */
+			0x0ec MUX_M2 /* TSI1_CLK, pin 59 */
+			0x0f0 MUX_M2 /* TSI1_D0, pin 60 */
+			0x0f4 MUX_M2 /* TSI0_VALID, pin 61 */
+			0x0f8 MUX_M2 /* TSI0_D0, pin 62 */
+			0x0fc MUX_M2 /* TSI0_CLK, pin 63 */
+		>;
+	};
+
+	sd0_pins: sd0-pins {
+		pinctrl-single,pins = <
+			0x158 MUX_M1 /* SDIO0_CARD_POWER_EN, pin 86 */
+			0x160 MUX_M1 /* SDIO0_CDATA1, pin 88 */
+			0x164 MUX_M1 /* SDIO0_CDATA0, pin 89 */
+			0x168 MUX_M1 /* SDIO0_CCLK_OUT, pin 90 */
+			0x16c MUX_M1 /* SDIO0_CCMD, pin 91 */
+			0x170 MUX_M1 /* SDIO0_CDATA3, pin 92 */
+			0x174 MUX_M1 /* SDIO0_CDATA2, pin 93 */
+			0x178 MUX_M1 /* SDIO0_CARD_DETECT, pin 94 */
+		>;
+	};
+};
+
+&emmc {
+	pinctrl-names = "default", "hs200", "hs400";
+	pinctrl-0 = <&ip1002_emmc_default_pins
+		     &ip1002_emmc_reset_pin &ip1002_emmc_strobe_pin>;
+	pinctrl-1 = <&ip1002_emmc_hs200_data_cmd_pins
+		     &ip1002_emmc_hs200_clk_pin
+		     &ip1002_emmc_reset_pin &ip1002_emmc_strobe_pin>;
+	pinctrl-2 = <&ip1002_emmc_hs400_pins
+		     &ip1002_emmc_reset_pin &ip1002_emmc_strobe_pin>;
+	hisilicon,io-voltage-reg = <&sysctrl 0xf4>;
+	hisilicon,hs400-strobe-reg = <&crg 0x290>;
+	hisilicon,inherit-boot-tuning;
+	clock-frequency = <100000000>;
+	max-frequency = <150000000>;
+	cap-mmc-highspeed;
+	cap-mmc-hw-reset;
+	mmc-ddr-1_8v;
+	mmc-hs200-1_8v;
+	mmc-hs400-1_8v;
+	no-sd;
+	no-sdio;
+	non-removable;
+	bus-width = <8>;
+	status = "okay";
+};
+
+&demux {
+	pinctrl-names = "default";
+	pinctrl-0 = <&ip1002_tsi_pins>;
+};
+
+&dvbip_demux_input0 {
+	hisilicon,cv200-legacy-ts-tuning;
+	hisilicon,hardware-pid-filtering;
+	port {
+		demux_input0: endpoint {
+			remote-endpoint = <&mxl214_output0>;
+		};
+	};
+};
+
+&dvbip_demux_input1 {
+	hisilicon,cv200-legacy-ts-tuning;
+	hisilicon,hardware-pid-filtering;
+	port {
+		demux_input1: endpoint {
+			remote-endpoint = <&mxl214_output1>;
+		};
+	};
+};
+
+&dvbip_demux_input2 {
+	hisilicon,cv200-legacy-ts-tuning;
+	hisilicon,hardware-pid-filtering;
+	port {
+		demux_input2: endpoint {
+			remote-endpoint = <&mxl214_output2>;
+		};
+	};
+};
+
+&dvbip_demux_input3 {
+	hisilicon,cv200-legacy-ts-tuning;
+	hisilicon,hardware-pid-filtering;
+	port {
+		demux_input3: endpoint {
+			remote-endpoint = <&mxl214_output3>;
+		};
+	};
+};
+
+&i2c1 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&ip1002_i2c1_pins>;
+	status = "okay";
+
+	mxl214: demodulator@50 {
+		compatible = "maxlinear,mxl214c", "maxlinear,mxl214";
+		reg = <0x50>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&ip1002_mxl214_reset_pin>;
+		reset-gpios = <&gpio7 4 GPIO_ACTIVE_LOW>;
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+
+				mxl214_output0: endpoint {
+					remote-endpoint = <&demux_input0>;
+				};
+			};
+
+			port@1 {
+				reg = <1>;
+
+				mxl214_output1: endpoint {
+					remote-endpoint = <&demux_input1>;
+				};
+			};
+
+			port@2 {
+				reg = <2>;
+
+				mxl214_output2: endpoint {
+					remote-endpoint = <&demux_input2>;
+				};
+			};
+
+			port@3 {
+				reg = <3>;
+
+				mxl214_output3: endpoint {
+					remote-endpoint = <&demux_input3>;
+				};
+			};
+		};
+	};
+};
+
+&sd0 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&sd0_pins>;
+	bus-width = <4>;
+	cap-sd-highspeed;
+	disable-wp;
+	max-frequency = <50000000>;
+	no-1-8-v;
+	no-mmc;
+	no-sdio;
+	status = "okay";
+};
+
+&gmac1 {
+	phy-mode = "rgmii-id";
+	hisilicon,phy-reset-delays-us = <10000 20000 50000>;
+};
+
+&dvbip_phy3 {
+	realtek,led-link-activity;
+};
+
+&ir {
+	status = "disabled";
+};
