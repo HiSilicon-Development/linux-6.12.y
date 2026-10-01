@@ -1,0 +1,62 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/media/hisilicon,hi3798cv200-jpge.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: HiSilicon Hi3798CV200 JPEG encoder
+
+maintainers:
+  - linux-media@vger.kernel.org
+
+description:
+  The JPGE block in the Hi3798CV200 encodes raw YUV frames as baseline JPEG.
+  It is independent from the H.264 VEDU block at a neighbouring address.
+
+properties:
+  compatible:
+    const: hisilicon,hi3798cv200-jpge
+
+  reg:
+    maxItems: 1
+
+  interrupts:
+    maxItems: 1
+
+  clocks:
+    maxItems: 1
+
+  clock-names:
+    const: core
+
+  resets:
+    maxItems: 1
+
+  reset-names:
+    const: jpge
+
+required:
+  - compatible
+  - reg
+  - interrupts
+  - clocks
+  - clock-names
+  - resets
+  - reset-names
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/clock/histb-clock.h>
+    #include <dt-bindings/interrupt-controller/arm-gic.h>
+
+    jpeg-encoder@f8c90000 {
+        compatible = "hisilicon,hi3798cv200-jpge";
+        reg = <0xf8c90000 0x10000>;
+        interrupts = <GIC_SPI 102 IRQ_TYPE_LEVEL_HIGH>;
+        clocks = <&crg HISTB_JPGE_CLK>;
+        clock-names = "core";
+        resets = <&crg 0x90 4>;
+        reset-names = "jpge";
+    };
