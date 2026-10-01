@@ -4408,6 +4408,8 @@ static int histb_vdec_copy_capture(struct histb_vdec_ctx *ctx,
 			return ret;
 		return histb_vdec_apply_vc1_range_map(ctx, dst_buf, dst);
 	}
+	if (dst_dma && ctx->dst.pix.pixelformat == V4L2_PIX_FMT_NV12)
+		return ret;
 	dev_warn_ratelimited(ctx->vdec->dev,
 			     "VPSS post-process failed (%d), using CPU fallback\n",
 			     ret);
