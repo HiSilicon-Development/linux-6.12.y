@@ -9,6 +9,7 @@
 #include <linux/build_bug.h>
 #include <linux/clk.h>
 #include <linux/delay.h>
+#include <linux/dma-buf.h>
 #include <linux/dma-mapping.h>
 #include <linux/interrupt.h>
 #include <linux/module.h>
@@ -311,6 +312,57 @@ histb_venc_get_q_data(struct histb_venc_ctx *ctx, enum v4l2_buf_type type)
 		return &ctx->src;
 
 	return &ctx->dst;
+}
+
+static unsigned int histb_venc_raw_plane_size(const struct histb_venc_q_data *q_data,
+					      unsigned int plane)
+{
+	if (plane == 0)
+		return q_data->pix.bytesperline * q_data->pix.height;
+
+	return q_data->pix.bytesperline * DIV_ROUND_UP(q_data->pix.height, 2);
+}
+
+static void histb_venc_pix_to_mplane(const struct v4l2_pix_format *pix,
+				     struct v4l2_pix_format_mplane *pix_mp,
+				     bool raw)
+{
+	memset(pix_mp, 0, sizeof(*pix_mp));
+	pix_mp->width = pix->width;
+	pix_mp->height = pix->height;
+	pix_mp->pixelformat = pix->pixelformat;
+	pix_mp->field = pix->field;
+	pix_mp->colorspace = pix->colorspace;
+	pix_mp->ycbcr_enc = pix->ycbcr_enc;
+	pix_mp->quantization = pix->quantization;
+	pix_mp->xfer_func = pix->xfer_func;
+	pix_mp->num_planes = raw ? 2 : 1;
+	pix_mp->plane_fmt[0].bytesperline = pix->bytesperline;
+	pix_mp->plane_fmt[0].sizeimage = raw ?
+		pix->bytesperline * pix->height : pix->sizeimage;
+	if (raw) {
+		pix_mp->plane_fmt[1].bytesperline = pix->bytesperline;
+		pix_mp->plane_fmt[1].sizeimage =
+			pix->bytesperline * DIV_ROUND_UP(pix->height, 2);
+	}
+}
+
+static void histb_venc_mplane_to_pix(const struct v4l2_pix_format_mplane *pix_mp,
+				     struct v4l2_pix_format *pix)
+{
+	memset(pix, 0, sizeof(*pix));
+	pix->width = pix_mp->width;
+	pix->height = pix_mp->height;
+	pix->pixelformat = pix_mp->pixelformat;
+	pix->field = pix_mp->field;
+	pix->colorspace = pix_mp->colorspace;
+	pix->ycbcr_enc = pix_mp->ycbcr_enc;
+	pix->quantization = pix_mp->quantization;
+	pix->xfer_func = pix_mp->xfer_func;
+	pix->bytesperline = pix_mp->plane_fmt[0].bytesperline;
+	pix->sizeimage = pix_mp->plane_fmt[0].sizeimage;
+	if (pix_mp->num_planes > 1)
+		pix->sizeimage += pix_mp->plane_fmt[1].sizeimage;
 }
 
 static void histb_venc_put_bits(struct histb_venc_bit_writer *writer,
@@ -722,23 +774,29 @@ static void histb_venc_cancel_rc(struct histb_venc_ctx *ctx, bool dropped)
 	ctx->rc_job_pending = false;
 }
 
-static int histb_venc_collect_stream(struct histb_venc_ctx *ctx,
-				     struct vb2_v4l2_buffer *dst)
+static int histb_venc_collect_stream_cpu(struct histb_venc_ctx *ctx,
+					 struct vb2_v4l2_buffer *dst)
 {
 	struct histb_venc_dev *venc = ctx->venc;
 	struct histb_venc_stream_desc *desc;
-	dma_addr_t dma = vb2_dma_contig_plane_dma_addr(&dst->vb2_buf, 0);
+	dma_addr_t dma = vb2_dma_contig_plane_dma_addr(&dst->vb2_buf, 0) +
+			  dst->vb2_buf.planes[0].data_offset;
 	void *cpu = vb2_plane_vaddr(&dst->vb2_buf, 0);
-	u8 sps[HISTB_VENC_HEADER_MAX], pps[HISTB_VENC_HEADER_MAX];
-	unsigned int size = vb2_plane_size(&dst->vb2_buf, 0);
+	size_t offset = dst->vb2_buf.planes[0].data_offset;
+	unsigned int size;
 	unsigned int packet_len, invalid, payload, prefix, total;
 	bool intra = ctx->curr_intra;
 	int sps_len, pps_len;
+	u8 sps[HISTB_VENC_HEADER_MAX], pps[HISTB_VENC_HEADER_MAX];
 
-	if (!cpu)
+	if (!cpu || offset > vb2_plane_size(&dst->vb2_buf, 0))
 		return -EFAULT;
+	size = vb2_plane_size(&dst->vb2_buf, 0) - offset;
+	if (dma < vb2_dma_contig_plane_dma_addr(&dst->vb2_buf, 0))
+		return -EFAULT;
+	cpu += offset;
 
-	if (!venc->reserved_mem)
+	if (!venc->reserved_mem && dst->vb2_buf.memory != VB2_MEMORY_DMABUF)
 		dma_sync_single_for_cpu(venc->dev, dma, size, DMA_BIDIRECTIONAL);
 	desc = cpu + HISTB_VENC_STREAM_META_SIZE;
 	packet_len = le32_to_cpu(desc->packet_len);
@@ -772,9 +830,29 @@ static int histb_venc_collect_stream(struct histb_venc_ctx *ctx,
 		memcpy(cpu, sps, sps_len);
 		memcpy(cpu + sps_len, pps, pps_len);
 	}
-	vb2_set_plane_payload(&dst->vb2_buf, 0, total);
+	vb2_set_plane_payload(&dst->vb2_buf, 0, offset + total);
 
 	return 0;
+}
+
+static int histb_venc_collect_stream(struct histb_venc_ctx *ctx,
+				     struct vb2_v4l2_buffer *dst)
+{
+	struct dma_buf *dbuf = dst->vb2_buf.planes[0].dbuf;
+	int ret, end_ret;
+
+	if (dbuf) {
+		ret = dma_buf_begin_cpu_access(dbuf, DMA_BIDIRECTIONAL);
+		if (ret)
+			return ret;
+	}
+	ret = histb_venc_collect_stream_cpu(ctx, dst);
+	if (dbuf) {
+		end_ret = dma_buf_end_cpu_access(dbuf, DMA_BIDIRECTIONAL);
+		if (!ret)
+			ret = end_ret;
+	}
+	return ret;
 }
 
 static void histb_venc_finish_job(struct histb_venc_ctx *ctx,
@@ -983,14 +1061,14 @@ static void histb_venc_program_scaling(struct histb_venc_dev *venc)
 }
 
 static void histb_venc_program_frame(struct histb_venc_ctx *ctx,
-				     dma_addr_t src_dma, dma_addr_t dst_dma,
+				     dma_addr_t src_y, dma_addr_t src_c,
+				     dma_addr_t dst_dma,
 				     unsigned int dst_size,
 				     u64 timestamp)
 {
 	struct histb_venc_dev *venc = ctx->venc;
 	unsigned int width = ctx->crop.width;
 	unsigned int height = ctx->crop.height;
-	unsigned int src_height = ctx->src.pix.height;
 	unsigned int recon_height = ALIGN(ctx->src.pix.height, 16);
 	unsigned int stride = ctx->src.pix.bytesperline;
 	unsigned int stream_len = (dst_size - HISTB_VENC_STREAM_META_SIZE) &
@@ -1062,9 +1140,8 @@ static void histb_venc_program_frame(struct histb_venc_ctx *ctx,
 			FIELD_PREP(HISTB_VENC_OUTSTANDING_READ, 1);
 	writel_relaxed(value, venc->regs + HISTB_VENC_OUTSTANDING);
 
-	writel_relaxed(lower_32_bits(src_dma), venc->regs + HISTB_VENC_SRC_Y);
-	writel_relaxed(lower_32_bits(src_dma + stride * src_height),
-			       venc->regs + HISTB_VENC_SRC_C);
+	writel_relaxed(lower_32_bits(src_y), venc->regs + HISTB_VENC_SRC_Y);
+	writel_relaxed(lower_32_bits(src_c), venc->regs + HISTB_VENC_SRC_C);
 	writel_relaxed(0, venc->regs + HISTB_VENC_SRC_V);
 	writel_relaxed(lower_32_bits(recon), venc->regs + HISTB_VENC_RECON_Y);
 	writel_relaxed(lower_32_bits(recon + stride * recon_height),
@@ -1151,15 +1228,68 @@ static void histb_venc_job_abort(void *priv)
 	histb_venc_abort(priv);
 }
 
+static int histb_venc_plane_dma(struct vb2_buffer *vb, unsigned int plane,
+				size_t required, unsigned int align,
+				dma_addr_t *dma)
+{
+	size_t offset = vb->planes[plane].data_offset;
+	size_t size = vb2_plane_size(vb, plane);
+	dma_addr_t base;
+
+	if (offset > size || required > size - offset ||
+	    vb2_get_plane_payload(vb, plane) < offset + required)
+		return -EINVAL;
+	base = vb2_dma_contig_plane_dma_addr(vb, plane);
+	*dma = base + offset;
+	if (*dma < base || *dma + required - 1 < *dma ||
+	    upper_32_bits(*dma) ||
+	    upper_32_bits(*dma + required - 1) ||
+	    !IS_ALIGNED(*dma, align))
+		return -EINVAL;
+
+	return 0;
+}
+
+static int histb_venc_dst_plane_dma(struct vb2_buffer *vb, unsigned int plane,
+				    unsigned int align, dma_addr_t *dma,
+				    unsigned int *size)
+{
+	size_t offset = vb->planes[plane].data_offset;
+	size_t plane_size = vb2_plane_size(vb, plane);
+	dma_addr_t base;
+
+	if (offset > plane_size || plane_size - offset <=
+	    HISTB_VENC_STREAM_META_SIZE)
+		return -EINVAL;
+	base = vb2_dma_contig_plane_dma_addr(vb, plane);
+	*dma = base + offset;
+	*size = plane_size - offset;
+	if (*dma < base || *dma + *size - 1 < *dma ||
+	    upper_32_bits(*dma) ||
+	    upper_32_bits(*dma + *size - 1) ||
+	    !IS_ALIGNED(*dma, align))
+		return -EINVAL;
+
+	return 0;
+}
+
+static void histb_venc_fail_job(struct histb_venc_ctx *ctx)
+{
+	histb_venc_finish_job(ctx, VB2_BUF_STATE_ERROR);
+}
+
 static void histb_venc_device_run(void *priv)
 {
 	struct histb_venc_ctx *ctx = priv;
 	struct histb_venc_dev *venc = ctx->venc;
 	struct vb2_v4l2_buffer *src, *dst;
-	dma_addr_t src_dma, dst_dma;
+	dma_addr_t src_y_dma, src_c_dma, dst_dma;
 	void *dst_cpu;
 	unsigned long flags;
 	unsigned int dst_size;
+	struct histb_venc_q_data *q_data = &ctx->src;
+	size_t y_size = histb_venc_raw_plane_size(q_data, 0);
+	size_t c_size = histb_venc_raw_plane_size(q_data, 1);
 
 	mutex_lock(&venc->launch_lock);
 	src = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
@@ -1182,29 +1312,52 @@ static void histb_venc_device_run(void *priv)
 		return;
 	}
 
-	src_dma = vb2_dma_contig_plane_dma_addr(&src->vb2_buf, 0);
-	dst_dma = vb2_dma_contig_plane_dma_addr(&dst->vb2_buf, 0);
-	dst_cpu = vb2_plane_vaddr(&dst->vb2_buf, 0);
-	dst_size = vb2_plane_size(&dst->vb2_buf, 0);
-	if (!dst_cpu || dst_size <= HISTB_VENC_STREAM_META_SIZE ||
-	    upper_32_bits(src_dma) || upper_32_bits(dst_dma) ||
-	    upper_32_bits(ctx->recon_dma) ||
-	    !IS_ALIGNED(src_dma, 16) ||
-	    !IS_ALIGNED(dst_dma, HISTB_VENC_STREAM_ALIGN)) {
-		histb_venc_finish_job(ctx, VB2_BUF_STATE_ERROR);
+	if (src->vb2_buf.num_planes != 2 ||
+	    histb_venc_plane_dma(&src->vb2_buf, 0, y_size, 16,
+				 &src_y_dma) ||
+	    histb_venc_plane_dma(&src->vb2_buf, 1, c_size, 16,
+				 &src_c_dma) ||
+	    histb_venc_dst_plane_dma(&dst->vb2_buf, 0,
+				     HISTB_VENC_STREAM_ALIGN, &dst_dma,
+				     &dst_size) ||
+	    upper_32_bits(ctx->recon_dma)) {
+		histb_venc_fail_job(ctx);
 		mutex_unlock(&venc->launch_lock);
 		return;
 	}
+	dst_cpu = vb2_plane_vaddr(&dst->vb2_buf, 0);
+	if (!dst_cpu) {
+		histb_venc_fail_job(ctx);
+		mutex_unlock(&venc->launch_lock);
+		return;
+	}
+	dst_cpu += dst->vb2_buf.planes[0].data_offset;
+
 	if (histb_venc_prepare_rc(ctx)) {
 		histb_venc_finish_job(ctx, VB2_BUF_STATE_ERROR);
 		mutex_unlock(&venc->launch_lock);
 		return;
 	}
 
+	if (dst->vb2_buf.planes[0].dbuf &&
+	    dma_buf_begin_cpu_access(dst->vb2_buf.planes[0].dbuf,
+				     DMA_BIDIRECTIONAL)) {
+		histb_venc_finish_job(ctx, VB2_BUF_STATE_ERROR);
+		mutex_unlock(&venc->launch_lock);
+		return;
+	}
 	memset(dst_cpu, 0, HISTB_VENC_STREAM_META_SIZE);
-	if (!venc->reserved_mem)
+	if (dst->vb2_buf.planes[0].dbuf) {
+		if (dma_buf_end_cpu_access(dst->vb2_buf.planes[0].dbuf,
+					  DMA_BIDIRECTIONAL)) {
+			histb_venc_finish_job(ctx, VB2_BUF_STATE_ERROR);
+			mutex_unlock(&venc->launch_lock);
+			return;
+		}
+	} else if (!venc->reserved_mem) {
 		dma_sync_single_for_device(venc->dev, dst_dma, dst_size,
 					   DMA_BIDIRECTIONAL);
+	}
 
 	spin_lock_irqsave(&venc->irqlock, flags);
 	if (WARN_ON(venc->curr_ctx)) {
@@ -1222,8 +1375,8 @@ static void histb_venc_device_run(void *priv)
 
 	writel(0, venc->regs + HISTB_VENC_INTMASK);
 	writel(HISTB_VENC_INT_ALL, venc->regs + HISTB_VENC_INTCLR);
-	histb_venc_program_frame(ctx, src_dma, dst_dma, dst_size,
-				 src->vb2_buf.timestamp);
+	histb_venc_program_frame(ctx, src_y_dma, src_c_dma, dst_dma,
+				 dst_size, src->vb2_buf.timestamp);
 	writel(HISTB_VENC_INT_ALL, venc->regs + HISTB_VENC_INTMASK);
 	mod_delayed_work(system_wq, &venc->watchdog_work,
 			 msecs_to_jiffies(HISTB_VENC_WATCHDOG_MS));
@@ -1293,11 +1446,22 @@ static int histb_venc_queue_setup(struct vb2_queue *vq,
 	struct histb_venc_q_data *q_data =
 		histb_venc_get_q_data(ctx, vq->type);
 
-	if (*nplanes)
-		return sizes[0] < q_data->pix.sizeimage ? -EINVAL : 0;
-
-	*nplanes = 1;
-	sizes[0] = q_data->pix.sizeimage;
+	if (V4L2_TYPE_IS_OUTPUT(vq->type)) {
+		if (*nplanes)
+			return *nplanes != 2 ||
+			       sizes[0] < histb_venc_raw_plane_size(q_data, 0) ||
+			       sizes[1] < histb_venc_raw_plane_size(q_data, 1) ?
+			       -EINVAL : 0;
+		*nplanes = 2;
+		sizes[0] = histb_venc_raw_plane_size(q_data, 0);
+		sizes[1] = histb_venc_raw_plane_size(q_data, 1);
+	} else {
+		if (*nplanes)
+			return sizes[0] < q_data->pix.sizeimage ||
+			       *nplanes != 1 ? -EINVAL : 0;
+		*nplanes = 1;
+		sizes[0] = q_data->pix.sizeimage;
+	}
 
 	return 0;
 }
@@ -1309,17 +1473,32 @@ static int histb_venc_buf_prepare(struct vb2_buffer *vb)
 		histb_venc_get_q_data(ctx, vb->vb2_queue->type);
 	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
 
-	if (vb2_plane_size(vb, 0) < q_data->pix.sizeimage)
-		return -EINVAL;
-	if (V4L2_TYPE_IS_CAPTURE(vb->vb2_queue->type) &&
-	    !vb2_plane_vaddr(vb, 0))
-		return -EFAULT;
-
 	vbuf->field = V4L2_FIELD_NONE;
-	if (V4L2_TYPE_IS_OUTPUT(vb->vb2_queue->type))
-		vb2_set_plane_payload(vb, 0, q_data->pix.sizeimage);
-	else
+	if (V4L2_TYPE_IS_OUTPUT(vb->vb2_queue->type)) {
+		if (vb->num_planes != 2 ||
+		    vb->planes[0].data_offset > vb2_plane_size(vb, 0) ||
+		    histb_venc_raw_plane_size(q_data, 0) >
+		    vb2_plane_size(vb, 0) - vb->planes[0].data_offset ||
+		    vb->planes[1].data_offset > vb2_plane_size(vb, 1) ||
+		    histb_venc_raw_plane_size(q_data, 1) >
+		    vb2_plane_size(vb, 1) - vb->planes[1].data_offset)
+			return -EINVAL;
+		vb2_set_plane_payload(vb, 0,
+				      vb->planes[0].data_offset +
+				      histb_venc_raw_plane_size(q_data, 0));
+		vb2_set_plane_payload(vb, 1,
+				      vb->planes[1].data_offset +
+				      histb_venc_raw_plane_size(q_data, 1));
+	} else {
+		if (vb->num_planes != 1 ||
+		    vb->planes[0].data_offset > vb2_plane_size(vb, 0) ||
+		    q_data->pix.sizeimage >
+		    vb2_plane_size(vb, 0) - vb->planes[0].data_offset)
+			return -EINVAL;
+		if (!vb2_plane_vaddr(vb, 0))
+			return -EFAULT;
 		vb2_set_plane_payload(vb, 0, 0);
+	}
 
 	return 0;
 }
@@ -1402,7 +1581,7 @@ static int histb_venc_queue_init(void *priv, struct vb2_queue *src_vq,
 	struct histb_venc_dev *venc = ctx->venc;
 	int ret;
 
-	src_vq->type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+	src_vq->type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
 	src_vq->io_modes = VB2_MMAP | VB2_DMABUF;
 	src_vq->drv_priv = ctx;
 	src_vq->buf_struct_size = sizeof(struct vb2_v4l2_buffer);
@@ -1416,7 +1595,7 @@ static int histb_venc_queue_init(void *priv, struct vb2_queue *src_vq,
 	if (ret)
 		return ret;
 
-	dst_vq->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	dst_vq->type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
 	dst_vq->io_modes = VB2_MMAP | VB2_DMABUF;
 	dst_vq->drv_priv = ctx;
 	dst_vq->buf_struct_size = sizeof(struct vb2_v4l2_buffer);
@@ -1436,7 +1615,10 @@ static int histb_venc_querycap(struct file *file, void *priv,
 	strscpy(cap->driver, "histb-venc", sizeof(cap->driver));
 	strscpy(cap->card, "HiSilicon Hi3798CV200 H.264 encoder",
 		sizeof(cap->card));
-
+	cap->capabilities = V4L2_CAP_VIDEO_M2M_MPLANE |
+			     V4L2_CAP_STREAMING | V4L2_CAP_DEVICE_CAPS;
+	cap->device_caps = V4L2_CAP_VIDEO_M2M_MPLANE |
+			   V4L2_CAP_STREAMING;
 	return 0;
 }
 
@@ -1484,7 +1666,7 @@ static int histb_venc_enum_fmt(struct file *file, void *priv,
 		return -EINVAL;
 
 	if (V4L2_TYPE_IS_OUTPUT(f->type))
-		f->pixelformat = V4L2_PIX_FMT_NV12;
+		f->pixelformat = V4L2_PIX_FMT_NV12M;
 	else
 		f->pixelformat = V4L2_PIX_FMT_H264;
 
@@ -1495,7 +1677,7 @@ static int histb_venc_enum_framesizes(struct file *file, void *priv,
 				      struct v4l2_frmsizeenum *fsize)
 {
 	if (fsize->index ||
-	    (fsize->pixel_format != V4L2_PIX_FMT_NV12 &&
+	    (fsize->pixel_format != V4L2_PIX_FMT_NV12M &&
 	     fsize->pixel_format != V4L2_PIX_FMT_H264))
 		return -EINVAL;
 
@@ -1510,34 +1692,38 @@ static int histb_venc_enum_framesizes(struct file *file, void *priv,
 	return 0;
 }
 
-static void histb_venc_try_raw_format(struct v4l2_pix_format *pix)
+static void histb_venc_try_raw_format(struct v4l2_pix_format_mplane *pix_mp)
 {
-	u32 width = pix->width;
-	u32 height = pix->height;
+	u32 width = pix_mp->width;
+	u32 height = pix_mp->height;
 	u32 bytesperline;
 
 	v4l_bound_align_image(&width, HISTB_VENC_MIN_WIDTH,
 				      HISTB_VENC_MAX_WIDTH, 4,
 				      &height, HISTB_VENC_MIN_HEIGHT,
 				      HISTB_VENC_MAX_HEIGHT, 1, 0);
-	bytesperline = clamp_t(u32, pix->bytesperline, width,
-			       HISTB_VENC_MAX_STRIDE);
+	bytesperline = clamp_t(u32, pix_mp->plane_fmt[0].bytesperline,
+			       width, HISTB_VENC_MAX_STRIDE);
 	bytesperline = ALIGN(bytesperline, 16);
 
-	pix->width = width;
-	pix->height = height;
-	pix->pixelformat = V4L2_PIX_FMT_NV12;
-	pix->field = V4L2_FIELD_NONE;
-	pix->bytesperline = bytesperline;
-	pix->sizeimage = bytesperline * height * 3 / 2;
-	pix->colorspace = V4L2_COLORSPACE_REC709;
-	pix->ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
-	pix->quantization = V4L2_QUANTIZATION_LIM_RANGE;
-	pix->xfer_func = V4L2_XFER_FUNC_DEFAULT;
+	pix_mp->width = width;
+	pix_mp->height = height;
+	pix_mp->pixelformat = V4L2_PIX_FMT_NV12M;
+	pix_mp->field = V4L2_FIELD_NONE;
+	pix_mp->num_planes = 2;
+	pix_mp->plane_fmt[0].bytesperline = bytesperline;
+	pix_mp->plane_fmt[0].sizeimage = bytesperline * height;
+	pix_mp->plane_fmt[1].bytesperline = bytesperline;
+	pix_mp->plane_fmt[1].sizeimage =
+		bytesperline * DIV_ROUND_UP(height, 2);
+	pix_mp->colorspace = V4L2_COLORSPACE_REC709;
+	pix_mp->ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
+	pix_mp->quantization = V4L2_QUANTIZATION_LIM_RANGE;
+	pix_mp->xfer_func = V4L2_XFER_FUNC_DEFAULT;
 }
 
 static void histb_venc_try_h264_format(struct histb_venc_ctx *ctx,
-				       struct v4l2_pix_format *pix)
+				       struct v4l2_pix_format_mplane *pix_mp)
 {
 	u32 width = ctx->crop.width ? ctx->crop.width : ctx->src.pix.width;
 	u32 height = ctx->crop.height ? ctx->crop.height : ctx->src.pix.height;
@@ -1547,17 +1733,19 @@ static void histb_venc_try_h264_format(struct histb_venc_ctx *ctx,
 				   HISTB_VENC_STREAM_ALIGN),
 			     HISTB_VENC_STREAM_MIN_SIZE);
 
-	pix->width = width;
-	pix->height = height;
-	pix->pixelformat = V4L2_PIX_FMT_H264;
-	pix->field = V4L2_FIELD_NONE;
-	pix->bytesperline = 0;
-	pix->sizeimage = clamp(pix->sizeimage, min_size,
-			       HISTB_VENC_STREAM_MAX_SIZE);
-	pix->colorspace = ctx->src.pix.colorspace;
-	pix->ycbcr_enc = ctx->src.pix.ycbcr_enc;
-	pix->quantization = ctx->src.pix.quantization;
-	pix->xfer_func = ctx->src.pix.xfer_func;
+	pix_mp->width = width;
+	pix_mp->height = height;
+	pix_mp->pixelformat = V4L2_PIX_FMT_H264;
+	pix_mp->field = V4L2_FIELD_NONE;
+	pix_mp->num_planes = 1;
+	pix_mp->plane_fmt[0].bytesperline = 0;
+	pix_mp->plane_fmt[0].sizeimage = clamp(pix_mp->plane_fmt[0].sizeimage,
+					       min_size,
+					       HISTB_VENC_STREAM_MAX_SIZE);
+	pix_mp->colorspace = ctx->src.pix.colorspace;
+	pix_mp->ycbcr_enc = ctx->src.pix.ycbcr_enc;
+	pix_mp->quantization = ctx->src.pix.quantization;
+	pix_mp->xfer_func = ctx->src.pix.xfer_func;
 }
 
 static int histb_venc_try_fmt(struct file *file, void *priv,
@@ -1566,9 +1754,9 @@ static int histb_venc_try_fmt(struct file *file, void *priv,
 	struct histb_venc_ctx *ctx = priv;
 
 	if (V4L2_TYPE_IS_OUTPUT(f->type))
-		histb_venc_try_raw_format(&f->fmt.pix);
+		histb_venc_try_raw_format(&f->fmt.pix_mp);
 	else
-		histb_venc_try_h264_format(ctx, &f->fmt.pix);
+		histb_venc_try_h264_format(ctx, &f->fmt.pix_mp);
 
 	return 0;
 }
@@ -1577,19 +1765,22 @@ static int histb_venc_g_fmt(struct file *file, void *priv,
 			    struct v4l2_format *f)
 {
 	struct histb_venc_ctx *ctx = priv;
+	struct histb_venc_q_data *q_data =
+		histb_venc_get_q_data(ctx, f->type);
 
-	f->fmt.pix = histb_venc_get_q_data(ctx, f->type)->pix;
-
+	histb_venc_pix_to_mplane(&q_data->pix, &f->fmt.pix_mp,
+				 V4L2_TYPE_IS_OUTPUT(f->type));
 	return 0;
 }
+
 
 static int histb_venc_s_fmt(struct file *file, void *priv,
 				    struct v4l2_format *f)
 {
 	struct histb_venc_ctx *ctx = priv;
 	struct vb2_queue *vq;
-	u32 visible_width = f->fmt.pix.width;
-	u32 visible_height = f->fmt.pix.height;
+	u32 visible_width = f->fmt.pix_mp.width;
+	u32 visible_height = f->fmt.pix_mp.height;
 	u32 width;
 	u32 height;
 	int ret;
@@ -1602,10 +1793,10 @@ static int histb_venc_s_fmt(struct file *file, void *priv,
 	if (vb2_is_busy(vq))
 		return -EBUSY;
 
-	histb_venc_get_q_data(ctx, f->type)->pix = f->fmt.pix;
 	if (V4L2_TYPE_IS_OUTPUT(f->type)) {
-		struct v4l2_pix_format dst = ctx->dst.pix;
+		struct v4l2_pix_format_mplane dst_mp;
 
+		histb_venc_mplane_to_pix(&f->fmt.pix_mp, &ctx->src.pix);
 		width = clamp_t(u32, ALIGN(visible_width, 2),
 				HISTB_VENC_MIN_WIDTH, ctx->src.pix.width);
 		height = clamp_t(u32, ALIGN(visible_height, 2),
@@ -1623,18 +1814,11 @@ static int histb_venc_s_fmt(struct file *file, void *priv,
 		ctx->rc_dirty = true;
 		ctx->force_idr = true;
 
-		histb_venc_try_h264_format(ctx, &dst);
-		ctx->dst.pix = dst;
+		histb_venc_pix_to_mplane(&ctx->dst.pix, &dst_mp, false);
+		histb_venc_try_h264_format(ctx, &dst_mp);
+		histb_venc_mplane_to_pix(&dst_mp, &ctx->dst.pix);
 	} else {
-		/* The capture format is the encoded picture size. */
-		/*
-		 * FFmpeg may first TRY_FMT the capture queue with its generic
-		 * 1280x720 default and then set the raw queue to the real input
-		 * size.  CV200 VENC has no capture-side scaler, so accepting that
-		 * stale default would program a 1280x720 SPS while consuming a
-		 * 1920x1080 frame.  Once the raw queue is set, follow the crop
-		 * selected from that queue instead of the stale capture request.
-		 */
+		/* Capture follows the crop selected by the raw queue. */
 		if (ctx->src_fmt_set) {
 			width = ctx->crop.width;
 			height = ctx->crop.height;
@@ -1651,8 +1835,8 @@ static int histb_venc_s_fmt(struct file *file, void *priv,
 		ctx->rc_initialized = false;
 		ctx->rc_dirty = true;
 		ctx->force_idr = true;
-		histb_venc_try_h264_format(ctx, &ctx->dst.pix);
-		f->fmt.pix = ctx->dst.pix;
+		histb_venc_try_h264_format(ctx, &f->fmt.pix_mp);
+		histb_venc_mplane_to_pix(&f->fmt.pix_mp, &ctx->dst.pix);
 	}
 
 	return 0;
@@ -1731,7 +1915,7 @@ static int histb_venc_g_parm(struct file *file, void *priv,
 {
 	struct histb_venc_ctx *ctx = priv;
 
-	if (parm->type != V4L2_BUF_TYPE_VIDEO_OUTPUT)
+	if (parm->type != V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE)
 		return -EINVAL;
 
 	memset(&parm->parm.output, 0, sizeof(parm->parm.output));
@@ -1747,7 +1931,7 @@ static int histb_venc_s_parm(struct file *file, void *priv,
 	struct v4l2_fract requested;
 	u32 fps;
 
-	if (parm->type != V4L2_BUF_TYPE_VIDEO_OUTPUT)
+	if (parm->type != V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE)
 		return -EINVAL;
 
 	requested = parm->parm.output.timeperframe;
@@ -1767,13 +1951,13 @@ static int histb_venc_s_parm(struct file *file, void *priv,
 static const struct v4l2_ioctl_ops histb_venc_ioctl_ops = {
 	.vidioc_querycap = histb_venc_querycap,
 	.vidioc_enum_fmt_vid_cap = histb_venc_enum_fmt,
-	.vidioc_g_fmt_vid_cap = histb_venc_g_fmt,
-	.vidioc_try_fmt_vid_cap = histb_venc_try_fmt,
-	.vidioc_s_fmt_vid_cap = histb_venc_s_fmt,
+	.vidioc_g_fmt_vid_cap_mplane = histb_venc_g_fmt,
+	.vidioc_try_fmt_vid_cap_mplane = histb_venc_try_fmt,
+	.vidioc_s_fmt_vid_cap_mplane = histb_venc_s_fmt,
 	.vidioc_enum_fmt_vid_out = histb_venc_enum_fmt,
-	.vidioc_g_fmt_vid_out = histb_venc_g_fmt,
-	.vidioc_try_fmt_vid_out = histb_venc_try_fmt,
-	.vidioc_s_fmt_vid_out = histb_venc_s_fmt,
+	.vidioc_g_fmt_vid_out_mplane = histb_venc_g_fmt,
+	.vidioc_try_fmt_vid_out_mplane = histb_venc_try_fmt,
+	.vidioc_s_fmt_vid_out_mplane = histb_venc_s_fmt,
 	.vidioc_enum_framesizes = histb_venc_enum_framesizes,
 	.vidioc_g_parm = histb_venc_g_parm,
 	.vidioc_s_parm = histb_venc_s_parm,
@@ -1859,13 +2043,20 @@ static const struct v4l2_ctrl_ops histb_venc_ctrl_ops = {
 
 static void histb_venc_set_default_formats(struct histb_venc_ctx *ctx)
 {
-	ctx->src.pix.width = HISTB_VENC_DEFAULT_WIDTH;
-	ctx->src.pix.height = HISTB_VENC_DEFAULT_HEIGHT;
-	ctx->src.pix.bytesperline = HISTB_VENC_DEFAULT_WIDTH;
-	histb_venc_try_raw_format(&ctx->src.pix);
-	ctx->dst.pix.width = HISTB_VENC_DEFAULT_WIDTH;
-	ctx->dst.pix.height = HISTB_VENC_DEFAULT_HEIGHT;
-	histb_venc_try_h264_format(ctx, &ctx->dst.pix);
+	struct v4l2_pix_format_mplane pix_mp;
+
+	memset(&pix_mp, 0, sizeof(pix_mp));
+	pix_mp.width = HISTB_VENC_DEFAULT_WIDTH;
+	pix_mp.height = HISTB_VENC_DEFAULT_HEIGHT;
+	pix_mp.plane_fmt[0].bytesperline = HISTB_VENC_DEFAULT_WIDTH;
+	histb_venc_try_raw_format(&pix_mp);
+	histb_venc_mplane_to_pix(&pix_mp, &ctx->src.pix);
+	memset(&pix_mp, 0, sizeof(pix_mp));
+	pix_mp.width = HISTB_VENC_DEFAULT_WIDTH;
+	pix_mp.height = HISTB_VENC_DEFAULT_HEIGHT;
+	pix_mp.plane_fmt[0].sizeimage = HISTB_VENC_STREAM_MIN_SIZE;
+	histb_venc_try_h264_format(ctx, &pix_mp);
+	histb_venc_mplane_to_pix(&pix_mp, &ctx->dst.pix);
 	ctx->crop.left = 0;
 	ctx->crop.top = 0;
 	ctx->crop.width = ctx->src.pix.width;
@@ -2157,7 +2348,8 @@ static int histb_venc_probe(struct platform_device *pdev)
 	venc->vfd.lock = &venc->lock;
 	venc->vfd.release = video_device_release_empty;
 	venc->vfd.vfl_dir = VFL_DIR_M2M;
-	venc->vfd.device_caps = V4L2_CAP_VIDEO_M2M | V4L2_CAP_STREAMING;
+	venc->vfd.device_caps = V4L2_CAP_VIDEO_M2M_MPLANE |
+				V4L2_CAP_STREAMING;
 	venc->vfd.entity.function = MEDIA_ENT_F_PROC_VIDEO_ENCODER;
 	video_set_drvdata(&venc->vfd, venc);
 
@@ -2220,3 +2412,4 @@ module_platform_driver(histb_venc_driver);
 MODULE_AUTHOR("HiSilicon Technologies Co., Ltd.");
 MODULE_DESCRIPTION("HiSilicon Hi3798CV200 H.264 encoder");
 MODULE_LICENSE("GPL");
+MODULE_IMPORT_NS(DMA_BUF);
