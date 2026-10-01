@@ -27,7 +27,11 @@ properties:
 
       - description: Hi3798cv200 based boards.
         items:
-          - const: hisilicon,hi3798cv200-poplar
+          - enum:
+              - dvbip,1001
+              - dvbip,1004
+              - hisilicon,hi3798cv200-ip1002
+              - hisilicon,hi3798cv200-poplar
           - const: hisilicon,hi3798cv200
 
       - description: Hi4511 Board
