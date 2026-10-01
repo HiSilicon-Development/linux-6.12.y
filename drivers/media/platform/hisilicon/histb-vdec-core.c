@@ -563,6 +563,15 @@ struct histb_vdec_q_data {
 
 struct histb_vdec_dev;
 
+/*
+ * Drive the VPSS de-interlacer instead of the software path for interlaced
+ * streams.  Off by default: the block's thresholds come from a vendor binary
+ * tuning table we do not have, so this is opt-in until it has been measured.
+ */
+static bool dei;
+module_param(dei, bool, 0644);
+MODULE_PARM_DESC(dei, "de-interlace with the VPSS DI block (default off)");
+
 struct histb_vdec_ctx {
 	struct v4l2_fh fh;
 	struct v4l2_ctrl_handler ctrl_handler;
@@ -584,6 +593,13 @@ struct histb_vdec_ctx {
 	bool h264_new_surface;
 	bool h264_last_slice;
 	bool h264_field_picture;
+	/*
+	 * VPSS de-interlace ring.  The DI block wants four consecutive fields;
+	 * each entry is the tile base address of one field surface.
+	 */
+	dma_addr_t dei_field[4];
+	unsigned int dei_fields;
+
 	bool h264_bottom_field;
 	bool h264_second_field;
 	bool h264_field_transaction;
@@ -4044,6 +4060,66 @@ static int histb_vdec_copy_capture(struct histb_vdec_ctx *ctx)
 	frame.input_ten_bit = ctx->hevc_main10;
 	frame.output_ten_bit =
 		ctx->dst.pix.pixelformat == V4L2_PIX_FMT_P010;
+	/*
+	 * Interlaced streams can be turned into progressive frames by the VPSS
+	 * DI block instead of by detiling the woven surface.  It wants four
+	 * consecutive fields, so the first three go into the ring and only the
+	 * fourth actually runs the block; until the ring is full the old path
+	 * is taken, which also keeps a single-frame stream correct.
+	 *
+	 * A field sits inside the woven surface, so it needs no extra
+	 * allocation: the top field starts at the tile base and the bottom
+	 * field one field-stride further in.
+	 *
+	 * histb_vpss_dei() rejects anything above 1920x1088, which is where the
+	 * vendor validation starts forcing progressive, so a 4K interlaced
+	 * source falls back to this path automatically.
+	 */
+	if (dei && (ctx->mbaff || ctx->h264_field_picture) &&
+	    ctx->dst.pix.pixelformat == V4L2_PIX_FMT_NV12 && dst_dma) {
+		u32 field_height = frame.height / 2;
+		u32 field_stride = frame.input_stride * field_height;
+
+		dma_addr_t field = decoded->tile.dma;
+		struct histb_vpss_dei_frame d;
+		unsigned int i;
+
+		/* Two fields per woven frame, alternating top and bottom. */
+		for (i = 0; i < 2 && ctx->dei_fields < ARRAY_SIZE(ctx->dei_field);
+		     i++) {
+			bool bottom = (ctx->dst.sequence & 1) ? !i : i;
+
+			ctx->dei_field[ctx->dei_fields++] =
+				field + (bottom ? field_stride : 0);
+		}
+
+		if (ctx->dei_fields == ARRAY_SIZE(ctx->dei_field)) {
+			memset(&d, 0, sizeof(d));
+			d.ref_dma = ctx->dei_field[0];
+			d.cur_dma = ctx->dei_field[1];
+			d.nxt1_dma = ctx->dei_field[2];
+			d.nxt2_dma = ctx->dei_field[3];
+			d.width = frame.width;
+			d.height = field_height;
+			d.stride = frame.input_stride;
+			d.top_field_first = true;
+			d.ten_bit = frame.input_ten_bit;
+			d.tile = true;
+			ret = histb_vpss_dei(ctx->vdec->vpss, &d, dst_dma);
+			ctx->dei_fields = 0;
+		} else {
+			ret = -EAGAIN;
+		}
+
+		if (!ret) {
+			ret = histb_vdec_capture_begin_cpu_access(&dst_buf->vb2_buf);
+			if (ret)
+				return ret;
+			return histb_vdec_apply_vc1_range_map(ctx, dst_buf, dst);
+		}
+		if (ret != -EAGAIN)
+			ctx->dei_fields = 0;
+	}
 	ret = histb_vpss_detile(ctx->vdec->vpss, &frame);
 	if (!ret) {
 		/*
@@ -9390,6 +9466,7 @@ static void histb_vdec_complete_capture_buffer(struct histb_vdec_ctx *ctx,
 		struct vb2_v4l2_buffer *dst,
 		enum vb2_buffer_state state, bool last)
 {
+
 	dst->sequence = ctx->dst.sequence++;
 	if (last && state == VB2_BUF_STATE_DONE) {
 		v4l2_m2m_last_buffer_done(ctx->fh.m2m_ctx, dst);

@@ -67,6 +67,7 @@
 #define HISTB_VPSS_DEI_NXT2STRIDE	0x13c
 #define HISTB_VPSS_DEI_ADDR		0x258
 #define HISTB_VPSS_DIECTRL		0x1000
+#define HISTB_VPSS_DEI_PARAM_BASE	0x1000
 
 /* VPSS_CTRL */
 #define HISTB_VPSS_CTRL_DEI_EN		BIT(7)
@@ -80,6 +81,8 @@
 #define HISTB_VPSS_DIE_EDGE_SMOOTH_EN	BIT(20)
 #define HISTB_VPSS_DIE_L_MODE		GENMASK(27, 26)
 #define HISTB_VPSS_DIE_C_MODE		GENMASK(25, 24)
+#define HISTB_VPSS_DIE_OUT_SEL_C	BIT(28)
+#define HISTB_VPSS_DIE_OUT_SEL_L	BIT(29)
 
 /* Field control: bit for "this field is in the decoder's tile format". */
 #define HISTB_VPSS_DEI_TILE_FORMAT	BIT(0)
@@ -161,6 +164,7 @@ struct histb_vpss {
 	struct reset_control *reset;
 	int irq;
 
+	phys_addr_t regs_phys;
 	__le32 *node;
 	dma_addr_t node_dma;
 	__le32 *zme_coef;
@@ -215,6 +219,11 @@ static const s16 histb_vpss_zme_4t_coef[17][4] = {
 	{ -3, 271, 254, -10 },
 	{ -7, 263, 263, -7 },
 };
+
+static u32 histb_vpss_node_read(struct histb_vpss *vpss, u32 reg)
+{
+	return le32_to_cpu(vpss->node[reg / sizeof(*vpss->node)]);
+}
 
 static void histb_vpss_node_write(struct histb_vpss *vpss, u32 reg,
 				  u32 value)
@@ -554,12 +563,391 @@ static void histb_vpss_dei_field(struct histb_vpss *vpss, u32 ctrl_off,
  * filled from PQ_FILE_HEADER_S), so there is no compiled-in set to copy;
  * only edge smoothing is enabled explicitly, as the BSP does.
  */
+
+struct histb_vpss_dei_default {
+	u16 reg;
+	u8 msb;
+	u8 lsb;
+	s32 value;
+};
+
+/* CV200 de-interlacer defaults, from the vendor table
+ * hal/3798cv200/pq_hal_table_default.c (403 HI_PQ_MODULE_DEI rows).
+ * Format: register, msb, lsb, value, name. */
+static const struct histb_vpss_dei_default histb_vpss_dei_defaults[] = {
+	{ 0x1000, 22, 22,      0 }, /* mc_only */
+	{ 0x1000, 21, 21,      0 }, /* ma_only */
+	{ 0x1000, 29, 29,      0 }, /* die_out_sel_l */
+	{ 0x1000, 28, 28,      0 }, /* die_out_sel_c */
+	{ 0x1000, 16, 16,      0 }, /* stinfo_stop */
+	{ 0x1000, 26, 27,      1 }, /* die_l_mode */
+	{ 0x1000, 24, 25,      1 }, /* die_c_mode */
+	{ 0x1000, 17, 17,      0 }, /* die_rst */
+	{ 0x1004, 24, 31,      8 }, /* chroma_mf_offset */
+	{ 0x1004,  7,  7,      1 }, /* rec_mode_en */
+	{ 0x1004,  6,  6,      0 }, /* chroma_mf_max */
+	{ 0x1004,  5,  5,      0 }, /* luma_mf_max */
+	{ 0x1004,  4,  4,      1 }, /* motion_iir_en */
+	{ 0x1004,  2,  2,      0 }, /* luma_scesdf_max */
+	{ 0x1004,  1,  1,      1 }, /* frame_motion_smooth_en */
+	{ 0x1004,  0,  0,      0 }, /* recmode_frmfld_blend_mode */
+	{ 0x1008, 16, 31,   -320 }, /* ver_min_inten */
+	{ 0x1008,  8, 11,      2 }, /* dir_inten_ver */
+	{ 0x100c,  0,  7,      2 }, /* range_scale */
+	{ 0x1010, 16, 19,      8 }, /* ck1_gain */
+	{ 0x1010,  8, 11,      2 }, /* ck1_range_gain */
+	{ 0x1010,  0,  7,     30 }, /* ck1_max_range */
+	{ 0x1014, 16, 19,      8 }, /* ck2_gain */
+	{ 0x1014,  8, 11,      2 }, /* ck2_range_gain */
+	{ 0x1014,  0,  7,     30 }, /* ck2_max_range */
+	{ 0x1024, 16, 21,      3 }, /* dir14_mult */
+	{ 0x1024,  8, 13,      5 }, /* dir13_mult */
+	{ 0x1024,  0,  5,      5 }, /* dir12_mult */
+	{ 0x1020, 24, 29,      6 }, /* dir11_mult */
+	{ 0x1020, 16, 21,      7 }, /* dir10_mult */
+	{ 0x1020,  8, 13,      8 }, /* dir9_mult */
+	{ 0x1020,  0,  5,      9 }, /* dir8_mult */
+	{ 0x101c, 24, 29,     11 }, /* dir7_mult */
+	{ 0x101c, 16, 21,     12 }, /* dir6_mult */
+	{ 0x101c,  8, 13,     15 }, /* dir5_mult */
+	{ 0x101c,  0,  5,     18 }, /* dir4_mult */
+	{ 0x1018, 24, 29,     27 }, /* dir3_mult */
+	{ 0x1018, 16, 21,     32 }, /* dir2_mult */
+	{ 0x1018,  8, 13,     24 }, /* dir1_mult */
+	{ 0x1018,  0,  5,     40 }, /* dir0_mult */
+	{ 0x1030, 24, 27,      8 }, /* intp_scale_ratio_15 */
+	{ 0x1030, 20, 23,      8 }, /* intp_scale_ratio_14 */
+	{ 0x1030, 16, 19,      8 }, /* intp_scale_ratio_13 */
+	{ 0x1030, 12, 15,      8 }, /* intp_scale_ratio_12 */
+	{ 0x1030,  8, 11,      8 }, /* intp_scale_ratio_11 */
+	{ 0x1030,  4,  7,      8 }, /* intp_scale_ratio_10 */
+	{ 0x1030,  0,  3,      8 }, /* intp_scale_ratio_9 */
+	{ 0x102c, 28, 31,      8 }, /* intp_scale_ratio_8 */
+	{ 0x102c, 24, 27,      7 }, /* intp_scale_ratio_7 */
+	{ 0x102c, 20, 23,      7 }, /* intp_scale_ratio_6 */
+	{ 0x102c, 16, 19,      6 }, /* intp_scale_ratio_5 */
+	{ 0x102c, 12, 15,      6 }, /* intp_scale_ratio_4 */
+	{ 0x102c,  8, 11,      5 }, /* intp_scale_ratio_3 */
+	{ 0x102c,  4,  7,      5 }, /* intp_scale_ratio_2 */
+	{ 0x102c,  0,  3,      6 }, /* intp_scale_ratio_1 */
+	{ 0x1034, 16, 31,   5000 }, /* strength_thd */
+	{ 0x1034, 13, 13,      0 }, /* hor_edge_en */
+	{ 0x1034, 12, 12,      0 }, /* edge_mode */
+	{ 0x1034,  8, 11,      4 }, /* dir_thd */
+	{ 0x1034,  0,  6,     32 }, /* bc_gain */
+	{ 0x1038, 12, 19,      0 }, /* fld_motion_coring */
+	{ 0x1038,  4, 11,      0 }, /* jitter_coring */
+	{ 0x1038,  0,  3,      0 }, /* jitter_gain */
+	{ 0x103c, 29, 29,      0 }, /* long_motion_shf */
+	{ 0x103c, 28, 28,      1 }, /* fld_motion_wnd_mode */
+	{ 0x103c, 24, 27,      8 }, /* fld_motion_gain */
+	{ 0x103c, 16, 21,     -2 }, /* fld_motion_curve_slope */
+	{ 0x103c,  8, 15,    255 }, /* fld_motion_thd_high */
+	{ 0x103c,  0,  7,      0 }, /* fld_motion_thd_low */
+	{ 0x1044, 24, 30,     64 }, /* max_motion_iir_ratio */
+	{ 0x1044, 16, 22,     32 }, /* min_motion_iir_ratio */
+	{ 0x1044,  8, 15,    255 }, /* motion_diff_thd_5 */
+	{ 0x1044,  0,  7,    255 }, /* motion_diff_thd_4 */
+	{ 0x1040, 24, 31,    255 }, /* motion_diff_thd_3 */
+	{ 0x1040, 16, 23,    208 }, /* motion_diff_thd_2 */
+	{ 0x1040,  8, 15,    144 }, /* motion_diff_thd_1 */
+	{ 0x1040,  0,  7,     16 }, /* motion_diff_thd_0 */
+	{ 0x1048, 18, 23,      0 }, /* motion_iir_curve_slope_3 */
+	{ 0x1048, 12, 17,      0 }, /* motion_iir_curve_slope_2 */
+	{ 0x1048,  6, 11,      2 }, /* motion_iir_curve_slope_1 */
+	{ 0x1048,  0,  5,      1 }, /* motion_iir_curve_slope_0 */
+	{ 0x104c, 24, 30,     64 }, /* motion_iir_curve_ratio_4 */
+	{ 0x104c, 16, 22,     64 }, /* motion_iir_curve_ratio_3 */
+	{ 0x104c,  8, 14,     64 }, /* motion_iir_curve_ratio_2 */
+	{ 0x104c,  0,  6,     48 }, /* motion_iir_curve_ratio_1 */
+	{ 0x1048, 24, 30,     32 }, /* motion_iir_curve_ratio_0 */
+	{ 0x1050, 21, 21,      0 }, /* his_motion_info_write_mode */
+	{ 0x1050, 20, 20,      0 }, /* his_motion_write_mode */
+	{ 0x1050, 19, 19,      1 }, /* his_motion_using_mode */
+	{ 0x1050, 18, 18,      1 }, /* his_motion_en */
+	{ 0x1050, 17, 17,      0 }, /* pre_info_en */
+	{ 0x1050, 16, 16,      1 }, /* ppre_info_en */
+	{ 0x1050, 12, 13,      0 }, /* rec_mode_frm_motion_step_1 */
+	{ 0x1050,  8,  9,      0 }, /* rec_mode_frm_motion_step_0 */
+	{ 0x1050,  4,  6,      2 }, /* rec_mode_fld_motion_step_1 */
+	{ 0x1050,  0,  2,      2 }, /* rec_mode_fld_motion_step_0 */
+	{ 0x1054, 26, 26,      0 }, /* med_blend_en */
+	{ 0x1054, 25, 25,      0 }, /* reserved_1 */
+	{ 0x1054, 24, 24,      1 }, /* mor_flt_en */
+	{ 0x1054, 10, 23,      0 }, /* reserved_2 */
+	{ 0x1054,  8,  9,      0 }, /* mor_flt_size */
+	{ 0x1054,  0,  7,      0 }, /* mor_flt_thd */
+	{ 0x105c, 16, 16,      0 }, /* comb_chk_en */
+	{ 0x105c,  8, 12,     30 }, /* comb_chk_md_thd */
+	{ 0x105c,  0,  6,     64 }, /* comb_chk_edge_thd */
+	{ 0x1058, 24, 31,    160 }, /* comb_chk_upper_limit */
+	{ 0x1058, 16, 23,     10 }, /* comb_chk_lower_limit */
+	{ 0x1058,  8, 15,     15 }, /* comb_chk_min_vthd */
+	{ 0x1058,  0,  7,    255 }, /* comb_chk_min_hthd */
+	{ 0x1064, 24, 30,     64 }, /* frame_motion_smooth_ratio_max */
+	{ 0x1064, 16, 22,      0 }, /* frame_motion_smooth_ratio_min */
+	{ 0x1064,  8, 15,    255 }, /* frame_motion_smooth_thd5 */
+	{ 0x1064,  0,  7,    255 }, /* frame_motion_smooth_thd4 */
+	{ 0x1060, 24, 31,    255 }, /* frame_motion_smooth_thd3 */
+	{ 0x1060, 16, 23,    255 }, /* frame_motion_smooth_thd2 */
+	{ 0x1060,  8, 15,     72 }, /* frame_motion_smooth_thd1 */
+	{ 0x1060,  0,  7,      8 }, /* frame_motion_smooth_thd0 */
+	{ 0x1068, 18, 23,      0 }, /* frame_motion_smooth_slope3 */
+	{ 0x1068, 12, 17,      0 }, /* frame_motion_smooth_slope2 */
+	{ 0x1068,  6, 11,      0 }, /* frame_motion_smooth_slope1 */
+	{ 0x1068,  0,  5,      8 }, /* frame_motion_smooth_slope0 */
+	{ 0x106c, 24, 30,     64 }, /* frame_motion_smooth_ratio4 */
+	{ 0x106c, 16, 22,     64 }, /* frame_motion_smooth_ratio3 */
+	{ 0x106c,  8, 14,     64 }, /* frame_motion_smooth_ratio2 */
+	{ 0x106c,  0,  6,     64 }, /* frame_motion_smooth_ratio1 */
+	{ 0x1068, 24, 30,      0 }, /* frame_motion_smooth_ratio0 */
+	{ 0x1074, 24, 30,     64 }, /* frame_field_blend_ratio_max */
+	{ 0x1074, 16, 22,      0 }, /* frame_field_blend_ratio_min */
+	{ 0x1074,  8, 15,    255 }, /* frame_field_blend_thd5 */
+	{ 0x1074,  0,  7,    255 }, /* frame_field_blend_thd4 */
+	{ 0x1070, 24, 31,    255 }, /* frame_field_blend_thd3 */
+	{ 0x1070, 16, 23,    255 }, /* frame_field_blend_thd2 */
+	{ 0x1070,  8, 15,     72 }, /* frame_field_blend_thd1 */
+	{ 0x1070,  0,  7,      8 }, /* frame_field_blend_thd0 */
+	{ 0x1078, 18, 23,      0 }, /* frame_field_blend_slope3 */
+	{ 0x1078, 12, 17,      0 }, /* frame_field_blend_slope2 */
+	{ 0x1078,  6, 11,      0 }, /* frame_field_blend_slope1 */
+	{ 0x1078,  0,  5,      8 }, /* frame_field_blend_slope0 */
+	{ 0x107c, 24, 30,     64 }, /* frame_field_blend_ratio4 */
+	{ 0x107c, 16, 22,     64 }, /* frame_field_blend_ratio3 */
+	{ 0x107c,  8, 14,     64 }, /* frame_field_blend_ratio2 */
+	{ 0x107c,  0,  6,     64 }, /* frame_field_blend_ratio1 */
+	{ 0x1078, 24, 30,      0 }, /* frame_field_blend_ratio0 */
+	{ 0x1080, 16, 23,    128 }, /* motion_adjust_gain_chr */
+	{ 0x1080,  8, 13,      0 }, /* motion_adjust_coring */
+	{ 0x1080,  0,  7,    128 }, /* motion_adjust_gain */
+	{ 0x1098, 12, 23,    134 }, /* edge_norm_11 */
+	{ 0x1098,  0, 11,    135 }, /* edge_norm_10 */
+	{ 0x1094, 12, 23,    143 }, /* edge_norm_9 */
+	{ 0x1094,  0, 11,    142 }, /* edge_norm_8 */
+	{ 0x1090, 12, 23,    132 }, /* edge_norm_7 */
+	{ 0x1090,  0, 11,    140 }, /* edge_norm_6 */
+	{ 0x108c, 12, 23,    132 }, /* edge_norm_5 */
+	{ 0x108c,  0, 11,    134 }, /* edge_norm_4 */
+	{ 0x1088, 12, 23,    115 }, /* edge_norm_3 */
+	{ 0x1088,  0, 11,    136 }, /* edge_norm_2 */
+	{ 0x1084, 12, 23,    227 }, /* edge_norm_1 */
+	{ 0x1084,  0, 11,      0 }, /* edge_norm_0 */
+	{ 0x1094, 24, 31,     32 }, /* inter_diff_thd0 */
+	{ 0x1098, 24, 31,     64 }, /* inter_diff_thd1 */
+	{ 0x109c, 24, 31,    255 }, /* inter_diff_thd2 */
+	{ 0x109c, 12, 23,     32 }, /* edge_scale */
+	{ 0x109c,  0, 11,     16 }, /* edge_coring */
+	{ 0x10a4, 24, 31,     16 }, /* mc_strength_maxg */
+	{ 0x10a4, 16, 23,     16 }, /* mc_strength_ming */
+	{ 0x1090, 24, 31,     64 }, /* mc_strength_g3 */
+	{ 0x10a4,  8, 15,     64 }, /* mc_strength_g2 */
+	{ 0x10a4,  0,  7,     16 }, /* mc_strength_g1 */
+	{ 0x10a0, 24, 31,     16 }, /* mc_strength_g0 */
+	{ 0x108c, 24, 31,      0 }, /* mc_strength_k3 */
+	{ 0x10a0, 16, 23,      0 }, /* mc_strength_k2 */
+	{ 0x10a0,  8, 15,      6 }, /* mc_strength_k1 */
+	{ 0x10a0,  0,  7,      0 }, /* mc_strength_k0 */
+	{ 0x10a8, 24, 30,     64 }, /* k_c_mcbld */
+	{ 0x10a8, 16, 22,      8 }, /* k_c_mcw */
+	{ 0x10a8,  8, 14,     64 }, /* k_y_mcbld */
+	{ 0x10a8,  0,  6,     16 }, /* k_y_mcw */
+	{ 0x10ac, 16, 27,   1023 }, /* g0_mcw_adj */
+	{ 0x10ac,  8, 15,     64 }, /* k0_mcw_adj */
+	{ 0x10ac,  0,  7,     64 }, /* x0_mcw_adj */
+	{ 0x10b0,  0,  7,    128 }, /* k1_mcw_adj */
+	{ 0x10b0, 24, 31,      0 }, /* k1_mcbld */
+	{ 0x10b0, 16, 23,      0 }, /* k0_mcbld */
+	{ 0x10b0,  8, 15,      0 }, /* x0_mcbld */
+	{ 0x10b4,  0, 11,      0 }, /* g0_mcbld */
+	{ 0x10b4, 20, 20,      1 }, /* mc_lai_bldmode */
+	{ 0x10b4, 12, 16,      0 }, /* k_curw_mcbld */
+	{ 0x10b8, 16, 25,     16 }, /* ma_gbm_thd0 */
+	{ 0x10b8,  0,  9,     48 }, /* ma_gbm_thd1 */
+	{ 0x10bc, 16, 25,     80 }, /* ma_gbm_thd2 */
+	{ 0x10bc,  0,  9,    112 }, /* ma_gbm_thd3 */
+	{ 0x10c0, 28, 28,      1 }, /* mtfilten_gmd */
+	{ 0x10c0, 20, 25,     28 }, /* mtth3_gmd */
+	{ 0x10c0, 12, 17,     20 }, /* mtth2_gmd */
+	{ 0x10c0,  4,  8,     12 }, /* mtth1_gmd */
+	{ 0x10c0,  0,  3,      4 }, /* mtth0_gmd */
+	{ 0x10c4, 12, 19,     96 }, /* k_mag_gmd */
+	{ 0x10c4,  4, 10,     22 }, /* k_difh_gmd */
+	{ 0x10c4,  0,  3,      4 }, /* k_maxmag_gmd */
+	{ 0x10fc, 24, 27,      3 }, /* k_rgdifycore */
+	{ 0x10fc, 14, 23,   1023 }, /* g_rgdifycore */
+	{ 0x10fc, 10, 13,      7 }, /* core_rgdify */
+	{ 0x10fc,  0,  9,    511 }, /* lmt_rgdify */
+	{ 0x1100, 23, 25,      1 }, /* coef_sadlpf */
+	{ 0x1100, 15, 21,     32 }, /* kmv_rgsad */
+	{ 0x1100,  9, 14,     63 }, /* k_tpdif_rgsad */
+	{ 0x1100,  0,  8,    255 }, /* g_tpdif_rgsad */
+	{ 0x1104, 19, 26,     48 }, /* thmag_rgmv */
+	{ 0x1104, 10, 18,    128 }, /* th_saddif_rgmv */
+	{ 0x1104,  0,  9,    256 }, /* th_0mvsad_rgmv */
+	{ 0x1108, 10, 13,      3 }, /* core_mag_rg */
+	{ 0x1108,  0,  9,    255 }, /* lmt_mag_rg */
+	{ 0x110c, 21, 25,      2 }, /* core_mv_rgmvls */
+	{ 0x110c, 16, 20,     16 }, /* k_mv_rgmvls */
+	{ 0x110c,  9, 15,    -64 }, /* core_mag_rgmvls */
+	{ 0x110c,  5,  8,     12 }, /* k_mag_rgmvls */
+	{ 0x110c,  1,  4,      8 }, /* th_mvadj_rgmvls */
+	{ 0x110c,  0,  0,      1 }, /* en_mvadj_rgmvls */
+	{ 0x1110, 15, 18,      8 }, /* k_sad_rgls */
+	{ 0x1110,  9, 14,     40 }, /* th_mag_rgls */
+	{ 0x1110,  4,  8,      8 }, /* th_sad_rgls */
+	{ 0x1110,  0,  3,      8 }, /* k_sadcore_rgmv */
+	{ 0x1114,  8,  8,      0 }, /* force_mven */
+	{ 0x1114,  0,  7,      0 }, /* force_mvx */
+	{ 0x1118, 16, 18,      6 }, /* th_blkmvx_mvdlt */
+	{ 0x1118, 12, 15,      4 }, /* th_rgmvx_mvdlt */
+	{ 0x1118,  8, 11,      8 }, /* th_ls_mvdlt */
+	{ 0x1118,  4,  7,      1 }, /* th_vblkdist_mvdlt */
+	{ 0x1118,  0,  3,      4 }, /* th_hblkdist_mvdlt */
+	{ 0x111c, 23, 25,      2 }, /* k_sadcore_mvdlt */
+	{ 0x111c, 18, 22,     12 }, /* th_mag_mvdlt */
+	{ 0x111c, 12, 17,     16 }, /* g_mag_mvdlt */
+	{ 0x111c,  5, 11,     96 }, /* thl_sad_mvdlt */
+	{ 0x111c,  0,  4,     16 }, /* thh_sad_mvdlt */
+	{ 0x1120, 20, 24,     20 }, /* k_rglsw */
+	{ 0x1120, 14, 19,     32 }, /* k_simimvw */
+	{ 0x1120,  8, 13,     15 }, /* gh_core_simimv */
+	{ 0x1120,  5,  7,      0 }, /* gl_core_simimv */
+	{ 0x1120,  0,  4,      8 }, /* k_core_simimv */
+	{ 0x1124, 23, 27,     16 }, /* k_core_vsaddif */
+	{ 0x1124, 19, 22,      8 }, /* k_rgsadadj_mcw */
+	{ 0x1124, 10, 18,     64 }, /* core_rgsadadj_mcw */
+	{ 0x1124,  4,  9,     16 }, /* k_mvy_mcw */
+	{ 0x1124,  1,  3,      3 }, /* core_mvy_mcw */
+	{ 0x1124,  0,  0,      1 }, /* rgtb_en_mcw */
+	{ 0x1128, 19, 26,     24 }, /* core_rgmag_mcw */
+	{ 0x1128, 18, 18,      0 }, /* mode_rgysad_mcw */
+	{ 0x1128, 12, 17,      8 }, /* k_vsaddifw */
+	{ 0x1128,  5, 11,     64 }, /* gh_core_vsad_dif */
+	{ 0x1128,  0,  4,      8 }, /* gl_core_vsaddif */
+	{ 0x112c, 18, 25,     64 }, /* g0_rgmag_mcw */
+	{ 0x112c,  9, 17,    256 }, /* k0_rgmag_mcw */
+	{ 0x112c,  0,  8,     64 }, /* x0_rgmag_mcw */
+	{ 0x1130, 17, 26,    512 }, /* x0_rgsad_mcw */
+	{ 0x1130,  9, 16,     96 }, /* core_rgsad_mcw */
+	{ 0x1130,  0,  8,    320 }, /* k1_rgmag_mcw */
+	{ 0x1134, 17, 25,    128 }, /* k1_rgsad_mcw */
+	{ 0x1134,  9, 16,    255 }, /* g0_rgsad_mcw */
+	{ 0x1134,  0,  8,    160 }, /* k0_rgsad_mcw */
+	{ 0x1138, 24, 29,     24 }, /* k_rgsad_mcw */
+	{ 0x1138, 16, 23,    122 }, /* x_rgsad_mcw */
+	{ 0x1138,  8, 15,     64 }, /* k0_smrg_mcw */
+	{ 0x1138,  0,  7,     16 }, /* x0_smrg_mcw */
+	{ 0x113c, 23, 29,     32 }, /* k1_tpmvdist_mcw */
+	{ 0x113c, 15, 22,      0 }, /* g0_tpmvdist_mcw */
+	{ 0x113c,  8, 14,     64 }, /* k0_tpmvdist_mcw */
+	{ 0x113c,  0,  7,    255 }, /* x0_tpmvdist_mcw */
+	{ 0x1140, 11, 13,      2 }, /* k_core_tpmvdist_mcw */
+	{ 0x1140,  8, 10,      2 }, /* b_core_tpmvdist_mcw */
+	{ 0x1140,  4,  7,      4 }, /* k_avgmvdist_mcw */
+	{ 0x1140,  0,  3,      4 }, /* k_minmvdist_mcw */
+	{ 0x1144, 27, 30,     15 }, /* k_tbdif_mcw */
+	{ 0x1144, 23, 26,      8 }, /* k0_max_mag_mcw */
+	{ 0x1144, 19, 22,      8 }, /* k1_max_mag_mcw */
+	{ 0x1144, 15, 18,      8 }, /* k_max_dif_mcw */
+	{ 0x1144, 11, 14,      8 }, /* k_max_core_mcw */
+	{ 0x1144,  5, 10,     32 }, /* k_difvcore_mcw */
+	{ 0x1144,  0,  4,     18 }, /* k_difhcore_mcw */
+	{ 0x1148, 21, 24,      6 }, /* k1_mag_wnd_mcw */
+	{ 0x1148, 15, 20,     24 }, /* g0_mag_wnd_mcw */
+	{ 0x1148, 11, 14,      6 }, /* k0_mag_wnd_mcw */
+	{ 0x1148,  4, 10,     32 }, /* x0_mag_wnd_mcw */
+	{ 0x1148,  0,  3,      0 }, /* k_tbmag_mcw */
+	{ 0x114c, 21, 28,     16 }, /* g0_sad_wnd_mcw */
+	{ 0x114c, 16, 20,     16 }, /* k0_sad_wnd_mcw */
+	{ 0x114c,  9, 15,      8 }, /* x0_sad_wnd_mcw */
+	{ 0x114c,  0,  8,    288 }, /* g1_mag_wnd_mcw */
+	{ 0x1150,  5, 13,    288 }, /* g1_sad_wnd_mcw */
+	{ 0x1150,  0,  4,     16 }, /* k1_sad_wnd_mcw */
+	{ 0x1154, 24, 26,      0 }, /* b_hvdif_dw */
+	{ 0x1154, 20, 22,      0 }, /* b_bhvdif_dw */
+	{ 0x1154, 12, 18,     64 }, /* k_bhvdif_dw */
+	{ 0x1154,  8, 11,      5 }, /* core_bhvdif_dw */
+	{ 0x1154,  4,  7,     15 }, /* gain_lpf_dw */
+	{ 0x1154,  0,  3,     12 }, /* k_max_hvdif_dw */
+	{ 0x1158, 20, 25,     56 }, /* b_mv_dw */
+	{ 0x1158, 16, 19,     -2 }, /* core_mv_dw */
+	{ 0x1158,  8, 12,     20 }, /* k_difv_dw */
+	{ 0x1158,  0,  4,     16 }, /* core_hvdif_dw */
+	{ 0x115c, 25, 30,      8 }, /* k1_hvdif_dw */
+	{ 0x115c, 16, 24,    128 }, /* g0_hvdif_dw */
+	{ 0x115c,  9, 14,      8 }, /* k0_hvdif_dw */
+	{ 0x115c,  0,  8,    256 }, /* x0_hvdif_dw */
+	{ 0x1160, 24, 31,     64 }, /* k1_mv_dw */
+	{ 0x1160, 16, 21,     32 }, /* g0_mv_dw */
+	{ 0x1160,  8, 13,     16 }, /* k0_mv_dw */
+	{ 0x1160,  0,  4,      8 }, /* x0_mv_dw */
+	{ 0x1164, 24, 29,     32 }, /* k1_mt_dw */
+	{ 0x1164, 16, 23,     64 }, /* g0_mt_dw */
+	{ 0x1164,  8, 13,     32 }, /* k0_mt_dw */
+	{ 0x1164,  0,  6,     32 }, /* x0_mt_dw */
+	{ 0x1168, 24, 31,      0 }, /* b_mt_dw */
+	{ 0x1168, 12, 16,     20 }, /* k1_mv_mt */
+	{ 0x1168,  8,  9,      1 }, /* x0_mv_mt */
+	{ 0x1168,  0,  4,     31 }, /* g0_mv_mt */
+	{ 0x116c, 28, 28,      1 }, /* mclpf_mode */
+	{ 0x116c, 20, 26,      8 }, /* k_pxlmag_mcw */
+	{ 0x116c, 16, 18,      2 }, /* x_pxlmag_mcw */
+	{ 0x116c, 15, 15,      0 }, /* rs_pxlmag_mcw */
+	{ 0x116c, 10, 14,     16 }, /* gain_mclpfh */
+	{ 0x116c,  5,  9,     16 }, /* gain_dn_mclpfv */
+	{ 0x116c,  0,  4,     16 }, /* gain_up_mclpfv */
+	{ 0x1170,  0,  5,      0 }, /* g_pxlmag_mcw */
+	{ 0x1174,  5, 11,     15 }, /* k_c_vertw */
+	{ 0x1174,  0,  4,      8 }, /* k_y_vertw */
+	{ 0x1178, 25, 29,      0 }, /* k_fstmt_mc */
+	{ 0x1178, 20, 24,      0 }, /* x_fstmt_mc */
+	{ 0x1178, 14, 19,     16 }, /* k1_mv_mc */
+	{ 0x1178, 11, 13,      2 }, /* x0_mv_mc */
+	{ 0x1178,  8, 10,      4 }, /* bdv_mcpos */
+	{ 0x1178,  5,  7,      4 }, /* bdh_mcpos */
+	{ 0x1178,  0,  4,      8 }, /* k_delta */
+	{ 0x117c, 26, 30,     48 }, /* k_hfcore_mc */
+	{ 0x117c, 21, 25,      8 }, /* x_hfcore_mc */
+	{ 0x117c, 15, 20,      0 }, /* g_slmt_mc */
+	{ 0x117c, 10, 14,      0 }, /* k_slmt_mc */
+	{ 0x117c,  5,  9,      0 }, /* x_slmt_mc */
+	{ 0x117c,  0,  4,      0 }, /* g_fstmt_mc */
+	{ 0x1180, 18, 29,      0 }, /* r0_mc */
+	{ 0x1180,  6, 17,      0 }, /* c0_mc */
+	{ 0x1180,  0,  5,      0 }, /* g_hfcore_mc */
+	{ 0x1184, 24, 29,     32 }, /* mcmvrange */
+	{ 0x1184, 12, 23,   4095 }, /* r1_mc */
+	{ 0x1184,  0, 11,   4095 }, /* c1_mc */
+	{ 0x1188,  6, 12,     48 }, /* k_frcount_mc */
+	{ 0x1188,  1,  5,      8 }, /* x_frcount_mc */
+	{ 0x1188,  0,  0,      0 }, /* scenechange_mc */
+	{ 0x118c, 24, 31,      0 }, /* mcendc */
+	{ 0x118c, 16, 23,      0 }, /* mcendr */
+	{ 0x118c,  8, 15,      0 }, /* mcstartc */
+	{ 0x118c,  0,  7,      0 }, /* mcstartr */
+	{ 0x1190, 18, 23,      2 }, /* movegain */
+	{ 0x1190, 12, 17,      4 }, /* movecorig */
+	{ 0x1190,  6, 11,      2 }, /* movethdl */
+	{ 0x1190,  0,  5,     12 }, /* movethdh */
+	{ 0x1194, 15, 15,      0 }, /* mc_numt_blden */
+	{ 0x1194,  7, 14,     32 }, /* numt_gain */
+	{ 0x1194,  1,  6,      0 }, /* numt_coring */
+	{ 0x1194,  0,  0,      0 }, /* numt_lpf_en */
+	{ 0x1198,  5, 16,      0 }, /* demo_border */
+	{ 0x1198,  3,  4,      2 }, /* demo_mode_r */
+	{ 0x1198,  1,  2,      2 }, /* demo_mode_l */
+	{ 0x1198,  0,  0,      0 }, /* demo_en */
+};
+
 int histb_vpss_dei(struct histb_vpss *vpss,
 		   const struct histb_vpss_dei_frame *frame,
 		   dma_addr_t output_dma)
 {
 	u32 stride = frame ? frame->stride : 0;
+	u32 field_height;
 	u32 ctrl;
+	unsigned int i;
 	unsigned long timeout;
 	int ret;
 
@@ -578,62 +966,137 @@ int histb_vpss_dei(struct histb_vpss *vpss,
 	    upper_32_bits(output_dma))
 		return -EINVAL;
 
+	field_height = frame->height / 2;
+
 	mutex_lock(&vpss->lock);
 
 	ret = pm_runtime_resume_and_get(vpss->dev);
 	if (ret < 0)
 		goto unlock;
 
-	/* Luma and chroma output of the de-interlacer. */
-	writel(lower_32_bits(output_dma), vpss->regs + HISTB_VPSS_LB_Y_ADDR);
-	writel(lower_32_bits(output_dma + stride *
-			     (frame->height * 2)),
-	       vpss->regs + HISTB_VPSS_LB_C_ADDR);
-	writel(stride, vpss->regs + HISTB_VPSS_LB_STRIDE);
-	writel(FIELD_PREP(GENMASK(15, 0), frame->width - 1) |
-	       FIELD_PREP(GENMASK(31, 16), frame->height * 2 - 1),
-	       vpss->regs + HISTB_VPSS_IMG_SIZE);
+	/*
+	 * Everything goes into the node image, not into the register window:
+	 * the engine reads its register set from the descriptor that
+	 * VPSS_NEXT points at, which is how the scaler path works too.
+	 * Writing the live registers instead leaves NEXT at zero, the engine
+	 * finds no node to run and the job times out - measured as
+	 * diesta = 0, intstat = 0, next = 0 with every other field correct.
+	 */
+	memset(vpss->node, 0, HISTB_VPSS_NODE_SIZE);
 
-	histb_vpss_dei_field(vpss, HISTB_VPSS_DEI_REF_CTRL,
-			     HISTB_VPSS_DEI_REFYADDR, HISTB_VPSS_DEI_REFCADDR,
-			     HISTB_VPSS_DEI_REFSTRIDE, frame, frame->ref_dma,
-			     stride);
-	histb_vpss_dei_field(vpss, HISTB_VPSS_DEI_CUR_CTRL,
-			     HISTB_VPSS_DEI_CURYADDR, HISTB_VPSS_DEI_CURCADDR,
-			     HISTB_VPSS_DEI_CURSTRIDE, frame, frame->cur_dma,
-			     stride);
-	histb_vpss_dei_field(vpss, HISTB_VPSS_DEI_NXT1_CTRL,
-			     HISTB_VPSS_DEI_NXT1YADDR, HISTB_VPSS_DEI_NXT1CADDR,
-			     HISTB_VPSS_DEI_NXT1STRIDE, frame, frame->nxt1_dma,
-			     stride);
-	histb_vpss_dei_field(vpss, HISTB_VPSS_DEI_NXT2_CTRL,
-			     HISTB_VPSS_DEI_NXT2YADDR, HISTB_VPSS_DEI_NXT2CADDR,
-			     HISTB_VPSS_DEI_NXT2STRIDE, frame, frame->nxt2_dma,
-			     stride);
-
-	/* 4-field mode, as the vendor HAL selects (`SetMode(..., 1)`). */
-	writel(FIELD_PREP(HISTB_VPSS_DIE_L_MODE, 1) |
-	       FIELD_PREP(HISTB_VPSS_DIE_C_MODE, 1) |
-	       HISTB_VPSS_DIE_EDGE_SMOOTH_EN, vpss->regs + HISTB_VPSS_DIECTRL);
-
-	ctrl = readl(vpss->regs + HISTB_VPSS_CTRL);
-	ctrl |= HISTB_VPSS_CTRL_DEI_EN;
-	ctrl &= ~HISTB_VPSS_CTRL_BFIELD_FIRST;
+	ctrl = histb_vpss_node_read(vpss, HISTB_VPSS_CTRL);
+	ctrl |= HISTB_VPSS_CTRL_DEI_EN | HISTB_VPSS_CTRL_OUTPUT_EN;
 	if (!frame->top_field_first)
 		ctrl |= HISTB_VPSS_CTRL_BFIELD_FIRST;
-	ctrl &= ~HISTB_VPSS_CTRL_BFIELD_MODE;
-	writel(ctrl, vpss->regs + HISTB_VPSS_CTRL);
+	else
+		ctrl &= ~HISTB_VPSS_CTRL_BFIELD_FIRST;
+	histb_vpss_node_write(vpss, HISTB_VPSS_CTRL, ctrl);
+
+	/* Output of the de-interlaced frame. */
+	histb_vpss_node_write(vpss, HISTB_VPSS_LB_Y_ADDR,
+			      lower_32_bits(output_dma));
+	histb_vpss_node_write(vpss, HISTB_VPSS_LB_C_ADDR,
+			      lower_32_bits(output_dma + stride * frame->height));
+	histb_vpss_node_write(vpss, HISTB_VPSS_LB_STRIDE, stride);
+	histb_vpss_node_write(vpss, HISTB_VPSS_IMG_SIZE,
+			      (frame->height - 1) << 16 | (frame->width - 1));
+
+	/* The four fields, in the same group-of-four layout as the registers. */
+	histb_vpss_node_write(vpss, HISTB_VPSS_DEI_REF_CTRL,
+			      frame->tile ? HISTB_VPSS_DEI_TILE_FORMAT : 0);
+	histb_vpss_node_write(vpss, HISTB_VPSS_DEI_REFYADDR,
+			      lower_32_bits(frame->ref_dma));
+	histb_vpss_node_write(vpss, HISTB_VPSS_DEI_REFCADDR,
+			      lower_32_bits(frame->ref_dma + stride * field_height));
+	histb_vpss_node_write(vpss, HISTB_VPSS_DEI_REFSTRIDE,
+			      stride | stride << 16);
+
+	histb_vpss_node_write(vpss, HISTB_VPSS_DEI_CUR_CTRL,
+			      frame->tile ? HISTB_VPSS_DEI_TILE_FORMAT : 0);
+	histb_vpss_node_write(vpss, HISTB_VPSS_DEI_CURYADDR,
+			      lower_32_bits(frame->cur_dma));
+	histb_vpss_node_write(vpss, HISTB_VPSS_DEI_CURCADDR,
+			      lower_32_bits(frame->cur_dma + stride * field_height));
+	histb_vpss_node_write(vpss, HISTB_VPSS_DEI_CURSTRIDE,
+			      stride | stride << 16);
+
+	histb_vpss_node_write(vpss, HISTB_VPSS_DEI_NXT1_CTRL,
+			      frame->tile ? HISTB_VPSS_DEI_TILE_FORMAT : 0);
+	histb_vpss_node_write(vpss, HISTB_VPSS_DEI_NXT1YADDR,
+			      lower_32_bits(frame->nxt1_dma));
+	histb_vpss_node_write(vpss, HISTB_VPSS_DEI_NXT1CADDR,
+			      lower_32_bits(frame->nxt1_dma + stride * field_height));
+	histb_vpss_node_write(vpss, HISTB_VPSS_DEI_NXT1STRIDE,
+			      stride | stride << 16);
+
+	histb_vpss_node_write(vpss, HISTB_VPSS_DEI_NXT2_CTRL,
+			      frame->tile ? HISTB_VPSS_DEI_TILE_FORMAT : 0);
+	histb_vpss_node_write(vpss, HISTB_VPSS_DEI_NXT2YADDR,
+			      lower_32_bits(frame->nxt2_dma));
+	histb_vpss_node_write(vpss, HISTB_VPSS_DEI_NXT2CADDR,
+			      lower_32_bits(frame->nxt2_dma + stride * field_height));
+	histb_vpss_node_write(vpss, HISTB_VPSS_DEI_NXT2STRIDE,
+			      stride | stride << 16);
+
+	/*
+	 * Bring the node up the way the vendor's field-node builder does
+	 * (VPSS_HAL_SetFieldNode in vpss_hal_3798cv200.c), because the block
+	 * checks state this driver was previously not setting at all:
+	 * pixel format and bit width in CTRL2, crop enable in CTRL3, and the
+	 * explicit disable of the replay/TNR/SNR stages in CTRL.  Writing CTRL
+	 * from scratch without those bits leaves the pipeline in a state the
+	 * de-interlacer will not start from.
+	 */
+	histb_vpss_node_write(vpss, HISTB_VPSS_MISC, HISTB_VPSS_MISC_DEFAULT);
+	histb_vpss_node_write(vpss, HISTB_VPSS_INT_MASK, 0xff);
+	/* CTRL2: input pixel format (NV12) and read bit width. */
+	histb_vpss_node_write(vpss, HISTB_VPSS_CTRL2,
+			      frame->ten_bit ? HISTB_VPSS_CTRL2_INPUT_10BIT : 0);
+	/* CTRL3: no input crop. */
+	histb_vpss_node_write(vpss, HISTB_VPSS_CTRL3, 0);
+
+	/*
+	 * Apply the vendor's de-interlacer defaults.  These are not invented:
+	 * every row comes from the CV200 table in
+	 * pq_hal_table_default.c (HI_PQ_MODULE_DEI), which is what the BSP
+	 * loads when no binary parameter file is present.  The block will not
+	 * produce a result without them - with every other field correct it
+	 * sat at diesta = 0xb7bab9b9 and never raised a completion interrupt.
+	 *
+	 * Each row is a bitfield: read the 32-bit word, splice in the value
+	 * and write it back.  Several registers carry many fields, so they
+	 * must accumulate rather than be overwritten.
+	 */
+	for (i = 0; i < ARRAY_SIZE(histb_vpss_dei_defaults); i++) {
+		const struct histb_vpss_dei_default *d =
+			&histb_vpss_dei_defaults[i];
+		u32 mask = GENMASK(d->msb, d->lsb);
+		u32 old = histb_vpss_node_read(vpss, d->reg);
+
+		histb_vpss_node_write(vpss, d->reg,
+				      (old & ~mask) |
+				      (((u32)d->value << d->lsb) & mask));
+	}
+
+	/* The block reads its own tuning block from inside the register map. */
+	histb_vpss_node_write(vpss, HISTB_VPSS_DEI_ADDR,
+			      lower_32_bits(vpss->regs_phys +
+					    HISTB_VPSS_DEI_PARAM_BASE));
+
+	histb_vpss_node_write(vpss, HISTB_VPSS_INT_MASK, HISTB_VPSS_INT_ALL);
+	histb_vpss_node_write(vpss, HISTB_VPSS_NEXT, 0);
 
 	reinit_completion(&vpss->completion);
 	vpss->irq_state = 0;
 	writel(HISTB_VPSS_INT_ALL, vpss->regs + HISTB_VPSS_INT_CLEAR);
 	writel(HISTB_VPSS_MISC_DEFAULT, vpss->regs + HISTB_VPSS_MISC);
-	writel(0, vpss->regs + HISTB_VPSS_NEXT);
+	writel(lower_32_bits(vpss->node_dma), vpss->regs + HISTB_VPSS_NEXT);
 	wmb();
 	writel(1, vpss->regs + HISTB_VPSS_START);
 
 	timeout = wait_for_completion_timeout(&vpss->completion,
 					      msecs_to_jiffies(500));
+	if (!timeout)
 	ret = timeout ? 0 : -ETIMEDOUT;
 
 	writel(0, vpss->regs + HISTB_VPSS_CTRL);
@@ -642,6 +1105,7 @@ unlock:
 	mutex_unlock(&vpss->lock);
 	return ret;
 }
+
 
 int histb_vpss_detile(struct histb_vpss *vpss,
 		      const struct histb_vpss_frame *frame)
@@ -734,6 +1198,7 @@ unlock:
 	return ret;
 }
 EXPORT_SYMBOL_GPL(histb_vpss_detile);
+EXPORT_SYMBOL_GPL(histb_vpss_dei);
 
 struct histb_vpss *histb_vpss_get(struct device *consumer)
 {
@@ -841,6 +1306,12 @@ static int histb_vpss_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	vpss->dev = dev;
 	vpss->regs = devm_platform_ioremap_resource(pdev, 0);
+	{
+		struct resource *res = platform_get_resource(pdev,
+							     IORESOURCE_MEM, 0);
+
+		vpss->regs_phys = res ? res->start : 0;
+	}
 	if (IS_ERR(vpss->regs))
 		return PTR_ERR(vpss->regs);
 	vpss->clock = devm_clk_get(dev, "core");

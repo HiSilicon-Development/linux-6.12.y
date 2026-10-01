@@ -123,6 +123,7 @@
 #define HISTB_VENC_PICFG0_I_PICTURE	BIT(13)
 #define HISTB_VENC_PICFG0_TRANSFORM	GENMASK(15, 14)
 #define HISTB_VENC_PICFG0_NAL_REF_IDC	GENMASK(17, 16)
+#define HISTB_VENC_PICFG0_ENTROPY_CABAC	BIT(19)
 #define HISTB_VENC_PICFG2_IPCM		BIT(0)
 #define HISTB_VENC_PICFG2_INTRA_4X4	BIT(1)
 #define HISTB_VENC_PICFG2_INTRA_16X16	BIT(3)
@@ -211,6 +212,7 @@ struct histb_venc_ctx {
 	u32 p_qp;
 	u32 gop_size;
 	u32 bitrate;
+	u32 profile;
 	u32 min_qp;
 	u32 max_qp;
 	struct v4l2_fract timeperframe;
@@ -1699,6 +1701,9 @@ static int histb_venc_s_ctrl(struct v4l2_ctrl *ctrl)
 		break;
 	case V4L2_CID_MPEG_VIDEO_BITRATE:
 		ctx->bitrate = ctrl->val;
+		break;
+	case V4L2_CID_MPEG_VIDEO_H264_PROFILE:
+		ctx->profile = ctrl->val;
 		ctx->rc_dirty = true;
 		break;
 	case V4L2_CID_MPEG_VIDEO_FRAME_RC_ENABLE:
@@ -1758,6 +1763,7 @@ static int histb_venc_open(struct file *file)
 	ctx->p_qp = HISTB_VENC_DEFAULT_QP;
 	ctx->gop_size = 50;
 	ctx->bitrate = HISTB_VENC_DEFAULT_BITRATE;
+	ctx->profile = V4L2_MPEG_VIDEO_H264_PROFILE_HIGH;
 	ctx->min_qp = HISTB_VENC_DEFAULT_MIN_QP;
 	ctx->max_qp = HISTB_VENC_DEFAULT_MAX_QP;
 	ctx->timeperframe.numerator = 1;
