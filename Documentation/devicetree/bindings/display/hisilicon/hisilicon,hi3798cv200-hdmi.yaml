@@ -1,0 +1,185 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/display/hisilicon/hisilicon,hi3798cv200-hdmi.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: HiSilicon Hi3798CV200 HDMI transmitter
+
+maintainers:
+  - dri-devel@lists.freedesktop.org
+
+description:
+  The Hi3798CV200 integrates an HDMI 2.0 transmitter with an internal DDC
+  controller, hot-plug detection, CEC controller and TMDS PHY.
+
+properties:
+  compatible:
+    const: hisilicon,hi3798cv200-hdmi
+
+  reg:
+    maxItems: 1
+
+  interrupts:
+    items:
+      - description: HDMI transmitter interrupt
+      - description: CEC interrupt
+
+  interrupt-names:
+    items:
+      - const: tx
+      - const: cec
+
+  clocks:
+    items:
+      - description: APB bus clock
+      - description: CEC clock
+      - description: Input data clock
+      - description: MHL clock
+      - description: TMDS oversampling clock
+      - description: Audio sample clock
+      - description: Transmitter reference clock
+      - description: Pixel-N clock
+      - description: Pixel clock
+
+  clock-names:
+    items:
+      - const: bus
+      - const: cec
+      - const: id
+      - const: mhl
+      - const: os
+      - const: as
+      - const: x
+      - const: pixel-nx
+      - const: pixel
+
+  resets:
+    items:
+      - description: HDMI bus reset
+      - description: HDMI transmitter reset
+      - description: HDMI PHY reset
+
+  reset-names:
+    items:
+      - const: bus
+      - const: core
+      - const: phy
+
+  hisilicon,perictrl:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    items:
+      - items:
+          - description: Phandle to the peripheral control syscon
+          - description: Offset of the HDMI transmitter control register
+    description:
+      Peripheral control register used to select the transmitter pad and PHY
+      routing.
+
+  hisilicon,hpd-poll:
+    type: boolean
+    description:
+      Use the official R002-style register poller for TX HPD/RSEN. The
+      poller starts after 150 ms and repeats every 10 ms; no physical TX IRQ
+      is requested. Use this when the exposed aggregate
+      interrupt remains asserted despite the status being handled in the
+      transmitter block.
+
+  ports:
+    $ref: /schemas/graph.yaml#/properties/ports
+
+    properties:
+      port@0:
+        $ref: /schemas/graph.yaml#/properties/port
+        description: Parallel video input from the display processor
+
+      port@1:
+        $ref: /schemas/graph.yaml#/properties/port
+        description: HDMI output to the board connector
+
+    required:
+      - port@0
+      - port@1
+
+    unevaluatedProperties: false
+
+required:
+  - compatible
+  - reg
+  - interrupts
+  - interrupt-names
+  - clocks
+  - clock-names
+  - resets
+  - reset-names
+  - hisilicon,perictrl
+  - ports
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/clock/histb-clock.h>
+    #include <dt-bindings/interrupt-controller/arm-gic.h>
+
+    hdmi@f8ce0000 {
+        compatible = "hisilicon,hi3798cv200-hdmi";
+        reg = <0xf8ce0000 0x20000>;
+        interrupts = <GIC_SPI 88 IRQ_TYPE_LEVEL_HIGH>,
+                     <GIC_SPI 147 IRQ_TYPE_LEVEL_HIGH>;
+        interrupt-names = "tx", "cec";
+        clocks = <&crg HISTB_HDMI_BUS_CLK>,
+                 <&crg HISTB_HDMI_CEC_CLK>,
+                 <&crg HISTB_HDMI_ID_CLK>,
+                 <&crg HISTB_HDMI_MHL_CLK>,
+                 <&crg HISTB_HDMI_OS_CLK>,
+                 <&crg HISTB_HDMI_AS_CLK>,
+                 <&crg HISTB_HDMI_X_CLK>,
+                 <&crg HISTB_HDMI_PIXEL_NX_CLK>,
+                 <&crg HISTB_HDMI_PIXEL_CLK>;
+        clock-names = "bus", "cec", "id", "mhl", "os", "as", "x",
+                      "pixel-nx", "pixel";
+        resets = <&crg 0x10c 8>, <&crg 0x10c 9>, <&crg 0x110 4>;
+        reset-names = "bus", "core", "phy";
+        hisilicon,perictrl = <&perictrl 0x8b0>;
+
+        ports {
+            #address-cells = <1>;
+            #size-cells = <0>;
+
+            port@0 {
+                reg = <0>;
+
+                hdmi_in: endpoint {
+                    remote-endpoint = <&vdp_out>;
+                };
+            };
+
+            port@1 {
+                reg = <1>;
+
+                hdmi_out: endpoint {
+                    remote-endpoint = <&hdmi_connector_in>;
+                };
+            };
+        };
+    };
+
+    hdmi-connector {
+        compatible = "hdmi-connector";
+        type = "a";
+
+        port {
+            hdmi_connector_in: endpoint {
+                remote-endpoint = <&hdmi_out>;
+            };
+        };
+    };
+
+    display-controller {
+        port {
+            vdp_out: endpoint {
+                remote-endpoint = <&hdmi_in>;
+            };
+        };
+    };

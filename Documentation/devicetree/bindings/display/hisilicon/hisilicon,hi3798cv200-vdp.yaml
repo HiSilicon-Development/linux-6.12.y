@@ -1,0 +1,130 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/display/hisilicon/hisilicon,hi3798cv200-vdp.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: HiSilicon Hi3798CV200 video display processor
+
+maintainers:
+  - dri-devel@lists.freedesktop.org
+
+description:
+  The Hi3798CV200 video display processor reads graphics and video planes from
+  memory, blends them, and generates timing for the SoC display outputs.
+
+properties:
+  compatible:
+    const: hisilicon,hi3798cv200-vdp
+
+  reg:
+    maxItems: 1
+
+  interrupts:
+    maxItems: 1
+
+  clocks:
+    minItems: 6
+    items:
+      - description: Video output bus clock
+      - description: Video output high-definition clock
+      - description: Display processor configuration clock
+      - description: Display processor high-definition core clock
+      - description: Primary video plane clock
+      - description: Primary graphics plane clock
+      - description: Video output pixel bypass clock feeding the HDMI interface
+
+  clock-names:
+    minItems: 6
+    items:
+      - const: bus
+      - const: hd
+      - const: config
+      - const: core
+      - const: video
+      - const: graphics
+      - const: bp
+
+  resets:
+    maxItems: 1
+
+  reset-names:
+    const: vdp
+
+  ports:
+    $ref: /schemas/graph.yaml#/properties/ports
+
+    properties:
+      port@0:
+        $ref: /schemas/graph.yaml#/properties/port
+        description: Primary high-definition display output
+
+      port@1:
+        $ref: /schemas/graph.yaml#/properties/port
+        description: Secondary display output
+
+    required:
+      - port@0
+
+    unevaluatedProperties: false
+
+required:
+  - compatible
+  - reg
+  - interrupts
+  - clocks
+  - clock-names
+  - resets
+  - reset-names
+  - ports
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/clock/histb-clock.h>
+    #include <dt-bindings/interrupt-controller/arm-gic.h>
+
+    display-controller@f8cc0000 {
+        compatible = "hisilicon,hi3798cv200-vdp";
+        reg = <0xf8cc0000 0x10000>;
+        interrupts = <GIC_SPI 90 IRQ_TYPE_LEVEL_HIGH>;
+        clocks = <&crg HISTB_VO_BUS_CLK>,
+                 <&crg HISTB_VO_HD_CLK>,
+                 <&crg HISTB_VDP_CFG_CLK>,
+                 <&crg HISTB_VDP_HD_CLK>,
+                 <&crg HISTB_VDP_V0_CLK>,
+                 <&crg HISTB_VDP_G0_CLK>,
+                 <&crg HISTB_VO_BP_CLK>;
+        clock-names = "bus", "hd", "config", "core", "video", "graphics", "bp";
+        resets = <&crg 0xd8 30>;
+        reset-names = "vdp";
+
+        ports {
+            #address-cells = <1>;
+            #size-cells = <0>;
+
+            port@0 {
+                reg = <0>;
+
+                vdp_hd0_out: endpoint {
+                    remote-endpoint = <&hdmi_in>;
+                };
+            };
+        };
+    };
+
+    hdmi-transmitter {
+        ports {
+            #address-cells = <1>;
+            #size-cells = <0>;
+
+            port@0 {
+                reg = <0>;
+
+                hdmi_in: endpoint {
+                    remote-endpoint = <&vdp_hd0_out>;
+                };
+            };
+        };
+    };
