@@ -45,6 +45,7 @@
 #define LME2510_DTMB_TUNER_ROM_ADDRESS 0x0d
 #define LME2510_DTMB_TUNER_ROM_DATA 0x10
 #define LME2510_DTMB_TUNER_REFERENCE_MHZ 12
+#define LME2510_DTMB_TUNER_INIT_REGISTERS 15
 
 #define LME2510_DTMB_COMMAND_BUFFER_SIZE 64
 #define LME2510_DTMB_FIRMWARE_PAYLOAD_SIZE 50
@@ -58,16 +59,15 @@
 #define LME2510_DTMB_STREAM_START_ATTEMPTS 3
 #define LME2510_DTMB_STREAM_RETUNE_ATTEMPTS 1
 #define LME2510_DTMB_STREAM_MIN_PACKETS 16
-#define LME2510_DTMB_STREAM_VALID_PERCENT 80
-#define LME2510_DTMB_STREAM_PAT_GRACE_MS 2000
 #define LME2510_DTMB_STREAM_STALE_MS 2000
+#define LME2510_DTMB_STATUS_SETTLE_PACKETS 4
 
 struct lme2510_dtmb_status {
 	bool valid;
 	u8 lock;
-	u8 quality_low;
-	u8 strength;
-	u8 quality_high;
+	u8 signal_low;
+	u8 snr;
+	u8 signal_high;
 	u8 extra;
 };
 
@@ -81,6 +81,7 @@ struct lme2510_dtmb_state {
 
 	struct urb *status_urb;
 	u8 status_buffer[LME2510_DTMB_COMMAND_BUFFER_SIZE];
+	u8 status_settle_packets;
 	atomic_t streaming;
 	bool stream_requested;
 	bool stream_recovering;
@@ -104,6 +105,7 @@ struct lme2510_dtmb_state {
 	u64 stream_null_packets;
 	u64 stream_scrambled_packets;
 	unsigned long stream_started;
+	unsigned long stream_last_packet;
 	unsigned long stream_last_pat;
 	bool stream_validated;
 	u8 stream_cc[LME2510_DTMB_TS_PID_COUNT];
@@ -548,7 +550,7 @@ static int lme2510_dtmb_demod_reset(struct lme2510_dtmb_state *state)
 
 static int lme2510_dtmb_tuner_init(struct lme2510_dtmb_state *state)
 {
-	u8 registers[16] = {};
+	u8 registers[LME2510_DTMB_TUNER_INIT_REGISTERS] = {};
 	u8 rom_address = LME2510_DTMB_TUNER_ROM_ADDRESS;
 	bool all_zero = true;
 	int ret;
@@ -599,9 +601,10 @@ static int lme2510_dtmb_frontend_initialize(struct lme2510_dtmb_state *state)
 	ret = lme2510_dtmb_demod_read(state, 0x00, &dummy);
 	if (ret)
 		return ret;
-	ret = lme2510_dtmb_command(state, bridge_init, sizeof(bridge_init), 2);
+	ret = lme2510_dtmb_command(state, bridge_init, sizeof(bridge_init), 5);
 	if (ret)
 		return ret;
+	state->status_settle_packets = LME2510_DTMB_STATUS_SETTLE_PACKETS;
 	ret = lme2510_dtmb_demod_read(state, 0x00, &dummy);
 	if (ret)
 		return ret;
@@ -818,8 +821,7 @@ static int lme2510_dtmb_tune(struct lme2510_dtmb_state *state, u32 frequency_hz)
 	u32 frequency_khz = frequency_hz / 1000;
 	int ret;
 
-	if (frequency_khz > 474000)
-		frequency_khz = DIV_ROUND_CLOSEST(frequency_khz, 1000) * 1000;
+	frequency_khz = frequency_khz / 1000 * 1000;
 	if (frequency_khz < 450000 || frequency_khz > 880000)
 		return -EINVAL;
 
@@ -915,30 +917,30 @@ static u16 lme2510_dtmb_percent(u8 percent)
 	return min_t(u8, percent, 100) * 0xffffU / 100;
 }
 
-static u8 lme2510_dtmb_stream_quality(const struct lme2510_dtmb_status *status,
-				      bool locked)
+static u8 lme2510_dtmb_stream_strength(const struct lme2510_dtmb_status *status,
+				       bool locked)
 {
-	u16 raw = status->quality_high << 8 | status->quality_low;
-	u8 low = status->quality_low & 0x07;
-	u8 quality;
+	u16 raw = status->signal_high << 8 | status->signal_low;
+	u8 low = status->signal_low & 0x07;
+	u8 strength;
 
 	if (!locked)
-		quality = low + 8;
+		strength = low + 8;
 	else if (raw >= 0x1f00 && raw <= 0x1fff)
-		quality = low + 80;
+		strength = low + 80;
 	else if (raw >= 0x0058 && raw <= 0x00ff)
-		quality = low + 70;
+		strength = low + 70;
 	else if (raw >= 0x0100 && raw <= 0x0180)
-		quality = low + 60;
+		strength = low + 60;
 	else if (raw >= 0x0180 && raw <= 0x0200)
-		quality = low + 50;
+		strength = low + 50;
 	else
-		quality = 69;
+		strength = 69;
 
-	return min_t(u8, quality, 100);
+	return min_t(u8, strength, 100);
 }
 
-static u8 lme2510_dtmb_stream_strength(u8 raw, bool locked)
+static u8 lme2510_dtmb_stream_quality(u8 raw, bool locked)
 {
 	u8 scaled = (u32)raw * 100 / 255;
 	u8 remainder = raw % 15;
@@ -973,13 +975,10 @@ static bool lme2510_dtmb_stream_is_live(struct lme2510_dtmb_state *state)
 	spin_lock_irqsave(&state->stream_lock, flags);
 	if (!state->stream_validated) {
 		live = true;
-	} else if (state->stream_pat_packets) {
-		deadline = state->stream_last_pat +
-			   msecs_to_jiffies(LME2510_DTMB_STREAM_STALE_MS);
-		live = time_before(jiffies, deadline);
 	} else {
-		deadline = state->stream_started +
-			   msecs_to_jiffies(LME2510_DTMB_STREAM_PAT_GRACE_MS);
+		deadline =
+			(state->stream_last_packet ?: state->stream_started) +
+			msecs_to_jiffies(LME2510_DTMB_STREAM_STALE_MS);
 		live = time_before(jiffies, deadline);
 	}
 	spin_unlock_irqrestore(&state->stream_lock, flags);
@@ -997,9 +996,9 @@ lme2510_dtmb_set_statistics(struct lme2510_dtmb_state *state,
 	u8 strength;
 
 	if (stream_status->valid) {
-		strength = lme2510_dtmb_stream_strength(stream_status->strength,
-							locked);
-		quality = lme2510_dtmb_stream_quality(stream_status, locked);
+		strength = lme2510_dtmb_stream_strength(stream_status, locked);
+		quality =
+			lme2510_dtmb_stream_quality(stream_status->snr, locked);
 	} else {
 		strength = (signal & 0x7f) * 100 / 127;
 		quality = strength;
@@ -1154,8 +1153,7 @@ static int lme2510_dtmb_read_signal_strength(struct dvb_frontend *frontend,
 
 	lme2510_dtmb_status_snapshot(state, &status);
 	if (status.valid) {
-		percent = lme2510_dtmb_stream_strength(status.strength,
-						       state->tuned);
+		percent = lme2510_dtmb_stream_strength(&status, state->tuned);
 		*strength = lme2510_dtmb_percent(percent);
 		return 0;
 	}
@@ -1185,7 +1183,7 @@ static int lme2510_dtmb_read_snr(struct dvb_frontend *frontend, u16 *snr)
 		return 0;
 	}
 	if (status.valid) {
-		quality = lme2510_dtmb_stream_quality(&status, true);
+		quality = lme2510_dtmb_stream_quality(status.snr, true);
 		*snr = lme2510_dtmb_percent(quality);
 	} else {
 		*snr = (state->tuned_strength & 0x7f) << 9;
@@ -1211,12 +1209,16 @@ static void lme2510_dtmb_parse_status(struct lme2510_dtmb_state *state,
 {
 	if (length < 7 || data[0] != 0xbb)
 		return;
+	if (state->status_settle_packets) {
+		state->status_settle_packets--;
+		return;
+	}
 
 	state->stream_status.valid = true;
 	state->stream_status.lock = data[2];
-	state->stream_status.quality_low = data[3];
-	state->stream_status.strength = data[4];
-	state->stream_status.quality_high = data[5];
+	state->stream_status.signal_low = data[3];
+	state->stream_status.snr = data[4];
+	state->stream_status.signal_high = data[5];
 	state->stream_status.extra = data[6];
 }
 
@@ -1306,6 +1308,7 @@ static void lme2510_dtmb_reset_stream(struct lme2510_dtmb_state *state)
 	state->stream_null_packets = 0;
 	state->stream_scrambled_packets = 0;
 	state->stream_started = 0;
+	state->stream_last_packet = 0;
 	state->stream_last_pat = 0;
 	state->stream_validated = false;
 	bitmap_zero(state->stream_cc_valid, LME2510_DTMB_TS_PID_COUNT);
@@ -1522,6 +1525,8 @@ static void lme2510_dtmb_stream_complete(struct usb_data_stream *stream,
 	}
 
 	state->stream_packets += output / LME2510_DTMB_TS_PACKET_SIZE;
+	if (output)
+		state->stream_last_packet = jiffies;
 	for (i = 0; i < output; i += LME2510_DTMB_TS_PACKET_SIZE)
 		lme2510_dtmb_count_packet(state, state->stream_buffer + i);
 	active_feeds = lme2510_dtmb_active_feeds(adapter);
@@ -1580,11 +1585,7 @@ static bool lme2510_dtmb_stream_is_valid(struct lme2510_dtmb_state *state,
 	*pat = state->stream_pat_packets;
 	spin_unlock_irqrestore(&state->stream_lock, flags);
 
-	if (*packets < LME2510_DTMB_STREAM_MIN_PACKETS || !*bytes)
-		return false;
-
-	return *packets * LME2510_DTMB_TS_PACKET_SIZE * 100 >=
-	       *bytes * LME2510_DTMB_STREAM_VALID_PERCENT;
+	return *bytes && *packets >= LME2510_DTMB_STREAM_MIN_PACKETS;
 }
 
 static void lme2510_dtmb_warn_invalid_stream(struct device *dev, u64 bytes,
@@ -1752,8 +1753,7 @@ static int lme2510_dtmb_streaming_ctrl(struct dvb_frontend *frontend,
 
 	WRITE_ONCE(state->stream_requested, true);
 	WRITE_ONCE(state->stream_recovering, true);
-	if (frequency_khz > 474000)
-		frequency_khz = DIV_ROUND_CLOSEST(frequency_khz, 1000) * 1000;
+	frequency_khz = frequency_khz / 1000 * 1000;
 	if (!state->tuned || state->tuned_frequency != frequency_khz * 1000) {
 		ret = lme2510_dtmb_tune(state, frequency);
 		if (ret)
