@@ -25,16 +25,9 @@
 #define HD2312_REQ_VERSION	0xed
 #define HD2312_REQ_FREQUENCY	0xfc
 
-enum hd2312_variant {
-	HD2312_GENERIC,
-	HD2312_LETV,
-	HD2312_AIWA,
-	HD2312_CVB,
-};
-
 struct hd2312_state {
 	struct dvb_frontend fe;
-	enum hd2312_variant variant;
+	bool cvb_firmware;
 	u32 frequency;
 };
 
@@ -89,49 +82,36 @@ static int hd2312_probe_device(struct dvb_usb_device *d)
 {
 	static const u8 cvb_key[] = "cidanaKEY";
 	struct hd2312_state *state = d_to_priv(d);
-	u8 hash[22];
 	u8 version[4];
+	u8 hash[22];
 	int ret;
 
-	ret = hd2312_ctrl(d, HD2312_REQ_VERSION, true, version,
-			   sizeof(version));
+	ret = hd2312_ctrl(d, HD2312_REQ_VERSION, true, version, sizeof(version));
 	if (ret)
 		return dev_err_probe(&d->udev->dev, ret,
 				     "failed to read firmware version\n");
 
-	state->variant = HD2312_GENERIC;
-	if (version[1] == 0x08 && version[2] == 0x20 && version[3] == 0x44) {
-		switch (version[0]) {
-		case 0x03:
-			state->variant = HD2312_LETV;
-			break;
-		case 0x05:
-			state->variant = HD2312_AIWA;
-			break;
-		case 0x06:
-			state->variant = HD2312_CVB;
-			break;
-		default:
-			break;
+	state->cvb_firmware = false;
+
+	/*
+	 * Probe CVB (Cidana) protocol by sending key and reading response hash.
+	 * Genuine CVB dongles across production batches return a 22-byte serial hash.
+	 */
+	ret = hd2312_ctrl(d, HD2312_REQ_CVB_KEY, false,
+			  (void *)cvb_key, sizeof(cvb_key) - 1);
+	if (!ret) {
+		ret = hd2312_ctrl(d, HD2312_REQ_CVB_HASH, true, hash, sizeof(hash));
+		if (!ret && (hash[0] >= 0x20 && hash[0] <= 0x7e)) {
+			state->cvb_firmware = true;
+			dev_info(&d->udev->dev,
+				 "CVB HD2312 authenticated: SN=%.22s (fw %u.%u.%u%u)\n",
+				 hash, version[0], version[1], version[2], version[3]);
 		}
 	}
 
-	if (state->variant == HD2312_CVB) {
-		ret = hd2312_ctrl(d, HD2312_REQ_CVB_KEY, false,
-				   (u8 *)cvb_key, sizeof(cvb_key) - 1);
-		if (ret)
-			return dev_err_probe(&d->udev->dev, ret,
-					     "failed to send CVB authorization key\n");
-
-		ret = hd2312_ctrl(d, HD2312_REQ_CVB_HASH, true, hash,
-				   sizeof(hash));
-		if (ret)
-			return dev_err_probe(&d->udev->dev, ret,
-					     "failed to read CVB authorization response\n");
-	}
-
-	dev_info(&d->udev->dev, "firmware %u.%u.%u%u, variant %u\n",
-		 version[0], version[1], version[2], version[3], state->variant);
+	if (!state->cvb_firmware)
+		dev_info(&d->udev->dev, "firmware %u.%u.%u%u\n",
+			 version[0], version[1], version[2], version[3]);
 
 	return 0;
 }
@@ -253,7 +233,7 @@ static int hd2312_read_status(struct dvb_frontend *fe, enum fe_status *status)
 	ret = hd2312_ctrl(d, HD2312_REQ_STRENGTH, true, strength,
 			   sizeof(strength));
 	if (!ret) {
-		if (state->variant == HD2312_CVB) {
+		if (state->cvb_firmware) {
 			c->strength.stat[0].scale = FE_SCALE_DECIBEL;
 			c->strength.stat[0].svalue = -(s64)strength[3] * 1000;
 		} else {
@@ -295,22 +275,9 @@ static int hd2312_frontend_attach(struct dvb_usb_adapter *adap)
 	memcpy(&state->fe.ops, &hd2312_ops, sizeof(state->fe.ops));
 	state->fe.demodulator_priv = state;
 
-	switch (state->variant) {
-	case HD2312_LETV:
-		strscpy(state->fe.ops.info.name, "Letv HD2312 DTMB",
-			sizeof(state->fe.ops.info.name));
-		break;
-	case HD2312_AIWA:
-		strscpy(state->fe.ops.info.name, "Aiwa HD2312 DTMB",
-			sizeof(state->fe.ops.info.name));
-		break;
-	case HD2312_CVB:
+	if (state->cvb_firmware)
 		strscpy(state->fe.ops.info.name, "CVB HD2312 DTMB",
 			sizeof(state->fe.ops.info.name));
-		break;
-	default:
-		break;
-	}
 
 	adap->fe[0] = &state->fe;
 	return 0;
