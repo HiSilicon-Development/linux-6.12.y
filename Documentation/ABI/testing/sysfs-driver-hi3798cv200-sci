@@ -1,0 +1,87 @@
+What:		/sys/bus/platform/devices/*/sci/state
+Date:		August 2026
+Contact:	linux-serial@vger.kernel.org
+Description:
+		Current smart-card controller state.  The possible values are
+		"no-card", "inactive", "wait-atr", "read-atr" and "ready".
+
+What:		/sys/bus/platform/devices/*/sci/card_present
+Date:		August 2026
+Contact:	linux-serial@vger.kernel.org
+Description:
+		Read-only card-detect state.  One means that a card is present.
+
+What:		/sys/bus/platform/devices/*/sci/tx_active
+Date:		August 2026
+Contact:	linux-serial@vger.kernel.org
+Description:
+		Read-only transmit transaction state.  One means that the driver is
+		feeding, or has paused while feeding, the transmit FIFO.  Hardware may
+		finish draining after the driver performs the original early
+		receive-direction hand-off.
+
+What:		/sys/bus/platform/devices/*/sci/atr
+Date:		August 2026
+Contact:	linux-serial@vger.kernel.org
+Description:
+		Last answer-to-reset captured by the controller driver.  The first
+		field is the byte count followed by hexadecimal bytes.
+
+What:		/sys/bus/platform/devices/*/sci/atr_protocol
+Date:		August 2026
+Contact:	linux-serial@vger.kernel.org
+Description:
+		Protocol selected from the last valid ATR, formatted as "T=N", or
+		"unknown" when no protocol has been parsed.
+
+What:		/sys/bus/platform/devices/*/sci/irq_count
+What:		/sys/bus/platform/devices/*/sci/irq_drain_limit_count
+What:		/sys/bus/platform/devices/*/sci/rx_bytes
+What:		/sys/bus/platform/devices/*/sci/tx_bytes
+What:		/sys/bus/platform/devices/*/sci/tx_transactions
+What:		/sys/bus/platform/devices/*/sci/tx_rekicks
+What:		/sys/bus/platform/devices/*/sci/tx_drain_appends
+What:		/sys/bus/platform/devices/*/sci/tx_rx_handoffs
+What:		/sys/bus/platform/devices/*/sci/tx_short_handoffs
+What:		/sys/bus/platform/devices/*/sci/tx_refill_handoffs
+What:		/sys/bus/platform/devices/*/sci/atr_complete
+What:		/sys/bus/platform/devices/*/sci/atr_fail
+What:		/sys/bus/platform/devices/*/sci/atr_start_timeout
+What:		/sys/bus/platform/devices/*/sci/atr_duration_timeout
+What:		/sys/bus/platform/devices/*/sci/tx_errors
+What:		/sys/bus/platform/devices/*/sci/rx_overruns
+What:		/sys/bus/platform/devices/*/sci/fifo_resets
+What:		/sys/bus/platform/devices/*/sci/recoveries
+Date:		August 2026
+Contact:	linux-serial@vger.kernel.org
+Description:
+		Monotonic driver counters used to diagnose ISO/IEC 7816 transport,
+		ATR and interrupt failures without enabling verbose interrupt logs.
+		TX errors and RX overruns are reported through the standard TTY error
+		path; they do not automatically FINISH or reactivate the card.
+		A transmit re-kick is a serial-core start request received while a
+		transaction is already active.  Short hand-offs occur after the first
+		FIFO fill; refill hand-offs occur after a later TX-tide interrupt or
+		re-kick.  A drain append is a fragmented TTY write appended while the
+		previous hand-off still has bytes in the hardware TX FIFO.  The total
+		hand-off count is the sum of the short and refill classes.
+
+What:		/sys/bus/platform/devices/*/sci/last_irq_status
+Date:		August 2026
+Contact:	linux-serial@vger.kernel.org
+Description:
+		Last non-zero masked interrupt status observed by the driver, in
+		hexadecimal.
+
+What:		/sys/bus/platform/devices/*/sci/recover
+Date:		August 2026
+Contact:	linux-serial@vger.kernel.org
+Description:
+		Write-only recovery control.  Writing "1" while the port is open
+		stops transmit, clears stale FIFO and interrupt state, restores
+		receive direction, and reactivates a present card.  Normal transmit
+		completion never invokes this full recovery.  Normal transactions
+		clear stale FIFO state at their start and switch to receive direction
+		as soon as the last software byte enters the hardware transmit FIFO.
+		Only a refill after the initial FIFO fill repeats the original RX-FIFO
+		clear before that switch; a short command does not clear RX twice.

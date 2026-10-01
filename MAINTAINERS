@@ -10219,6 +10219,13 @@ F:	drivers/crypto/hisilicon/hpre/hpre.h
 F:	drivers/crypto/hisilicon/hpre/hpre_crypto.c
 F:	drivers/crypto/hisilicon/hpre/hpre_main.c
 
+HISILICON HI3798CV200 SMART CARD INTERFACE DRIVER
+L:	linux-serial@vger.kernel.org
+S:	Supported
+F:	Documentation/ABI/testing/sysfs-driver-hi3798cv200-sci
+F:	Documentation/devicetree/bindings/serial/hisilicon,hi3798cv200-sci.yaml
+F:	drivers/tty/serial/hi3798cv200-sci.c
+
 HISILICON HNS3 PMU DRIVER
 M:	Jijie Shao <shaojijie@huawei.com>
 S:	Supported

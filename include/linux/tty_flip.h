@@ -8,6 +8,8 @@
 struct tty_ldisc;
 
 int tty_buffer_set_limit(struct tty_port *port, int limit);
+void tty_buffer_set_workqueue(struct tty_port *port,
+			      struct workqueue_struct *workqueue);
 unsigned int tty_buffer_space_avail(struct tty_port *port);
 int tty_buffer_request_room(struct tty_port *port, size_t size);
 size_t __tty_insert_flip_string_flags(struct tty_port *port, const u8 *chars,

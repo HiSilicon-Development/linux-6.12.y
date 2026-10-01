@@ -41,6 +41,7 @@ obj-$(CONFIG_SERIAL_ESP32)		+= esp32_uart.o
 obj-$(CONFIG_SERIAL_ESP32_ACM)		+= esp32_acm.o
 obj-$(CONFIG_SERIAL_FSL_LINFLEXUART)	+= fsl_linflexuart.o
 obj-$(CONFIG_SERIAL_FSL_LPUART)		+= fsl_lpuart.o
+obj-$(CONFIG_SERIAL_HI3798CV200_SCI)	+= hi3798cv200-sci.o
 obj-$(CONFIG_SERIAL_ICOM)		+= icom.o
 obj-$(CONFIG_SERIAL_IMX)		+= imx.o
 obj-$(CONFIG_SERIAL_IMX_EARLYCON)	+= imx_earlycon.o

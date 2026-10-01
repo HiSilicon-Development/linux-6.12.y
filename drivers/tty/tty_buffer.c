@@ -40,6 +40,14 @@
 
 #define TTY_BUFFER_PAGE	(((PAGE_SIZE - sizeof(struct tty_buffer)) / 2) & ~TTYB_ALIGN_MASK)
 
+static bool tty_buffer_queue_work(struct tty_port *port)
+{
+	struct tty_bufhead *buf = &port->buf;
+	struct workqueue_struct *workqueue = READ_ONCE(buf->workqueue);
+
+	return queue_work(workqueue, &buf->work);
+}
+
 /**
  * tty_buffer_lock_exclusive	-	gain exclusive access to buffer
  * @port: tty port owning the flip buffer
@@ -76,7 +84,7 @@ void tty_buffer_unlock_exclusive(struct tty_port *port)
 	mutex_unlock(&buf->lock);
 
 	if (restart)
-		queue_work(system_unbound_wq, &buf->work);
+		tty_buffer_queue_work(port);
 }
 EXPORT_SYMBOL_GPL(tty_buffer_unlock_exclusive);
 
@@ -531,7 +539,7 @@ void tty_flip_buffer_push(struct tty_port *port)
 	struct tty_bufhead *buf = &port->buf;
 
 	tty_flip_buffer_commit(buf->tail);
-	queue_work(system_unbound_wq, &buf->work);
+	tty_buffer_queue_work(port);
 }
 EXPORT_SYMBOL(tty_flip_buffer_push);
 
@@ -561,7 +569,7 @@ int tty_insert_flip_string_and_push_buffer(struct tty_port *port,
 		tty_flip_buffer_commit(buf->tail);
 	spin_unlock_irqrestore(&port->lock, flags);
 
-	queue_work(system_unbound_wq, &buf->work);
+	tty_buffer_queue_work(port);
 
 	return size;
 }
@@ -585,8 +593,38 @@ void tty_buffer_init(struct tty_port *port)
 	atomic_set(&buf->mem_used, 0);
 	atomic_set(&buf->priority, 0);
 	INIT_WORK(&buf->work, flush_to_ldisc);
+	buf->workqueue = system_unbound_wq;
 	buf->mem_limit = TTYB_DEFAULT_MEM_LIMIT;
 }
+
+/**
+ * tty_buffer_set_workqueue - select a workqueue for flip-buffer delivery
+ * @port: tty port to update
+ * @workqueue: target workqueue, or %NULL to restore system_unbound_wq
+ *
+ * The caller must prevent new flip-buffer producers while this function runs.
+ * Pending work is synchronously cancelled before the queue is changed, and
+ * committed data is scheduled again on the new queue.
+ */
+void tty_buffer_set_workqueue(struct tty_port *port,
+			      struct workqueue_struct *workqueue)
+{
+	struct tty_bufhead *buf = &port->buf;
+	bool restart;
+
+	if (!workqueue)
+		workqueue = system_unbound_wq;
+
+	tty_buffer_cancel_work(port);
+	WRITE_ONCE(buf->workqueue, workqueue);
+
+	mutex_lock(&buf->lock);
+	restart = buf->head->commit != buf->head->read || buf->head->next;
+	mutex_unlock(&buf->lock);
+	if (restart)
+		tty_buffer_queue_work(port);
+}
+EXPORT_SYMBOL_GPL(tty_buffer_set_workqueue);
 
 /**
  * tty_buffer_set_limit		-	change the tty buffer memory limit
@@ -614,7 +652,7 @@ void tty_buffer_set_lock_subclass(struct tty_port *port)
 
 bool tty_buffer_restart_work(struct tty_port *port)
 {
-	return queue_work(system_unbound_wq, &port->buf.work);
+	return tty_buffer_queue_work(port);
 }
 
 bool tty_buffer_cancel_work(struct tty_port *port)
