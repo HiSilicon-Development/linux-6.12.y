@@ -11,19 +11,32 @@
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
+#include <linux/property.h>
 
 #define RNG_CTRL		0x0
-#define  RNG_SOURCE			GENMASK(1, 0)
-#define  DROP_ENABLE			BIT(5)
-#define  POST_PROCESS_ENABLE		BIT(7)
-#define  POST_PROCESS_DEPTH		GENMASK(15, 8)
+#define  RNG_V100_SOURCE		GENMASK(1, 0)
+#define  RNG_V100_DROP_ENABLE		BIT(5)
+#define  RNG_V100_POST_PROCESS_ENABLE	BIT(7)
+#define  RNG_V100_POST_PROCESS_DEPTH	GENMASK(15, 8)
+#define  RNG_V200_DRBG_ENABLE		BIT(3)
 #define RNG_NUMBER		0x4
 #define RNG_STAT		0x8
-#define  DATA_COUNT			GENMASK(2, 0)	/* max 4 */
+#define  RNG_V100_DATA_COUNT		GENMASK(2, 0)	/* max 4 */
+#define  RNG_V200_DATA_COUNT		GENMASK(15, 8)
+#define  RNG_V200_ALARMS		GENMASK(22, 16)
+
+struct histb_rng_data {
+	void (*init)(void __iomem *base, unsigned int depth);
+	u32 data_count_mask;
+	u32 alarm_mask;
+	bool has_depth;
+};
 
 struct histb_rng_priv {
 	struct hwrng rng;
 	void __iomem *base;
+	const struct histb_rng_data *data;
+	struct device *dev;
 };
 
 /*
@@ -31,30 +44,48 @@ struct histb_rng_priv {
  * depth = 1 -> ~1ms
  * depth = 255 -> ~16ms
  */
-static int histb_rng_wait(void __iomem *base)
+static int histb_rng_wait(struct histb_rng_priv *priv)
 {
 	u32 val;
+	int ret;
 
-	return readl_relaxed_poll_timeout(base + RNG_STAT, val,
-					  val & DATA_COUNT, 1000, 30 * 1000);
+	ret = readl_relaxed_poll_timeout(priv->base + RNG_STAT, val,
+					 (val & priv->data->data_count_mask) ||
+					 (val & priv->data->alarm_mask),
+					 1000, 30 * 1000);
+	if (ret)
+		return ret;
+
+	if (val & priv->data->alarm_mask) {
+		dev_err_ratelimited(priv->dev, "hardware alarm: %#x\n",
+				    val & priv->data->alarm_mask);
+		return -EIO;
+	}
+
+	return 0;
 }
 
-static void histb_rng_init(void __iomem *base, unsigned int depth)
+static void histb_rng_v100_init(void __iomem *base, unsigned int depth)
 {
 	u32 val;
 
 	val = readl_relaxed(base + RNG_CTRL);
 
-	val &= ~RNG_SOURCE;
+	val &= ~RNG_V100_SOURCE;
 	val |= 2;
 
-	val &= ~POST_PROCESS_DEPTH;
+	val &= ~RNG_V100_POST_PROCESS_DEPTH;
 	val |= min(depth, 0xffu) << 8;
 
-	val |= POST_PROCESS_ENABLE;
-	val |= DROP_ENABLE;
+	val |= RNG_V100_POST_PROCESS_ENABLE;
+	val |= RNG_V100_DROP_ENABLE;
 
 	writel_relaxed(val, base + RNG_CTRL);
+}
+
+static void histb_rng_v200_init(void __iomem *base, unsigned int depth)
+{
+	writel_relaxed(2 | RNG_V200_DRBG_ENABLE, base + RNG_CTRL);
 }
 
 static int histb_rng_read(struct hwrng *rng, void *data, size_t max, bool wait)
@@ -63,16 +94,28 @@ static int histb_rng_read(struct hwrng *rng, void *data, size_t max, bool wait)
 	void __iomem *base = priv->base;
 
 	for (int i = 0; i < max; i += sizeof(u32)) {
-		if (!(readl_relaxed(base + RNG_STAT) & DATA_COUNT)) {
+		u32 stat = readl_relaxed(base + RNG_STAT);
+		int ret;
+
+		if (stat & priv->data->alarm_mask) {
+			dev_err_ratelimited(priv->dev, "hardware alarm: %#x\n",
+					    stat & priv->data->alarm_mask);
+			return -EIO;
+		}
+
+		if (!(stat & priv->data->data_count_mask)) {
 			if (!wait)
 				return i;
-			if (histb_rng_wait(base)) {
+			ret = histb_rng_wait(priv);
+			if (ret) {
+				if (ret == -EIO)
+					return ret;
 				pr_err("failed to generate random number, generated %d\n",
 				       i);
 				return i ? i : -ETIMEDOUT;
 			}
 		}
-		*(u32 *) (data + i) = readl_relaxed(base + RNG_NUMBER);
+		*(u32 *)(data + i) = readl_relaxed(base + RNG_NUMBER);
 	}
 
 	return max;
@@ -80,7 +123,8 @@ static int histb_rng_read(struct hwrng *rng, void *data, size_t max, bool wait)
 
 static unsigned int histb_rng_get_depth(void __iomem *base)
 {
-	return (readl_relaxed(base + RNG_CTRL) & POST_PROCESS_DEPTH) >> 8;
+	return (readl_relaxed(base + RNG_CTRL) &
+		RNG_V100_POST_PROCESS_DEPTH) >> 8;
 }
 
 static ssize_t
@@ -103,7 +147,7 @@ depth_store(struct device *dev, struct device_attribute *attr,
 	if (kstrtouint(buf, 0, &depth))
 		return -ERANGE;
 
-	histb_rng_init(base, depth);
+	priv->data->init(base, depth);
 	return count;
 }
 
@@ -114,7 +158,36 @@ static struct attribute *histb_rng_attrs[] = {
 	NULL,
 };
 
-ATTRIBUTE_GROUPS(histb_rng);
+static umode_t
+histb_rng_attr_is_visible(struct kobject *kobj, struct attribute *attr,
+			  int unused)
+{
+	struct histb_rng_priv *priv = dev_get_drvdata(kobj_to_dev(kobj));
+
+	return priv->data->has_depth ? attr->mode : 0;
+}
+
+static const struct attribute_group histb_rng_group = {
+	.attrs = histb_rng_attrs,
+	.is_visible = histb_rng_attr_is_visible,
+};
+
+static const struct attribute_group *histb_rng_groups[] = {
+	&histb_rng_group,
+	NULL,
+};
+
+static const struct histb_rng_data histb_rng_v100_data = {
+	.init = histb_rng_v100_init,
+	.data_count_mask = RNG_V100_DATA_COUNT,
+	.has_depth = true,
+};
+
+static const struct histb_rng_data histb_rng_v200_data = {
+	.init = histb_rng_v200_init,
+	.data_count_mask = RNG_V200_DATA_COUNT,
+	.alarm_mask = RNG_V200_ALARMS,
+};
 
 static int histb_rng_probe(struct platform_device *pdev)
 {
@@ -131,13 +204,18 @@ static int histb_rng_probe(struct platform_device *pdev)
 	if (IS_ERR(base))
 		return PTR_ERR(base);
 
-	histb_rng_init(base, 144);
-	if (histb_rng_wait(base)) {
+	priv->base = base;
+	priv->data = device_get_match_data(dev);
+	priv->dev = dev;
+	if (!priv->data)
+		return -ENODEV;
+
+	priv->data->init(base, 144);
+	if (histb_rng_wait(priv)) {
 		dev_err(dev, "cannot bring up device\n");
 		return -ENODEV;
 	}
 
-	priv->base = base;
 	priv->rng.name = pdev->name;
 	priv->rng.read = histb_rng_read;
 	ret = devm_hwrng_register(dev, &priv->rng);
@@ -152,7 +230,8 @@ static int histb_rng_probe(struct platform_device *pdev)
 }
 
 static const struct of_device_id histb_rng_of_match[] = {
-	{ .compatible = "hisilicon,histb-rng", },
+	{ .compatible = "hisilicon,histb-rng", .data = &histb_rng_v100_data },
+	{ .compatible = "hisilicon,hi3798cv200-rng", .data = &histb_rng_v200_data },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, histb_rng_of_match);
