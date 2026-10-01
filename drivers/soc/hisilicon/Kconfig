@@ -18,4 +18,12 @@ config KUNPENG_HCCS
 	  Say M here if you want to include support for querying the
 	  health status and port information of HCCS on Kunpeng SoC.
 
+config SOC_HI3798CV200
+	bool "HiSilicon Hi3798CV200 SoC support"
+	help
+	  Enable SoC-specific integration for the HiSilicon Hi3798CV200.
+	  This gates extensions to shared HiSilicon and ARM peripheral drivers
+	  so builds for other SoCs retain their upstream behavior. Runtime
+	  compatible data still selects each hardware-specific operation.
+
 endmenu

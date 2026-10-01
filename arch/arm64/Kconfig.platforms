@@ -155,6 +155,14 @@ config ARCH_HISI
 	help
 	  This enables support for Hisilicon ARMv8 SoC family
 
+config ARCH_HISI_HISTB
+	bool "HiSilicon HiSTB platforms"
+	select ARCH_HISI
+	help
+	  Enable support for HiSilicon set-top-box platforms and their
+	  additional board devicetrees. Device-specific electrical policy
+	  remains selected by each board devicetree.
+
 config ARCH_KEEMBAY
 	bool "Keem Bay SoC"
 	help
