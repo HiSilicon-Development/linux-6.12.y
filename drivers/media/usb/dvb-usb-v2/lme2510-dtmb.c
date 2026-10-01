@@ -1477,9 +1477,11 @@ static int lme2510_dtmb_start_transport(struct lme2510_dtmb_state *state)
 
 static int lme2510_dtmb_stop_transport(struct lme2510_dtmb_state *state)
 {
-	static const u8 stop[] = { 0x03, 0x02, 0x20, 0xa0 };
-
-	return lme2510_dtmb_stream_command(state, stop, sizeof(stop), 1);
+	/*
+	 * In official UDE262D.sys, stream stopping is host URB cancellation.
+	 * Sending 0x03 0x02 0x20 0xa0 is rejected by bridge firmware (-EREMOTEIO).
+	 */
+	return 0;
 }
 
 static void lme2510_dtmb_mark_stream_valid(struct lme2510_dtmb_state *state)
