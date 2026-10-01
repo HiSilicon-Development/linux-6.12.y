@@ -1,0 +1,62 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/media/hisilicon,hi3798cv200-vpss.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: HiSilicon Hi3798CV200 video post-processing subsystem
+
+maintainers:
+  - linux-media@vger.kernel.org
+
+description:
+  The VPSS block converts native decoder tile surfaces into linear frames and
+  provides scaling, noise reduction and deinterlacing pipelines.
+
+properties:
+  compatible:
+    const: hisilicon,hi3798cv200-vpss
+
+  reg:
+    maxItems: 1
+
+  interrupts:
+    maxItems: 1
+
+  clocks:
+    maxItems: 1
+
+  clock-names:
+    const: core
+
+  resets:
+    maxItems: 1
+
+  reset-names:
+    const: core
+
+required:
+  - compatible
+  - reg
+  - interrupts
+  - clocks
+  - clock-names
+  - resets
+  - reset-names
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/clock/histb-clock.h>
+    #include <dt-bindings/interrupt-controller/arm-gic.h>
+
+    video-post-processing@f8cb0000 {
+        compatible = "hisilicon,hi3798cv200-vpss";
+        reg = <0xf8cb0000 0x10000>;
+        interrupts = <GIC_SPI 93 IRQ_TYPE_LEVEL_HIGH>;
+        clocks = <&crg HISTB_VPSS_CLK>;
+        clock-names = "core";
+        resets = <&crg 0xf0 4>;
+        reset-names = "core";
+    };
