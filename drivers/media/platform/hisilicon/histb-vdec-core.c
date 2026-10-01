@@ -9357,7 +9357,8 @@ histb_vdec_prepare_messages(struct histb_vdec_ctx *ctx,
 		FIELD_PREP(HISTB_VDEC_SLICE_ALPHA,
 			   slice->slice_alpha_c0_offset_div2 & 0xf);
 	slice_msg[11] = cpu_to_le32(value);
-	value = width_mbs * picture_height - 1;
+	/* DOWN slice addresses count MBAFF pairs; UP coverage counts MBs. */
+	value = (width_mbs * picture_height - 1) / (mbaff + 1);
 	slice_msg[44] = cpu_to_le32(value);
 	if (V4L2_H264_CTRL_PRED_WEIGHTS_REQUIRED(pps, slice)) {
 		histb_vdec_write_h264_weights(slice_msg, pred_weights, 0,
