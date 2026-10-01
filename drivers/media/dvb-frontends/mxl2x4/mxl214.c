@@ -624,6 +624,19 @@ static int mxl214_set_frontend(struct dvb_frontend *frontend)
 				"error counter reset", status);
 	if (ret)
 		goto unlock;
+	ret = mxl214_xpt_readback(state->device_id, channel->id, &readback);
+	if (ret) {
+		dev_err(&state->client->dev,
+			"channel %u post-tune XPT readback failed: %d\n",
+			channel->id, ret);
+		goto unlock;
+	}
+	dev_info(&state->client->dev,
+		 "channel %u post-tune XPT: phys=%u core=%u oe=%u mck=%u tsclk=%u mode=%u eco=%04x/%04x\n",
+		 channel->id, readback.physical_output,
+		 readback.output_enable, readback.mpeg_output_enable,
+		 readback.mpeg_clock_enable, readback.ts_clock_enable,
+		 readback.xpt_ts_mode, readback.eco4, readback.eco8);
 
 	channel->demod_enabled = true;
 	ret = 0;
