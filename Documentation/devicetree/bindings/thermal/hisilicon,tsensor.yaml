@@ -11,12 +11,25 @@ maintainers:
 
 allOf:
   - $ref: thermal-sensor.yaml
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: hisilicon,hi3798cv200-tsensor
+    then:
+      properties:
+        clocks: false
+        clock-names: false
+    else:
+      required:
+        - interrupts
 
 properties:
   compatible:
     enum:
       - hisilicon,tsensor
       - hisilicon,hi3660-tsensor
+      - hisilicon,hi3798cv200-tsensor
 
   reg:
     maxItems: 1
@@ -37,7 +50,6 @@ properties:
 required:
   - compatible
   - reg
-  - interrupts
   - '#thermal-sensor-cells'
 
 unevaluatedProperties: false

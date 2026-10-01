@@ -11,8 +11,10 @@
 
 #include <linux/cpufreq.h>
 #include <linux/delay.h>
+#include <linux/hwmon.h>
 #include <linux/interrupt.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/io.h>
@@ -37,6 +39,13 @@
 #define HI3660_INT_EN(chan)		(HI3660_OFFSET(chan) + 0x2C)
 #define HI3660_INT_CLR(chan)		(HI3660_OFFSET(chan) + 0x30)
 
+#define HI3798CV200_TEMP_CTRL		0x0
+#define HI3798CV200_TEMP_DATA(chan)	(0x8 + ((chan) * 0x4))
+#define HI3798CV200_TEMP_START		0x6005
+#define HI3798CV200_TEMP_SAMPLE_MASK	GENMASK(9, 0)
+#define HI3798CV200_TEMP_NUM_REGS	4
+#define HI3798CV200_TEMP_NUM_SAMPLES	8
+
 #define HI6220_TEMP_BASE			(-60000)
 #define HI6220_TEMP_RESET			(100000)
 #define HI6220_TEMP_STEP			(785)
@@ -59,6 +68,9 @@ struct hisi_thermal_data;
 struct hisi_thermal_sensor {
 	struct hisi_thermal_data *data;
 	struct thermal_zone_device *tzd;
+#if IS_REACHABLE(CONFIG_HWMON)
+	struct device *hwmon_dev;
+#endif
 	const char *irq_name;
 	uint32_t id;
 	uint32_t thres_temp;
@@ -78,6 +90,8 @@ struct hisi_thermal_data {
 	struct platform_device *pdev;
 	struct clk *clk;
 	void __iomem *regs;
+	/* Serialize the start/read/stop sampling sequence. */
+	struct mutex lock;
 	int nr_sensors;
 };
 
@@ -301,6 +315,32 @@ static int hi3660_thermal_get_temp(struct hisi_thermal_sensor *sensor)
 	return hi3660_thermal_get_temperature(data->regs, sensor->id);
 }
 
+static int hi3798cv200_thermal_get_temp(struct hisi_thermal_sensor *sensor)
+{
+	struct hisi_thermal_data *data = sensor->data;
+	unsigned int sample_sum = 0;
+	unsigned int value;
+	int average;
+	int i;
+
+	mutex_lock(&data->lock);
+	writel(HI3798CV200_TEMP_START, data->regs + HI3798CV200_TEMP_CTRL);
+	usleep_range(16000, 17000);
+
+	for (i = 0; i < HI3798CV200_TEMP_NUM_REGS; i++) {
+		value = readl(data->regs + HI3798CV200_TEMP_DATA(i));
+		sample_sum += value & HI3798CV200_TEMP_SAMPLE_MASK;
+		sample_sum += (value >> 16) & HI3798CV200_TEMP_SAMPLE_MASK;
+	}
+
+	writel(0, data->regs + HI3798CV200_TEMP_CTRL);
+	mutex_unlock(&data->lock);
+
+	average = sample_sum / HI3798CV200_TEMP_NUM_SAMPLES;
+
+	return ((((average - 125) * 165) / 806) - 40) * 1000;
+}
+
 static int hi6220_thermal_disable_sensor(struct hisi_thermal_sensor *sensor)
 {
 	struct hisi_thermal_data *data = sensor->data;
@@ -384,6 +424,11 @@ static int hi3660_thermal_enable_sensor(struct hisi_thermal_sensor *sensor)
 	return 0;
 }
 
+static int hi3798cv200_thermal_toggle_sensor(struct hisi_thermal_sensor *sensor)
+{
+	return 0;
+}
+
 static int hi6220_thermal_probe(struct hisi_thermal_data *data)
 {
 	struct platform_device *pdev = data->pdev;
@@ -424,6 +469,20 @@ static int hi3660_thermal_probe(struct hisi_thermal_data *data)
 	return 0;
 }
 
+static int hi3798cv200_thermal_probe(struct hisi_thermal_data *data)
+{
+	struct device *dev = &data->pdev->dev;
+
+	data->sensor = devm_kzalloc(dev, sizeof(*data->sensor), GFP_KERNEL);
+	if (!data->sensor)
+		return -ENOMEM;
+
+	data->sensor[0].data = data;
+	data->nr_sensors = 1;
+
+	return 0;
+}
+
 static int hisi_thermal_get_temp(struct thermal_zone_device *tz, int *temp)
 {
 	struct hisi_thermal_sensor *sensor = thermal_zone_device_priv(tz);
@@ -433,6 +492,63 @@ static int hisi_thermal_get_temp(struct thermal_zone_device *tz, int *temp)
 
 	return 0;
 }
+
+#if IS_REACHABLE(CONFIG_HWMON)
+static int hisi_thermal_hwmon_read(struct device *dev,
+				   enum hwmon_sensor_types type, u32 attr,
+				  int channel, long *val)
+{
+	struct hisi_thermal_sensor *sensor = dev_get_drvdata(dev);
+	int temperature;
+	int ret;
+
+	if (type != hwmon_temp || channel != 0)
+		return -EOPNOTSUPP;
+
+	switch (attr) {
+	case hwmon_temp_input:
+		ret = thermal_zone_get_temp(sensor->tzd, &temperature);
+		break;
+	case hwmon_temp_crit:
+		ret = thermal_zone_get_crit_temp(sensor->tzd, &temperature);
+		break;
+	default:
+		return -EOPNOTSUPP;
+	}
+
+	if (ret)
+		return ret;
+
+	*val = temperature;
+	return 0;
+}
+
+static umode_t hisi_thermal_hwmon_is_visible(const void *data,
+					     enum hwmon_sensor_types type,
+					     u32 attr, int channel)
+{
+	if (type == hwmon_temp && channel == 0 &&
+	    (attr == hwmon_temp_input || attr == hwmon_temp_crit))
+		return 0444;
+
+	return 0;
+}
+
+static const struct hwmon_channel_info * const hisi_thermal_hwmon_info[] = {
+	HWMON_CHANNEL_INFO(temp, HWMON_T_INPUT | HWMON_T_CRIT),
+	NULL
+};
+
+static const struct hwmon_ops hisi_thermal_hwmon_ops = {
+	.is_visible = hisi_thermal_hwmon_is_visible,
+	.read = hisi_thermal_hwmon_read,
+};
+
+static const struct hwmon_chip_info hisi_thermal_hwmon_chip_info = {
+	.ops = &hisi_thermal_hwmon_ops,
+	.info = hisi_thermal_hwmon_info,
+};
+#endif
 
 static const struct thermal_zone_device_ops hisi_of_thermal_ops = {
 	.get_temp = hisi_thermal_get_temp,
@@ -514,6 +630,13 @@ static const struct hisi_thermal_ops hi3660_ops = {
 	.probe		= hi3660_thermal_probe,
 };
 
+static const struct hisi_thermal_ops hi3798cv200_ops = {
+	.get_temp	= hi3798cv200_thermal_get_temp,
+	.enable_sensor	= hi3798cv200_thermal_toggle_sensor,
+	.disable_sensor	= hi3798cv200_thermal_toggle_sensor,
+	.probe		= hi3798cv200_thermal_probe,
+};
+
 static const struct of_device_id of_hisi_thermal_match[] = {
 	{
 		.compatible = "hisilicon,tsensor",
@@ -522,6 +645,10 @@ static const struct of_device_id of_hisi_thermal_match[] = {
 	{
 		.compatible = "hisilicon,hi3660-tsensor",
 		.data = &hi3660_ops,
+	},
+	{
+		.compatible = "hisilicon,hi3798cv200-tsensor",
+		.data = &hi3798cv200_ops,
 	},
 	{ /* end */ }
 };
@@ -551,6 +678,7 @@ static int hisi_thermal_probe(struct platform_device *pdev)
 	data->pdev = pdev;
 	platform_set_drvdata(pdev, data);
 	data->ops = of_device_get_match_data(dev);
+	mutex_init(&data->lock);
 
 	data->regs = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(data->regs))
@@ -570,17 +698,33 @@ static int hisi_thermal_probe(struct platform_device *pdev)
 			return ret;
 		}
 
-		ret = platform_get_irq(pdev, 0);
-		if (ret < 0)
-			return ret;
+#if IS_REACHABLE(CONFIG_HWMON)
+		sensor->hwmon_dev =
+			devm_hwmon_device_register_with_info(dev, "hisi_thermal",
+							     sensor,
+							     &hisi_thermal_hwmon_chip_info,
+							     NULL);
+		if (IS_ERR(sensor->hwmon_dev)) {
+			ret = PTR_ERR(sensor->hwmon_dev);
+			dev_warn(dev, "failed to register hwmon interface: %d\n", ret);
+			sensor->hwmon_dev = NULL;
+		}
+#endif
 
-		ret = devm_request_threaded_irq(dev, ret, NULL,
-						hisi_thermal_alarm_irq_thread,
-						IRQF_ONESHOT, sensor->irq_name,
-						sensor);
-		if (ret < 0) {
-			dev_err(dev, "Failed to request alarm irq: %d\n", ret);
-			return ret;
+		if (data->ops->irq_handler) {
+			ret = platform_get_irq(pdev, 0);
+			if (ret < 0)
+				return ret;
+
+			ret = devm_request_threaded_irq(dev, ret, NULL,
+							hisi_thermal_alarm_irq_thread,
+							IRQF_ONESHOT,
+							sensor->irq_name, sensor);
+			if (ret < 0) {
+				dev_err(dev, "Failed to request alarm irq: %d\n",
+					ret);
+				return ret;
+			}
 		}
 
 		ret = data->ops->enable_sensor(sensor);
