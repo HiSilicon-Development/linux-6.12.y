@@ -4095,13 +4095,26 @@ static int histb_vdec_copy_capture(struct histb_vdec_ctx *ctx)
 
 		if (ctx->dei_fields == ARRAY_SIZE(ctx->dei_field)) {
 			memset(&d, 0, sizeof(d));
-			d.ref_dma = ctx->dei_field[0];
-			d.cur_dma = ctx->dei_field[1];
-			d.nxt1_dma = ctx->dei_field[2];
-			d.nxt2_dma = ctx->dei_field[3];
+			/*
+			 * Field order follows VPSS_HAL_SetDeiCfg(): the newest field is
+			 * the one the engine takes through the NEXT2 slot and the oldest
+			 * is LAST.  This driver had it the other way round.
+			 */
+			d.ref_dma = ctx->dei_field[3];
+			d.cur_dma = ctx->dei_field[2];
+			d.nxt1_dma = ctx->dei_field[1];
+			d.nxt2_dma = ctx->dei_field[0];
 			d.width = frame.width;
 			d.height = field_height;
-			d.stride = frame.input_stride;
+			/*
+			 * The parser hands us a tiled surface but the de-interlacer is
+			 * programmed for linear input (the BSP sets ImgTile(FALSE) on all
+			 * four fields and runs a separate interlace step ahead of DEI).
+			 * Feeding a tile pitch as a linear stride made the engine walk 24
+			 * lines and then stall - DIESTA read cur_state=8, l_height_cnt=24.
+			 * Use the linear pitch instead.
+			 */
+			d.stride = ALIGN(frame.width, 256);
 			d.top_field_first = true;
 			d.ten_bit = frame.input_ten_bit;
 			d.tile = true;

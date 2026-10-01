@@ -32,6 +32,60 @@
 #define HISTB_VPSS_LB_Y_ADDR		0x094
 #define HISTB_VPSS_LB_C_ADDR		0x098
 #define HISTB_VPSS_LB_STRIDE		0x09c
+#define HISTB_VPSS_REE_Y_ADDR		0x188
+#define HISTB_VPSS_REE_C_ADDR		0x18c
+#define HISTB_VPSS_REE_STRIDE		0x190
+#define HISTB_VPSS_PRJV_CUR_ADDR	0x194
+#define HISTB_VPSS_PRJH_CUR_ADDR	0x198
+#define HISTB_VPSS_PRJCUR_STRIDE	0x19c
+#define HISTB_VPSS_RGMV_CUR_ADDR	0x1a0
+#define HISTB_VPSS_RGMV_NX1_ADDR	0x1a4
+#define HISTB_VPSS_RGMV_STRIDE		0x1a8
+#define HISTB_VPSS_BLKMV_CUR_ADDR	0x1ac
+#define HISTB_VPSS_BLKMV_REF_ADDR	0x1b0
+#define HISTB_VPSS_BLKMV_STRIDE	0x1b4
+#define HISTB_VPSS_CUE_Y_ADDR		0x1bc
+#define HISTB_VPSS_CUE_C_ADDR		0x1c0
+#define HISTB_VPSS_CUE_STRIDE		0x1c4
+#define HISTB_VPSS_PRJV_NX2_ADDR	0x1c8
+#define HISTB_VPSS_PRJH_NX2_ADDR	0x1cc
+#define HISTB_VPSS_PRJNX2_STRIDE	0x1d0
+#define HISTB_VPSS_RGMV_NX2_ADDR	0x1d4
+#define HISTB_VPSS_RGMVNX2_STRIDE	0x1d8
+#define HISTB_VPSS_BLKMV_NX1_ADDR	0x1dc
+#define HISTB_VPSS_BLKMVNX1_STRIDE	0x1e0
+#define HISTB_VPSS_CTRL_MCDI_EN		BIT(8)
+#define HISTB_VPSS_CTRL_MEDS_EN		BIT(9)
+#define HISTB_VPSS_VHD0_SIZE		0x154
+#define HISTB_VPSS_VHD0_Y_ADDR		0x158
+#define HISTB_VPSS_VHD0_C_ADDR		0x15c
+#define HISTB_VPSS_VHD0_STRIDE		0x160
+#define HISTB_VPSS_STT_W_ADDR		0x170
+#define HISTB_VPSS_TNR_ADDR		0x210
+#define HISTB_VPSS_TNR_CLUT_ADDR		0x214
+#define HISTB_VPSS_VHD0_CTRL		0x150
+#define HISTB_VPSS_VHD0_SIZE		0x154
+#define HISTB_VPSS_VHD0_Y_ADDR		0x158
+#define HISTB_VPSS_VHD0_C_ADDR		0x15c
+#define HISTB_VPSS_VHD0_STRIDE		0x160
+#define HISTB_VPSS_CTRL2_VHD0_FORMAT	GENMASK(15, 12)
+/* HI_DRV_PIX_FMT_NV21 = 1 in the BSP pixel-format enum. */
+#define HISTB_VPSS_FMT_NV21		1
+/*
+ * DEI tuning block contents, taken verbatim from the CV200 default PQ table
+ * (pq_hal_table_default.c, HI_PQ_MODULE_DEI):
+ *   0x1000 die_l_mode=0 die_c_mode=0 ma_only=0 mc_only=0 ...
+ *   0x1004 chroma_mf_offset=8 rec_mode_en=1 motion_iir_en=1 frame_motion_smooth_en=1
+ *   0x1008 ver_min_inten=-320 dir_inten_ver=2
+ *   0x100c range_scale=2
+ *   0x1010 ck1_gain=8 ck1_range_gain=2 ck1_max_range=30
+ */
+#define HISTB_VPSS_DIECTRL_VAL	0x00000000
+#define HISTB_VPSS_DIELMA2_VAL	((8u << 24) | (1u << 7) | (1u << 4) | (1u << 1))
+#define HISTB_VPSS_DIEINTEN_VAL	((0xFEC0u << 16) | (2u << 8))
+#define HISTB_VPSS_DIESCALE_VAL	2u
+#define HISTB_VPSS_DIECHECK_VAL	((8u << 16) | (2u << 8) | 30u)
+#define HISTB_VPSS_NODE_ID		0x0f8
 #define HISTB_VPSS_INT_MASK		0x0fc
 #define HISTB_VPSS_INPUT_CTRL		0x130
 #define HISTB_VPSS_INPUT_Y_ADDR		0x134
@@ -65,7 +119,6 @@
 #define HISTB_VPSS_DEI_NXT2YADDR	0x134
 #define HISTB_VPSS_DEI_NXT2CADDR	0x138
 #define HISTB_VPSS_DEI_NXT2STRIDE	0x13c
-#define HISTB_VPSS_DEI_ADDR		0x258
 #define HISTB_VPSS_DIECTRL		0x1000
 #define HISTB_VPSS_DEI_PARAM_BASE	0x1000
 
@@ -85,7 +138,45 @@
 #define HISTB_VPSS_DIE_OUT_SEL_L	BIT(29)
 
 /* Field control: bit for "this field is in the decoder's tile format". */
-#define HISTB_VPSS_DEI_TILE_FORMAT	BIT(0)
+#define HISTB_VPSS_DEI_TILE_FORMAT	BIT(4)	/* VPSS_NXT2_CTRL.nxt2_tile_format */
+#define HISTB_VPSS_DEI_DCMP_EN		BIT(31)	/* nxt2_dcmp_en: must stay clear */
+#define HISTB_VPSS_CTRL2_IN_FORMAT	GENMASK(20, 16)
+#define HISTB_VPSS_CTRL2_IN_PIX_BITW	BIT(21)
+#define HISTB_VPSS_CTRL2_REF_NXT_BITW	BIT(22)
+#define HISTB_VPSS_CTRL2_RFR_PIX_BITW	BIT(23)
+#define HISTB_VPSS_CTRL3_PRE_VFIR_MODE	GENMASK(5, 4)
+#define HISTB_VPSS_CTRL3_PRE_VFIR_EN	BIT(6)
+#define HISTB_VPSS_CTRL3_IN_CROP_EN	BIT(16)
+#define HISTB_VPSS_REFSIZE		0x014
+#define HISTB_VPSS_RFR_Y_ADDR		0x144
+#define HISTB_VPSS_RFR_C_ADDR		0x148
+#define HISTB_VPSS_RFR_STRIDE		0x14c
+#define HISTB_VPSS_CTRL_PROT		GENMASK(24, 23)	/* prot is 2 bits */
+#define HISTB_VPSS_CTRL_IMG_PRO_MODE	GENMASK(28, 27)
+#define HISTB_VPSS_CTRL_IGBM_EN		BIT(26)
+#define HISTB_VPSS_CTRL_BFIELD		BIT(31)
+#define HISTB_VPSS_DEI_ADDR		0x258
+/*
+ * VPSS_DIECTRL, at offset 0x1000 inside the node image.  VPSS_DEI_ADDR
+ * points the engine here; the BSP fills this region by memcpy()ing a whole
+ * PQ parameter table (VPSS_REG_ResetAppReg), which we do not have, so it
+ * was left all-zero.  U_VPSS_DIECTRL:
+ *   edge_smooth_ratio[15:8] edge_smooth_en[20] ma_only[21] mc_only[22]
+ *   die_c_mode[25:24] die_l_mode[27:26] die_out_sel_c[28] die_out_sel_l[29]
+ */
+#define HISTB_VPSS_DIECTRL_OFF		0x1010
+
+#define HISTB_VPSS_ST_RD_ADDR		0x164
+#define HISTB_VPSS_ST_WR_ADDR		0x168
+#define HISTB_VPSS_ST_STRIDE		0x16c
+#define HISTB_VPSS_DEI_ST_SLOTS		3
+#define HISTB_VPSS_DEI_CTRL_OFF	0x1000	/* VPSS_DIECTRL */
+#define HISTB_VPSS_DIESTA	0x1028	/* DEI state: cur_state/height counters */
+#define HISTB_VPSS_CTRL_TNR_EN		BIT(18)
+#define HISTB_VPSS_CTRL_SNR_EN		BIT(17)
+#define HISTB_VPSS_CTRL_RFR_EN		BIT(19)
+#define HISTB_VPSS_CTRL_DBM_EN		BIT(11)
+#define HISTB_VPSS_DEI_IN_FMT_NV12_TILE	3
 
 /* The BSP bypasses the de-interlacer above these (vpss_in_3798cv200.c). */
 #define HISTB_VPSS_DEI_MAX_WIDTH	1920
@@ -172,6 +263,12 @@ struct histb_vpss {
 	void *staging_cpu;
 	dma_addr_t staging_dma;
 	size_t staging_size;
+
+	/* Motion-statistics ring the de-interlacer reads from and writes to. */
+	void *dei_st_cpu;
+	dma_addr_t dei_st_dma;
+	size_t dei_st_size;
+	u32 dei_st_seq;
 
 	/* Serializes the single hardware pipeline and its staging buffer. */
 	struct mutex lock;
@@ -354,6 +451,53 @@ static int histb_vpss_prepare_staging(struct histb_vpss *vpss,
 				     DMA_FROM_DEVICE);
 		vpss->staging_cpu = NULL;
 		vpss->staging_size = 0;
+		return -ERANGE;
+	}
+
+	return 0;
+}
+
+/*
+ * The de-interlacer keeps per-field motion statistics in DDR: it reads the
+ * previous field's block through VPSS_STRADDR and writes the current one to
+ * VPSS_STWADDR, at VPSS_STSTRIDE.  The vendor sizes one block as
+ * ((width + 3) / 4 * 2) rounded up to 16 and then to the 64-byte Y stride,
+ * times half the frame height, and rotates three of them (vpss_sttinf.c:
+ * VPSS_STTINFO_CalDieBufSize / VPSS_STTINFO_DieInit).
+ */
+static u32 histb_vpss_dei_st_stride(u32 width)
+{
+	return ALIGN(((width + 3) / 4 * 2 + 15) / 16 * 16, 64);
+}
+
+static int histb_vpss_prepare_dei_st(struct histb_vpss *vpss, u32 width,
+				     u32 field_height)
+{
+	size_t slot = (size_t)histb_vpss_dei_st_stride(width) * field_height;
+	size_t size = slot * HISTB_VPSS_DEI_ST_SLOTS;
+
+	if (!slot)
+		return -EINVAL;
+	if (vpss->dei_st_cpu && vpss->dei_st_size >= size)
+		return 0;
+
+	if (vpss->dei_st_cpu)
+		dma_free_coherent(vpss->dev, vpss->dei_st_size,
+				  vpss->dei_st_cpu, vpss->dei_st_dma);
+	vpss->dei_st_cpu = dma_alloc_coherent(vpss->dev, size,
+					      &vpss->dei_st_dma, GFP_KERNEL);
+	if (!vpss->dei_st_cpu) {
+		vpss->dei_st_size = 0;
+		return -ENOMEM;
+	}
+	vpss->dei_st_size = size;
+	vpss->dei_st_seq = 0;
+	memset(vpss->dei_st_cpu, 0, size);
+	if (upper_32_bits(vpss->dei_st_dma)) {
+		dma_free_coherent(vpss->dev, size, vpss->dei_st_cpu,
+				  vpss->dei_st_dma);
+		vpss->dei_st_cpu = NULL;
+		vpss->dei_st_size = 0;
 		return -ERANGE;
 	}
 
@@ -543,7 +687,7 @@ static void histb_vpss_dei_field(struct histb_vpss *vpss, u32 ctrl_off,
 				 const struct histb_vpss_dei_frame *frame,
 				 dma_addr_t dma, u32 stride)
 {
-	writel(frame->tile ? HISTB_VPSS_DEI_TILE_FORMAT : 0,
+	writel(0 /* fields are linear, not tiled */,
 	       vpss->regs + ctrl_off);
 	writel(lower_32_bits(dma), vpss->regs + y_off);
 	writel(lower_32_bits(dma + stride * frame->height),
@@ -946,6 +1090,8 @@ int histb_vpss_dei(struct histb_vpss *vpss,
 {
 	u32 stride = frame ? frame->stride : 0;
 	u32 field_height;
+	u32 st_stride;
+	u32 st_slot;
 	u32 ctrl;
 	unsigned int i;
 	unsigned long timeout;
@@ -974,6 +1120,13 @@ int histb_vpss_dei(struct histb_vpss *vpss,
 	if (ret < 0)
 		goto unlock;
 
+	ret = histb_vpss_prepare_dei_st(vpss, frame->width, field_height);
+	if (ret < 0)
+		goto put;
+
+	st_stride = histb_vpss_dei_st_stride(frame->width);
+	st_slot = st_stride * field_height;
+
 	/*
 	 * Everything goes into the node image, not into the register window:
 	 * the engine reads its register set from the descriptor that
@@ -984,13 +1137,72 @@ int histb_vpss_dei(struct histb_vpss *vpss,
 	 */
 	memset(vpss->node, 0, HISTB_VPSS_NODE_SIZE);
 
+	/*
+	 * VPSS_HAL_SetH265DeiCfg() in the BSP sets eight things our driver
+	 * previously omitted, and the engine will not complete a DEI job
+	 * without them:
+	 *
+	 *   SetImgReadMod(TRUE)   CTRL.bfield[31]      - DEI reads from cache
+	 *   EnDei(TRUE)           CTRL.dei_en[7]
+	 *   SetDeiTopFirst()      CTRL.bfield_first[29]
+	 *   SetDeiFieldMode()     CTRL.bfield_mode[30]
+	 *   SetModeEn(CHROME)     REG_DIE_MODE.chroma
+	 *   SetModeEn(LUMA)       REG_DIE_MODE.luma
+	 *   SetMode(4-field)      REG_DIE_MODE_ALL = 1
+	 *   SetDeiParaAddr()      VPSS_DEI_ADDR = node + 0x1000 - 4
+	 *
+	 * The last one is the reason the engine used to time out: it reads the
+	 * DEI tuning table from an offset inside the node image, and with
+	 * VPSS_DEI_ADDR left at zero it waits for a parameter block that never
+	 * arrives.  Measured before the fix: "post-processing timed out", -110,
+	 * CPU fallback on every frame.
+	 */
 	ctrl = histb_vpss_node_read(vpss, HISTB_VPSS_CTRL);
 	ctrl |= HISTB_VPSS_CTRL_DEI_EN | HISTB_VPSS_CTRL_OUTPUT_EN;
+	/*
+	 * FOUR_PIX is what histb_vpss_build_node() - the detile/scaler path,
+	 * which the engine completes on every frame - sets and the DEI path
+	 * did not.  The de-interlacer's motion estimator works on four-pixel
+	 * groups, so it is a plausible start condition.
+	 */
+	ctrl |= HISTB_VPSS_CTRL_FOUR_PIX;
+	/*
+	 * MCDI is not optional on CV200: VPSS_HAL_SetMcDeiCfg() - called by
+	 * every DEI node the BSP builds - sets McdiEn unconditionally, and
+	 * the de-interlacer's motion estimator consumes the motion buffers it
+	 * programs.  Driving mcdi_en from the stream's field flag left it
+	 * clear, which would starve the estimator; the detile path does not
+	 * touch MCDI, which is why detile completes and DEI does not.
+	 */
+	ctrl |= HISTB_VPSS_CTRL_MCDI_EN;
+	if (frame->width > 960)
+		ctrl |= HISTB_VPSS_CTRL_MEDS_EN;
+	else
+		ctrl &= ~(u32)HISTB_VPSS_CTRL_MEDS_EN;
+	ctrl |= HISTB_VPSS_CTRL_BFIELD;		/* SetImgReadMod(HI_TRUE) */
+	ctrl |= HISTB_VPSS_CTRL_IGBM_EN;	/* SetIglbEn(HI_TRUE) */
+	ctrl |= HISTB_VPSS_CTRL_IFMD_EN;	/* SetIfmdEn(HI_TRUE) */
 	if (!frame->top_field_first)
 		ctrl |= HISTB_VPSS_CTRL_BFIELD_FIRST;
 	else
 		ctrl &= ~HISTB_VPSS_CTRL_BFIELD_FIRST;
+	if (frame->bottom_field)
+		ctrl |= HISTB_VPSS_CTRL_BFIELD_MODE;	/* SetDeiFieldMode */
+	else
+		ctrl &= ~HISTB_VPSS_CTRL_BFIELD_MODE;
 	histb_vpss_node_write(vpss, HISTB_VPSS_CTRL, ctrl);
+
+	/* VPSS_REG_SetStRdAddr/SetStWrAddr/SetStStride - motion statistics. */
+	histb_vpss_node_write(vpss, HISTB_VPSS_ST_RD_ADDR,
+			      lower_32_bits(vpss->dei_st_dma +
+					    (vpss->dei_st_seq %
+					     HISTB_VPSS_DEI_ST_SLOTS) * st_slot));
+	histb_vpss_node_write(vpss, HISTB_VPSS_ST_WR_ADDR,
+			      lower_32_bits(vpss->dei_st_dma +
+					    ((vpss->dei_st_seq + 1) %
+					     HISTB_VPSS_DEI_ST_SLOTS) * st_slot));
+	histb_vpss_node_write(vpss, HISTB_VPSS_ST_STRIDE, st_stride);
+	vpss->dei_st_seq++;
 
 	/* Output of the de-interlaced frame. */
 	histb_vpss_node_write(vpss, HISTB_VPSS_LB_Y_ADDR,
@@ -998,12 +1210,13 @@ int histb_vpss_dei(struct histb_vpss *vpss,
 	histb_vpss_node_write(vpss, HISTB_VPSS_LB_C_ADDR,
 			      lower_32_bits(output_dma + stride * frame->height));
 	histb_vpss_node_write(vpss, HISTB_VPSS_LB_STRIDE, stride);
+	/* SetImgSize(w, field_height * 2): the woven frame is twice a field. */
 	histb_vpss_node_write(vpss, HISTB_VPSS_IMG_SIZE,
-			      (frame->height - 1) << 16 | (frame->width - 1));
+			      (frame->height * 2 - 1) << 16 | (frame->width - 1));
 
 	/* The four fields, in the same group-of-four layout as the registers. */
 	histb_vpss_node_write(vpss, HISTB_VPSS_DEI_REF_CTRL,
-			      frame->tile ? HISTB_VPSS_DEI_TILE_FORMAT : 0);
+			      0 /* fields are linear, not tiled */);
 	histb_vpss_node_write(vpss, HISTB_VPSS_DEI_REFYADDR,
 			      lower_32_bits(frame->ref_dma));
 	histb_vpss_node_write(vpss, HISTB_VPSS_DEI_REFCADDR,
@@ -1012,7 +1225,7 @@ int histb_vpss_dei(struct histb_vpss *vpss,
 			      stride | stride << 16);
 
 	histb_vpss_node_write(vpss, HISTB_VPSS_DEI_CUR_CTRL,
-			      frame->tile ? HISTB_VPSS_DEI_TILE_FORMAT : 0);
+			      0 /* fields are linear, not tiled */);
 	histb_vpss_node_write(vpss, HISTB_VPSS_DEI_CURYADDR,
 			      lower_32_bits(frame->cur_dma));
 	histb_vpss_node_write(vpss, HISTB_VPSS_DEI_CURCADDR,
@@ -1021,7 +1234,7 @@ int histb_vpss_dei(struct histb_vpss *vpss,
 			      stride | stride << 16);
 
 	histb_vpss_node_write(vpss, HISTB_VPSS_DEI_NXT1_CTRL,
-			      frame->tile ? HISTB_VPSS_DEI_TILE_FORMAT : 0);
+			      0 /* fields are linear, not tiled */);
 	histb_vpss_node_write(vpss, HISTB_VPSS_DEI_NXT1YADDR,
 			      lower_32_bits(frame->nxt1_dma));
 	histb_vpss_node_write(vpss, HISTB_VPSS_DEI_NXT1CADDR,
@@ -1030,7 +1243,7 @@ int histb_vpss_dei(struct histb_vpss *vpss,
 			      stride | stride << 16);
 
 	histb_vpss_node_write(vpss, HISTB_VPSS_DEI_NXT2_CTRL,
-			      frame->tile ? HISTB_VPSS_DEI_TILE_FORMAT : 0);
+			      0 /* fields are linear, not tiled */);
 	histb_vpss_node_write(vpss, HISTB_VPSS_DEI_NXT2YADDR,
 			      lower_32_bits(frame->nxt2_dma));
 	histb_vpss_node_write(vpss, HISTB_VPSS_DEI_NXT2CADDR,
@@ -1079,27 +1292,320 @@ int histb_vpss_dei(struct histb_vpss *vpss,
 	}
 
 	/* The block reads its own tuning block from inside the register map. */
+	/*
+	 * The node image and the live register window are different address
+	 * spaces: histb_vpss_node_write() writes vpss->node (memory the engine
+	 * reads through PNEXT), writel() writes vpss->regs (the CPU window).
+	 * The BSP computes this address from the *node* pointer
+	 * (VPSS_REG_StartLogic casts pu32PhyAddr, the node address, to
+	 * VPSS_REG_S *), so it must be node_dma based.  Using regs_phys here
+	 * points the engine at the wrong block and the job times out.
+	 */
 	histb_vpss_node_write(vpss, HISTB_VPSS_DEI_ADDR,
-			      lower_32_bits(vpss->regs_phys +
-					    HISTB_VPSS_DEI_PARAM_BASE));
+			      lower_32_bits(vpss->node_dma +
+					    HISTB_VPSS_DIECTRL_OFF -
+					    sizeof(u32)));
 
-	histb_vpss_node_write(vpss, HISTB_VPSS_INT_MASK, HISTB_VPSS_INT_ALL);
+	/*
+	 * The DEI tuning word the engine reads through VPSS_DEI_ADDR.
+	 */
+	/*
+	 * The whole DEI tuning block, values taken verbatim from the CV200
+	 * default PQ table (pq_hal_table_default.c, HI_PQ_MODULE_DEI):
+	 *   0x1000 die_l_mode=1 (4-field)  die_c_mode=1
+	 *   0x1004 chroma_mf_offset=8 rec_mode_en=1 motion_iir_en=1
+	 *          frame_motion_smooth_en=1
+	 *   0x1008 ver_min_inten=-320 dir_inten_ver=2
+	 *   0x100c range_scale=2
+	 *   0x1010/0x1014 ck1/ck2_gain=8 range_gain=2 max_range=30
+	 */
+	{
+		/*
+		 * The complete DEI tuning block: 363 entries from the CV200
+		 * default PQ table (pq_hal_table_default.c, HI_PQ_MODULE_DEI),
+		 * collapsed to 89 register words with every bitfield spliced
+		 * into place.  The earlier code wrote six of these words; the
+		 * block covers 0x1000-0x1198 and the motion estimator reads most
+		 * of it.
+		 */
+		static const struct { u32 off, val; } dei_blk[] = {
+			{ 0x1000, 0x05000000u },
+			{ 0x1004, 0x08000092u },
+			{ 0x1008, 0xfec00200u },
+			{ 0x100c, 0x00000002u },
+			{ 0x1010, 0x0008021eu },
+			{ 0x1014, 0x0008021eu },
+			{ 0x1018, 0x1b201828u },
+			{ 0x101c, 0x0b0c0f12u },
+			{ 0x1020, 0x06070809u },
+			{ 0x1024, 0x00030505u },
+			{ 0x102c, 0x87766556u },
+			{ 0x1030, 0x08888888u },
+			{ 0x1034, 0x13880420u },
+			{ 0x1038, 0x00000000u },
+			{ 0x103c, 0x183eff00u },
+			{ 0x1040, 0xffd09010u },
+			{ 0x1044, 0x4020ffffu },
+			{ 0x1048, 0x20000081u },
+			{ 0x104c, 0x40404030u },
+			{ 0x1050, 0x000d0022u },
+			{ 0x1054, 0x01000000u },
+			{ 0x1058, 0xa00a0fffu },
+			{ 0x105c, 0x00001e40u },
+			{ 0x1060, 0xffff4808u },
+			{ 0x1064, 0x4000ffffu },
+			{ 0x1068, 0x00000008u },
+			{ 0x106c, 0x40404040u },
+			{ 0x1070, 0xffff4808u },
+			{ 0x1074, 0x4000ffffu },
+			{ 0x1078, 0x00000008u },
+			{ 0x107c, 0x40404040u },
+			{ 0x1080, 0x00800080u },
+			{ 0x1084, 0x000e3000u },
+			{ 0x1088, 0x00073088u },
+			{ 0x108c, 0x00084086u },
+			{ 0x1090, 0x4008408cu },
+			{ 0x1094, 0x2008f08eu },
+			{ 0x1098, 0x40086087u },
+			{ 0x109c, 0xff020010u },
+			{ 0x10a0, 0x10000600u },
+			{ 0x10a4, 0x10104010u },
+			{ 0x10a8, 0x40084010u },
+			{ 0x10ac, 0x03ff4040u },
+			{ 0x10b0, 0x00000080u },
+			{ 0x10b4, 0x00100000u },
+			{ 0x10b8, 0x00100030u },
+			{ 0x10bc, 0x00500070u },
+			{ 0x10c0, 0x11c140c4u },
+			{ 0x10c4, 0x00060164u },
+			{ 0x10fc, 0x03ffddffu },
+			{ 0x1100, 0x00907effu },
+			{ 0x1104, 0x01820100u },
+			{ 0x1108, 0x00000cffu },
+			{ 0x110c, 0x00508191u },
+			{ 0x1110, 0x00045088u },
+			{ 0x1114, 0x00000000u },
+			{ 0x1118, 0x00064814u },
+			{ 0x111c, 0x01310c10u },
+			{ 0x1120, 0x01480f08u },
+			{ 0x1124, 0x08410107u },
+			{ 0x1128, 0x00c08808u },
+			{ 0x112c, 0x01020040u },
+			{ 0x1130, 0x0400c140u },
+			{ 0x1134, 0x0101fea0u },
+			{ 0x1138, 0x187a4010u },
+			{ 0x113c, 0x100040ffu },
+			{ 0x1140, 0x00001244u },
+			{ 0x1144, 0x7c444412u },
+			{ 0x1148, 0x00cc3200u },
+			{ 0x114c, 0x02101120u },
+			{ 0x1150, 0x00002410u },
+			{ 0x1154, 0x000405fcu },
+			{ 0x1158, 0x038e1410u },
+			{ 0x115c, 0x10801100u },
+			{ 0x1160, 0x40201008u },
+			{ 0x1164, 0x20402020u },
+			{ 0x1168, 0x0001411fu },
+			{ 0x116c, 0x10824210u },
+			{ 0x1170, 0x00000000u },
+			{ 0x1174, 0x000001e8u },
+			{ 0x1178, 0x00041488u },
+			{ 0x117c, 0x41000000u },
+			{ 0x1180, 0x00000000u },
+			{ 0x1184, 0x20ffffffu },
+			{ 0x1188, 0x00000c10u },
+			{ 0x118c, 0x00000000u },
+			{ 0x1190, 0x0008408cu },
+			{ 0x1194, 0x00001000u },
+			{ 0x1198, 0x00000014u },
+		};
+		unsigned int b;
+
+		for (b = 0; b < ARRAY_SIZE(dei_blk); b++) {
+			histb_vpss_node_write(vpss, dei_blk[b].off, dei_blk[b].val);
+			writel(dei_blk[b].val, vpss->regs + dei_blk[b].off);
+		}
+	}
+
+	/* --- remaining BSP calls our driver never made --- */
+	{
+		u32 c = histb_vpss_node_read(vpss, HISTB_VPSS_CTRL);
+
+		/* prot[24:23]=0 (not secure), rfr/tnr/snr off, dbm for big frames */
+		c &= ~(u32)(HISTB_VPSS_CTRL_PROT | HISTB_VPSS_CTRL_RFR_EN |
+			    HISTB_VPSS_CTRL_TNR_EN | HISTB_VPSS_CTRL_SNR_EN);
+		if (frame->width > 128 && frame->height > 64)
+			c |= HISTB_VPSS_CTRL_DBM_EN;
+		histb_vpss_node_write(vpss, HISTB_VPSS_CTRL, c);
+
+		/* SetDcmpEn(FALSE) - no compressed frame store. */
+		histb_vpss_node_write(vpss, HISTB_VPSS_INPUT_CTRL, 0);
+	}
+
+	/* SetRefWidth / SetRefHight: the woven frame is twice a field. */
+	histb_vpss_node_write(vpss, HISTB_VPSS_REFSIZE,
+			      (((frame->height * 2) & 0x1fff) << 16) |
+			      (frame->width & 0x1fff));
+
+	/* SetSttWrAddr / SetTnrAddr / SetTnrClutAddr: the block wants these
+	 * offsets inside the node even when TNR is disabled. */
+	histb_vpss_node_write(vpss, HISTB_VPSS_STT_W_ADDR, 0);
+	histb_vpss_node_write(vpss, HISTB_VPSS_TNR_ADDR,
+			      lower_32_bits(vpss->node_dma + 0x3800 - sizeof(u32)));
+	histb_vpss_node_write(vpss, HISTB_VPSS_TNR_CLUT_ADDR,
+			      lower_32_bits(vpss->node_dma + 0x3b00 - sizeof(u32)));
+
+	/*
+	 * The engine loads this node into its own register file, so the node's
+	 * INTMASK is what actually governs interrupt delivery - the live
+	 * window copy is overwritten when the node is fetched.  The readback
+	 * showed intmask=0xff even after the live window was written with
+	 * 0xfe, which is exactly that overwrite.  Use 0xfe, i.e. eof unmasked
+	 * (0 = enabled), matching what the HAL leaves in the live window.
+	 */
+	histb_vpss_node_write(vpss, HISTB_VPSS_INT_MASK, 0xfe);
 	histb_vpss_node_write(vpss, HISTB_VPSS_NEXT, 0);
 
 	reinit_completion(&vpss->completion);
 	vpss->irq_state = 0;
 	writel(HISTB_VPSS_INT_ALL, vpss->regs + HISTB_VPSS_INT_CLEAR);
 	writel(HISTB_VPSS_MISC_DEFAULT, vpss->regs + HISTB_VPSS_MISC);
+	/*
+	 * VPSS_REG_SetIntMask(base, 0xfe) - the HAL unmasks exactly one bit
+	 * (eof) in the live window after every ResetAppReg.  0 = enabled, so
+	 * 0xfe leaves bit 0 clear.  This driver never set the live window at
+	 * all, and the node copy is 0xff (all masked), so no completion
+	 * interrupt could ever arrive.
+	 */
+	writel(0xfe, vpss->regs + HISTB_VPSS_INT_MASK);
+	/*
+	 * VPSS_REG_StartLogic() writes PNEXT and START into the *node*, not the
+	 * live window: it casts its pu32PhyAddr argument - the node address -
+	 * to VPSS_REG_S * and stores through that.  Writing the live window
+	 * instead leaves the engine looking for a start bit inside the node
+	 * that was never set, so it never begins and never raises a completion
+	 * interrupt.  Measured before the fix: start=0x0 and pnext=0x0 in the
+	 * live window while ctrl=0x86000088 (read from the node) was correct.
+	 */
+	/*
+	 * VPSS_REG_SetNodeID(): the BSP always stamps a node id before the
+	 * node is submitted.  With it left at zero the engine loads the node
+	 * (its CTRL is visible on readback) and then does nothing at all -
+	 * no completion interrupt, no error bit - which is exactly what we
+	 * measured.  Use 1, a non-zero user node id.
+	 */
+	/*
+	 * VPSS_REG_SetRchSmmuBypass/WchSmmuBypass: the BSP unconditionally
+	 * programs both to 0xffffffff (bypass) for every node it builds.  A
+	 * non-bypassed channel with no page tables installed would stall every
+	 * bus access the engine makes, which matches the readout: the engine
+	 * loads the node, then neither completes nor reports an error.
+	 */
+	histb_vpss_node_write(vpss, HISTB_VPSS_RCH_BYPASS, 0xffffffff);
+	histb_vpss_node_write(vpss, HISTB_VPSS_WCH_BYPASS, 0xffffffff);
+	writel(0xffffffff, vpss->regs + HISTB_VPSS_RCH_BYPASS);
+	writel(0xffffffff, vpss->regs + HISTB_VPSS_WCH_BYPASS);
+
+	/*
+	 * Port/VHD0 output.  The BSP's de-interlacer writes its result through
+	 * the VHD0 port (SetFrmAddr/SetFrmStride/SetFrmFormat/EnPort), not
+	 * through the RFR write-back path this driver used.  Stride is doubled
+	 * for the woven frame, exactly as SetNode_H265_Step1_Interlace does.
+	 */
+	histb_vpss_node_write(vpss, HISTB_VPSS_VHD0_SIZE,
+			      ((frame->height * 2) << 16) | frame->width);
+	histb_vpss_node_write(vpss, HISTB_VPSS_VHD0_Y_ADDR, lower_32_bits(output_dma));
+	histb_vpss_node_write(vpss, HISTB_VPSS_VHD0_C_ADDR,
+			      lower_32_bits(output_dma + stride * frame->height * 2));
+	histb_vpss_node_write(vpss, HISTB_VPSS_VHD0_STRIDE,
+			      ((stride * 2) << 16) | (stride * 2));
+	{
+		u32 c2 = histb_vpss_node_read(vpss, HISTB_VPSS_CTRL2) &
+			 ~(u32)HISTB_VPSS_CTRL2_VHD0_FORMAT;
+		histb_vpss_node_write(vpss, HISTB_VPSS_CTRL2,
+				      c2 | (HISTB_VPSS_FMT_NV21 << 12));
+	}
+	histb_vpss_node_write(vpss, HISTB_VPSS_VHD0_CTRL, 1);
+
+	/*
+	 * Motion buffers.  The BSP allocates dedicated ones; we point every
+	 * one of them at the motion-statistics buffer this driver already
+	 * allocates, which is large enough and is never read by the CPU.
+	 */
+	{
+		dma_addr_t mb = vpss->dei_st_dma;
+		u32 mstride = st_stride;
+
+		histb_vpss_node_write(vpss, HISTB_VPSS_REE_Y_ADDR, lower_32_bits(mb));
+		histb_vpss_node_write(vpss, HISTB_VPSS_REE_C_ADDR, lower_32_bits(mb + mstride * 8));
+		histb_vpss_node_write(vpss, HISTB_VPSS_REE_STRIDE, mstride | (mstride << 16));
+		histb_vpss_node_write(vpss, HISTB_VPSS_CUE_Y_ADDR, lower_32_bits(mb + mstride * 16));
+		histb_vpss_node_write(vpss, HISTB_VPSS_CUE_C_ADDR, lower_32_bits(mb + mstride * 24));
+		histb_vpss_node_write(vpss, HISTB_VPSS_CUE_STRIDE, mstride | (mstride << 16));
+
+		histb_vpss_node_write(vpss, HISTB_VPSS_BLKMV_CUR_ADDR, lower_32_bits(mb + mstride * 32));
+		histb_vpss_node_write(vpss, HISTB_VPSS_BLKMV_REF_ADDR, lower_32_bits(mb + mstride * 40));
+		histb_vpss_node_write(vpss, HISTB_VPSS_BLKMV_STRIDE, mstride);
+		histb_vpss_node_write(vpss, HISTB_VPSS_BLKMV_NX1_ADDR, lower_32_bits(mb + mstride * 48));
+		histb_vpss_node_write(vpss, HISTB_VPSS_BLKMVNX1_STRIDE, mstride);
+
+		histb_vpss_node_write(vpss, HISTB_VPSS_RGMV_CUR_ADDR, lower_32_bits(mb + mstride * 56));
+		histb_vpss_node_write(vpss, HISTB_VPSS_RGMV_NX1_ADDR, lower_32_bits(mb + mstride * 64));
+		histb_vpss_node_write(vpss, HISTB_VPSS_RGMV_STRIDE, mstride);
+		histb_vpss_node_write(vpss, HISTB_VPSS_RGMV_NX2_ADDR, lower_32_bits(mb + mstride * 72));
+		histb_vpss_node_write(vpss, HISTB_VPSS_RGMVNX2_STRIDE, mstride);
+
+		histb_vpss_node_write(vpss, HISTB_VPSS_PRJV_CUR_ADDR, lower_32_bits(mb + mstride * 80));
+		histb_vpss_node_write(vpss, HISTB_VPSS_PRJH_CUR_ADDR, lower_32_bits(mb + mstride * 88));
+		histb_vpss_node_write(vpss, HISTB_VPSS_PRJCUR_STRIDE, mstride);
+		histb_vpss_node_write(vpss, HISTB_VPSS_PRJV_NX2_ADDR, lower_32_bits(mb + mstride * 96));
+		histb_vpss_node_write(vpss, HISTB_VPSS_PRJH_NX2_ADDR, lower_32_bits(mb + mstride * 104));
+		histb_vpss_node_write(vpss, HISTB_VPSS_PRJNX2_STRIDE, mstride);
+	}
+
+	histb_vpss_node_write(vpss, HISTB_VPSS_NODE_ID, 1);
+	histb_vpss_node_write(vpss, HISTB_VPSS_NEXT, 0);
+	histb_vpss_node_write(vpss, HISTB_VPSS_START, 1);
+	/* Keep the live window consistent too: harmless, and it is what the
+	 * scaler path already does. */
 	writel(lower_32_bits(vpss->node_dma), vpss->regs + HISTB_VPSS_NEXT);
 	wmb();
 	writel(1, vpss->regs + HISTB_VPSS_START);
 
 	timeout = wait_for_completion_timeout(&vpss->completion,
 					      msecs_to_jiffies(500));
-	if (!timeout)
-	ret = timeout ? 0 : -ETIMEDOUT;
+	if (!timeout) {
+		{
+			unsigned int q;
+
+			dev_err(vpss->dev,
+				"dei timed out: intstate=%#x intmask=%#x pnext=%#x start=%#x ctrl=%#x\n",
+				readl(vpss->regs + HISTB_VPSS_INT_STATE),
+				readl(vpss->regs + HISTB_VPSS_INT_MASK),
+				readl(vpss->regs + HISTB_VPSS_NEXT),
+				readl(vpss->regs + HISTB_VPSS_START),
+				readl(vpss->regs + HISTB_VPSS_CTRL));
+			for (q = 0x1000; q < 0x10d0; q += 16)
+				dev_err(vpss->dev,
+					"die[%03x]=%08x %08x %08x %08x\n", q,
+					readl(vpss->regs + q), readl(vpss->regs + q + 4),
+					readl(vpss->regs + q + 8), readl(vpss->regs + q + 12));
+			for (q = 0x1100; q < 0x11a0; q += 16)
+				dev_err(vpss->dev,
+					"die[%03x]=%08x %08x %08x %08x\n", q,
+					readl(vpss->regs + q), readl(vpss->regs + q + 4),
+					readl(vpss->regs + q + 8), readl(vpss->regs + q + 12));
+		}
+		ret = -ETIMEDOUT;
+	} else if (vpss->irq_state & HISTB_VPSS_INT_ERROR) {
+		dev_err(vpss->dev, "dei failed, state=%#x\n", vpss->irq_state);
+		ret = -EIO;
+	} else {
+		ret = 0;
+	}
 
 	writel(0, vpss->regs + HISTB_VPSS_CTRL);
+put:
 	pm_runtime_put(vpss->dev);
 unlock:
 	mutex_unlock(&vpss->lock);

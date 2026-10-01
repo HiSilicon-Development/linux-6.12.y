@@ -51,6 +51,7 @@ struct histb_vpss_dei_frame {
 	u32 stride;		/* Y stride; C follows the same pitch */
 	bool top_field_first;
 	bool ten_bit;
+	bool	bottom_field;	/* HI_DRV_FIELD_BOTTOM */
 	bool tile;
 };
 
