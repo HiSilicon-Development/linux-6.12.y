@@ -27,7 +27,8 @@ config VIDEO_HISTB_JPGE
 	help
 	  Support the stand-alone baseline JPEG encoder found in HiSilicon
 	  Hi3798CV200 SoCs. The driver exposes a standard V4L2 memory-to-memory
-	  encoder with NV12 input and JPEG output.
+	  encoder with semi-planar 4:2:0, 4:2:2 and 4:4:4 input, packed 4:2:2
+	  input and JPEG output.
 
 	  To compile this driver as a module, choose M here. The module will be
 	  called histb-jpge.
@@ -68,9 +69,13 @@ config VIDEO_HISTB_VENC
 	help
 	  Support the first-generation VEDU H.264 encoder found in the
 	  HiSilicon Hi3798CV200 SoC. The driver exposes a standard V4L2
-	  memory-to-memory encoder with NV12 input and H.264 output. The
-	  initial public implementation produces Baseline-profile I/P
-	  streams and restores the original CBR-like feedback policy.
+	  memory-to-memory encoder with NV12 input and H.264 output. It
+	  supports Baseline, Main and High profile signalling, CABAC for
+	  Main/High, CBR-style frame feedback, runtime bitrate/QP/GOP/fps
+	  controls, and a top-left encoded crop selected through the capture
+	  format or the output crop selection. CV200's original VENC contract
+	  does not include hardware H.265 or AVS encoding; those formats are
+	  deliberately not advertised here.
 
 	  To compile this driver as a module, choose M here. The module will be
 	  called histb-venc.

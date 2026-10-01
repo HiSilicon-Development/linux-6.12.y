@@ -62,6 +62,17 @@
 #define HISTB_JPGE_PICFG_MEM_CLK_GATE	BIT(16)
 #define HISTB_JPGE_PICFG_PACKAGE	GENMASK(27, 20)
 
+#define HISTB_JPGE_STORE_SEMIPLANAR	0
+#define HISTB_JPGE_STORE_PACKED		2
+
+#define HISTB_JPGE_SAMPLE_420		0
+#define HISTB_JPGE_SAMPLE_422		1
+#define HISTB_JPGE_SAMPLE_444		2
+
+#define HISTB_JPGE_PACKAGE_UYVY		0x8d
+#define HISTB_JPGE_PACKAGE_YUYV		0xd8
+#define HISTB_JPGE_PACKAGE_YVYU		0x78
+
 #define HISTB_JPGE_IMAGE_WIDTH		GENMASK(12, 0)
 #define HISTB_JPGE_IMAGE_HEIGHT		GENMASK(28, 16)
 
@@ -93,6 +104,54 @@ struct histb_jpge_stream_header {
 struct histb_jpge_q_data {
 	struct v4l2_pix_format pix;
 	u32 sequence;
+};
+
+struct histb_jpge_fmt {
+	u32 fourcc;
+	u8 sample;
+	u8 store;
+	u8 package;
+	u8 sof_sampling;
+};
+
+static const struct histb_jpge_fmt histb_jpge_raw_formats[] = {
+	{
+		.fourcc = V4L2_PIX_FMT_NV12,
+		.sample = HISTB_JPGE_SAMPLE_420,
+		.store = HISTB_JPGE_STORE_SEMIPLANAR,
+		.package = HISTB_JPGE_PACKAGE_YUYV,
+		.sof_sampling = 0x22,
+	}, {
+		.fourcc = V4L2_PIX_FMT_NV16,
+		.sample = HISTB_JPGE_SAMPLE_422,
+		.store = HISTB_JPGE_STORE_SEMIPLANAR,
+		.package = HISTB_JPGE_PACKAGE_YUYV,
+		.sof_sampling = 0x21,
+	}, {
+		.fourcc = V4L2_PIX_FMT_NV24,
+		.sample = HISTB_JPGE_SAMPLE_444,
+		.store = HISTB_JPGE_STORE_SEMIPLANAR,
+		.package = HISTB_JPGE_PACKAGE_YUYV,
+		.sof_sampling = 0x11,
+	}, {
+		.fourcc = V4L2_PIX_FMT_YUYV,
+		.sample = HISTB_JPGE_SAMPLE_422,
+		.store = HISTB_JPGE_STORE_PACKED,
+		.package = HISTB_JPGE_PACKAGE_YUYV,
+		.sof_sampling = 0x21,
+	}, {
+		.fourcc = V4L2_PIX_FMT_YVYU,
+		.sample = HISTB_JPGE_SAMPLE_422,
+		.store = HISTB_JPGE_STORE_PACKED,
+		.package = HISTB_JPGE_PACKAGE_YVYU,
+		.sof_sampling = 0x21,
+	}, {
+		.fourcc = V4L2_PIX_FMT_UYVY,
+		.sample = HISTB_JPGE_SAMPLE_422,
+		.store = HISTB_JPGE_STORE_PACKED,
+		.package = HISTB_JPGE_PACKAGE_UYVY,
+		.sof_sampling = 0x21,
+	},
 };
 
 struct histb_jpge_dev;
@@ -154,6 +213,17 @@ histb_jpge_get_q_data(struct histb_jpge_ctx *ctx, enum v4l2_buf_type type)
 		return &ctx->src;
 
 	return &ctx->dst;
+}
+
+static const struct histb_jpge_fmt *histb_jpge_find_format(u32 fourcc)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(histb_jpge_raw_formats); i++)
+		if (histb_jpge_raw_formats[i].fourcc == fourcc)
+			return &histb_jpge_raw_formats[i];
+
+	return NULL;
 }
 
 static void histb_jpge_put_u8(struct histb_jpge_header_writer *writer, u8 value)
@@ -236,6 +306,7 @@ static void histb_jpge_write_dht(struct histb_jpge_header_writer *writer,
 static int histb_jpge_build_header(struct histb_jpge_ctx *ctx, void *buffer)
 {
 	struct histb_jpge_header_writer writer = { .buf = buffer };
+	const struct histb_jpge_fmt *fmt;
 	const u8 *chroma_ac = v4l2_jpeg_ref_table_chroma_ac_ht;
 	const u8 *chroma_dc = v4l2_jpeg_ref_table_chroma_dc_ht;
 	const u8 *luma_ac = v4l2_jpeg_ref_table_luma_ac_ht;
@@ -260,7 +331,11 @@ static int histb_jpge_build_header(struct histb_jpge_ctx *ctx, void *buffer)
 	histb_jpge_write_dqt(&writer, ctx->chroma_qtable, 1);
 	histb_jpge_write_dqt(&writer, ctx->chroma_qtable, 2);
 
-	/* Baseline SOF0, 8-bit YCbCr 4:2:0. */
+	fmt = histb_jpge_find_format(ctx->src.pix.pixelformat);
+	if (!fmt)
+		return -EINVAL;
+
+	/* Baseline SOF0, 8-bit YCbCr with the negotiated subsampling. */
 	histb_jpge_put_marker(&writer, 0xc0);
 	histb_jpge_put_be16(&writer, 17);
 	histb_jpge_put_u8(&writer, 8);
@@ -268,7 +343,7 @@ static int histb_jpge_build_header(struct histb_jpge_ctx *ctx, void *buffer)
 	histb_jpge_put_be16(&writer, ctx->src.pix.width);
 	histb_jpge_put_u8(&writer, 3);
 	histb_jpge_put_u8(&writer, 1);
-	histb_jpge_put_u8(&writer, 0x22);
+	histb_jpge_put_u8(&writer, fmt->sof_sampling);
 	histb_jpge_put_u8(&writer, 0);
 	histb_jpge_put_u8(&writer, 2);
 	histb_jpge_put_u8(&writer, 0x11);
@@ -571,13 +646,14 @@ static void histb_jpge_job_abort(void *priv)
 
 static void histb_jpge_device_run(void *priv)
 {
-
 	struct histb_jpge_ctx *ctx = priv;
 	struct histb_jpge_dev *jpge = ctx->jpge;
+	const struct histb_jpge_fmt *fmt;
 	struct vb2_v4l2_buffer *src, *dst;
-	dma_addr_t src_dma, dst_dma, stream_dma;
+	dma_addr_t src_dma, src_c_dma = 0;
+	dma_addr_t dst_dma, stream_dma;
 	unsigned long flags;
-	unsigned int dst_size, stream_len;
+	unsigned int chroma_stride = 0, dst_size, stream_len;
 	u32 image_size, picfg;
 
 	mutex_lock(&jpge->launch_lock);
@@ -600,12 +676,26 @@ static void histb_jpge_device_run(void *priv)
 	src_dma = vb2_dma_contig_plane_dma_addr(&src->vb2_buf, 0);
 	dst_dma = vb2_dma_contig_plane_dma_addr(&dst->vb2_buf, 0);
 	dst_size = vb2_plane_size(&dst->vb2_buf, 0);
+	fmt = histb_jpge_find_format(ctx->src.pix.pixelformat);
 	if (dst_size <= HISTB_JPGE_STREAM_DATA_OFFSET ||
-	    upper_32_bits(src_dma) || upper_32_bits(dst_dma) ||
+	    !fmt || upper_32_bits(src_dma) || upper_32_bits(dst_dma) ||
 	    !IS_ALIGNED(src_dma, 16)) {
 		histb_jpge_finish_job(ctx, VB2_BUF_STATE_ERROR);
 		mutex_unlock(&jpge->launch_lock);
 		return;
+	}
+
+	if (fmt->store == HISTB_JPGE_STORE_SEMIPLANAR) {
+		src_c_dma = src_dma + ctx->src.pix.bytesperline *
+			    ctx->src.pix.height;
+		chroma_stride = ctx->src.pix.bytesperline;
+		if (fmt->sample == HISTB_JPGE_SAMPLE_444)
+			chroma_stride *= 2;
+		if (upper_32_bits(src_c_dma) || !IS_ALIGNED(src_c_dma, 16)) {
+			histb_jpge_finish_job(ctx, VB2_BUF_STATE_ERROR);
+			mutex_unlock(&jpge->launch_lock);
+			return;
+		}
 	}
 
 	histb_jpge_prepare_qtables(ctx);
@@ -641,11 +731,11 @@ static void histb_jpge_device_run(void *priv)
 	writel(0, jpge->regs + HISTB_JPGE_INTMASK);
 	writel(HISTB_JPGE_INT_ALL, jpge->regs + HISTB_JPGE_INTCLR);
 
-	picfg = FIELD_PREP(HISTB_JPGE_PICFG_STORE, 0) |
-		 FIELD_PREP(HISTB_JPGE_PICFG_SAMPLE, 0) |
+	picfg = FIELD_PREP(HISTB_JPGE_PICFG_STORE, fmt->store) |
+		 FIELD_PREP(HISTB_JPGE_PICFG_SAMPLE, fmt->sample) |
 		 FIELD_PREP(HISTB_JPGE_PICFG_CLK_GATE, 2) |
 		 HISTB_JPGE_PICFG_MEM_CLK_GATE |
-		 FIELD_PREP(HISTB_JPGE_PICFG_PACKAGE, 0xd8);
+		 FIELD_PREP(HISTB_JPGE_PICFG_PACKAGE, fmt->package);
 	writel_relaxed(picfg, jpge->regs + HISTB_JPGE_PICFG);
 	writel_relaxed(0, jpge->regs + HISTB_JPGE_ECSCFG);
 	image_size = FIELD_PREP(HISTB_JPGE_IMAGE_WIDTH,
@@ -654,11 +744,10 @@ static void histb_jpge_device_run(void *priv)
 				ctx->src.pix.height - 1);
 	writel_relaxed(image_size, jpge->regs + HISTB_JPGE_IMAGE_SIZE);
 	writel_relaxed(src_dma, jpge->regs + HISTB_JPGE_SRC_Y);
-	writel_relaxed(src_dma + ctx->src.pix.bytesperline *
-			 ctx->src.pix.height, jpge->regs + HISTB_JPGE_SRC_C);
+	writel_relaxed(src_c_dma, jpge->regs + HISTB_JPGE_SRC_C);
 	writel_relaxed(0, jpge->regs + HISTB_JPGE_SRC_V);
 	writel_relaxed(ctx->src.pix.bytesperline |
-			 ctx->src.pix.bytesperline << 16,
+			 chroma_stride << 16,
 			 jpge->regs + HISTB_JPGE_SRC_STRIDE);
 	writel_relaxed(stream_dma, jpge->regs + HISTB_JPGE_STREAM_ADDR);
 	writel_relaxed(stream_dma - 16, jpge->regs + HISTB_JPGE_STREAM_RPTR);
@@ -692,7 +781,6 @@ static int histb_jpge_queue_setup(struct vb2_queue *vq,
 				  unsigned int sizes[],
 				  struct device *alloc_devs[])
 {
-
 	struct histb_jpge_ctx *ctx = vb2_get_drv_priv(vq);
 	struct histb_jpge_q_data *q_data =
 		histb_jpge_get_q_data(ctx, vq->type);
@@ -708,7 +796,6 @@ static int histb_jpge_queue_setup(struct vb2_queue *vq,
 
 static int histb_jpge_buf_prepare(struct vb2_buffer *vb)
 {
-
 	struct histb_jpge_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
 	struct histb_jpge_q_data *q_data =
 		histb_jpge_get_q_data(ctx, vb->vb2_queue->type);
@@ -739,7 +826,6 @@ static void histb_jpge_buf_queue(struct vb2_buffer *vb)
 static int histb_jpge_start_streaming(struct vb2_queue *vq,
 				      unsigned int count)
 {
-
 	struct histb_jpge_ctx *ctx = vb2_get_drv_priv(vq);
 	struct histb_jpge_q_data *q_data =
 		histb_jpge_get_q_data(ctx, vq->type);
@@ -843,9 +929,9 @@ static int histb_jpge_enum_fmt(struct file *file, void *priv,
 			       struct v4l2_fmtdesc *f)
 {
 	if (V4L2_TYPE_IS_OUTPUT(f->type)) {
-		if (f->index)
+		if (f->index >= ARRAY_SIZE(histb_jpge_raw_formats))
 			return -EINVAL;
-		f->pixelformat = V4L2_PIX_FMT_NV12;
+		f->pixelformat = histb_jpge_raw_formats[f->index].fourcc;
 	} else {
 		if (f->index > 1)
 			return -EINVAL;
@@ -860,7 +946,7 @@ static int histb_jpge_enum_framesizes(struct file *file, void *priv,
 				      struct v4l2_frmsizeenum *fsize)
 {
 	if (fsize->index ||
-	    (fsize->pixel_format != V4L2_PIX_FMT_NV12 &&
+	    (!histb_jpge_find_format(fsize->pixel_format) &&
 	     fsize->pixel_format != V4L2_PIX_FMT_JPEG &&
 	     fsize->pixel_format != V4L2_PIX_FMT_MJPEG))
 		return -EINVAL;
@@ -878,22 +964,43 @@ static int histb_jpge_enum_framesizes(struct file *file, void *priv,
 
 static void histb_jpge_try_raw_format(struct v4l2_pix_format *pix)
 {
+	const struct histb_jpge_fmt *fmt;
 	const u32 min = HISTB_JPGE_MIN_DIMENSION;
 	const u32 max = HISTB_JPGE_MAX_DIMENSION;
 	u32 width = pix->width;
 	u32 height = pix->height;
-	u32 bytesperline;
+	u32 bytesperline, max_bytesperline, min_bytesperline;
+	u32 sizeimage;
+
+	fmt = histb_jpge_find_format(pix->pixelformat);
+	if (!fmt)
+		fmt = &histb_jpge_raw_formats[0];
 
 	v4l_bound_align_image(&width, min, max, 4, &height, min, max, 1, 0);
-	bytesperline = clamp_t(u32, pix->bytesperline, width, U16_MAX & ~15);
+	min_bytesperline = width;
+	if (fmt->store == HISTB_JPGE_STORE_PACKED)
+		min_bytesperline *= 2;
+	max_bytesperline = U16_MAX & ~15;
+	if (fmt->sample == HISTB_JPGE_SAMPLE_444)
+		max_bytesperline = (U16_MAX / 2) & ~15;
+	bytesperline = clamp_t(u32, pix->bytesperline, min_bytesperline, max_bytesperline);
 	bytesperline = ALIGN(bytesperline, 16);
+
+	if (fmt->store == HISTB_JPGE_STORE_PACKED)
+		sizeimage = bytesperline * height;
+	else if (fmt->sample == HISTB_JPGE_SAMPLE_420)
+		sizeimage = bytesperline * height * 3 / 2;
+	else if (fmt->sample == HISTB_JPGE_SAMPLE_422)
+		sizeimage = bytesperline * height * 2;
+	else
+		sizeimage = bytesperline * height * 3;
 
 	pix->width = width;
 	pix->height = height;
-	pix->pixelformat = V4L2_PIX_FMT_NV12;
+	pix->pixelformat = fmt->fourcc;
 	pix->field = V4L2_FIELD_NONE;
 	pix->bytesperline = bytesperline;
-	pix->sizeimage = bytesperline * height * 3 / 2;
+	pix->sizeimage = sizeimage;
 	pix->colorspace = V4L2_COLORSPACE_REC709;
 	pix->ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
 	pix->quantization = V4L2_QUANTIZATION_LIM_RANGE;

@@ -166,7 +166,8 @@
 #define HISTB_VENC_DEFAULT_MAX_QP	50
 #define HISTB_VENC_MIN_BITRATE		(32 * 1024)
 #define HISTB_VENC_MAX_BITRATE		(50 * 1024 * 1024)
-#define HISTB_VENC_CORE_RATE		200000000UL
+#define HISTB_VENC_CORE_RATE		270000000UL
+#define HISTB_VENC_HW_TIMEOUT_CYCLES	20000000U
 #define HISTB_VENC_STREAM_META_SIZE	256
 #define HISTB_VENC_STREAM_DESC_SIZE	64
 #define HISTB_VENC_STREAM_ALIGN		64
@@ -227,6 +228,8 @@ struct histb_venc_ctx {
 	bool force_idr;
 	bool curr_intra;
 	bool job_aborting;
+	/* The raw queue has been negotiated; capture must follow its crop. */
+	bool src_fmt_set;
 };
 
 struct histb_venc_dev {
@@ -353,46 +356,82 @@ static int histb_venc_finish_nal(struct histb_venc_bit_writer *writer)
 	return writer->overflow ? -ENOSPC : DIV_ROUND_UP(writer->bitpos, 8);
 }
 
-static u8 histb_venc_level_idc(unsigned int width, unsigned int height)
+static u8 histb_venc_level_idc(const struct histb_venc_ctx *ctx)
 {
-	unsigned int macroblocks = DIV_ROUND_UP(width, 16) *
-				   DIV_ROUND_UP(height, 16);
+	unsigned int macroblocks = DIV_ROUND_UP(ctx->crop.width, 16) *
+				   DIV_ROUND_UP(ctx->crop.height, 16);
+	u64 macroblocks_per_second = (u64)macroblocks *
+				     ctx->timeperframe.denominator /
+				     ctx->timeperframe.numerator;
 
-	if (macroblocks <= 99)
+	if (macroblocks <= 99 && macroblocks_per_second <= 1485)
 		return 10;
-	if (macroblocks <= 396)
-		return 20;
-	if (macroblocks <= 792)
+	if (macroblocks <= 396 && macroblocks_per_second <= 3000)
+		return 11;
+	if (macroblocks <= 396 && macroblocks_per_second <= 6000)
+		return 12;
+	if (macroblocks <= 396 && macroblocks_per_second <= 11880)
+		return 13;
+	if (macroblocks <= 792 && macroblocks_per_second <= 19800)
 		return 21;
-	if (macroblocks <= 1620)
+	if (macroblocks <= 1620 && macroblocks_per_second <= 20250)
+		return 22;
+	if (macroblocks <= 1620 && macroblocks_per_second <= 40500)
 		return 30;
-	if (macroblocks <= 3600)
+	if (macroblocks <= 3600 && macroblocks_per_second <= 108000)
 		return 31;
-	if (macroblocks <= 5120)
+	if (macroblocks <= 5120 && macroblocks_per_second <= 216000)
 		return 32;
+	if (macroblocks <= 8192 && macroblocks_per_second <= 245760)
+		return 41;
 
-	return 41;
+	return 42;
+}
+
+static u8 histb_venc_h264_profile_idc(const struct histb_venc_ctx *ctx)
+{
+	switch (ctx->profile) {
+	case V4L2_MPEG_VIDEO_H264_PROFILE_MAIN:
+		return 77;
+	case V4L2_MPEG_VIDEO_H264_PROFILE_HIGH:
+		return 100;
+	case V4L2_MPEG_VIDEO_H264_PROFILE_BASELINE:
+	default:
+		return 66;
+	}
+}
+
+static bool histb_venc_h264_cabac(const struct histb_venc_ctx *ctx)
+{
+	return ctx->profile != V4L2_MPEG_VIDEO_H264_PROFILE_BASELINE;
 }
 
 static int histb_venc_build_sps(struct histb_venc_ctx *ctx, u8 *data,
 				unsigned int size)
 {
 	struct histb_venc_bit_writer writer = { .data = data, .size = size };
-	unsigned int width_mb = DIV_ROUND_UP(ctx->src.pix.width, 16);
-	unsigned int height_mb = DIV_ROUND_UP(ctx->src.pix.height, 16);
+	unsigned int width_mb = DIV_ROUND_UP(ctx->crop.width, 16);
+	unsigned int height_mb = DIV_ROUND_UP(ctx->crop.height, 16);
 	unsigned int crop_right = (width_mb * 16 - ctx->crop.width) / 2;
 	unsigned int crop_bottom = (height_mb * 16 - ctx->crop.height) / 2;
+	u8 profile_idc = histb_venc_h264_profile_idc(ctx);
 	bool cropped = crop_right || crop_bottom;
 
 	memset(data, 0, size);
 	histb_venc_put_bits(&writer, 1, 32);
 	histb_venc_put_bits(&writer, 0x67, 8);
-	histb_venc_put_bits(&writer, 66, 8);
+	histb_venc_put_bits(&writer, profile_idc, 8);
 	histb_venc_put_bits(&writer, 0, 8);
-	histb_venc_put_bits(&writer,
-			    histb_venc_level_idc(ctx->src.pix.width,
-						 ctx->src.pix.height), 8);
+	histb_venc_put_bits(&writer, histb_venc_level_idc(ctx), 8);
 	histb_venc_put_ue(&writer, 0);
+	if (profile_idc >= 100) {
+		/* CV200 uses 4:2:0 8-bit video and no scaling matrix. */
+		histb_venc_put_ue(&writer, 1); /* chroma_format_idc */
+		histb_venc_put_ue(&writer, 0); /* bit_depth_luma_minus8 */
+		histb_venc_put_ue(&writer, 0); /* bit_depth_chroma_minus8 */
+		histb_venc_put_bits(&writer, 0, 1); /* qpprime_y_zero_transform_bypass */
+		histb_venc_put_bits(&writer, 0, 1); /* seq_scaling_matrix_present */
+	}
 	histb_venc_put_ue(&writer, 0);
 	histb_venc_put_ue(&writer, 2);
 	histb_venc_put_ue(&writer, 1);
@@ -408,12 +447,31 @@ static int histb_venc_build_sps(struct histb_venc_ctx *ctx, u8 *data,
 		histb_venc_put_ue(&writer, 0);
 		histb_venc_put_ue(&writer, crop_bottom);
 	}
-	histb_venc_put_bits(&writer, 0, 1);
+	/*
+	 * VUI timing is required for raw H.264 consumers to recover the
+	 * negotiated frame rate.  H.264 defines frame_rate as time_scale /
+	 * (2 * num_units_in_tick) for progressive fixed-rate video.
+	 */
+	histb_venc_put_bits(&writer, 1, 1); /* vui_parameters_present_flag */
+	histb_venc_put_bits(&writer, 0, 1); /* aspect_ratio_info_present */
+	histb_venc_put_bits(&writer, 0, 1); /* overscan_info_present */
+	histb_venc_put_bits(&writer, 0, 1); /* video_signal_type_present */
+	histb_venc_put_bits(&writer, 0, 1); /* chroma_loc_info_present */
+	histb_venc_put_bits(&writer, 1, 1); /* timing_info_present */
+	histb_venc_put_bits(&writer, ctx->timeperframe.numerator, 32);
+	histb_venc_put_bits(&writer,
+			    2 * ctx->timeperframe.denominator, 32);
+	histb_venc_put_bits(&writer, 1, 1); /* fixed_frame_rate_flag */
+	histb_venc_put_bits(&writer, 0, 1); /* nal_hrd_parameters_present */
+	histb_venc_put_bits(&writer, 0, 1); /* vcl_hrd_parameters_present */
+	histb_venc_put_bits(&writer, 0, 1); /* pic_struct_present_flag */
+	histb_venc_put_bits(&writer, 0, 1); /* bitstream_restriction_flag */
 
 	return histb_venc_finish_nal(&writer);
 }
 
-static int histb_venc_build_pps(u8 *data, unsigned int size)
+static int histb_venc_build_pps(const struct histb_venc_ctx *ctx, u8 *data,
+				unsigned int size)
 {
 	struct histb_venc_bit_writer writer = { .data = data, .size = size };
 
@@ -422,7 +480,7 @@ static int histb_venc_build_pps(u8 *data, unsigned int size)
 	histb_venc_put_bits(&writer, 0x68, 8);
 	histb_venc_put_ue(&writer, 0);
 	histb_venc_put_ue(&writer, 0);
-	histb_venc_put_bits(&writer, 0, 1);
+	histb_venc_put_bits(&writer, histb_venc_h264_cabac(ctx), 1);
 	histb_venc_put_bits(&writer, 0, 1);
 	histb_venc_put_ue(&writer, 0);
 	histb_venc_put_ue(&writer, 0);
@@ -435,6 +493,15 @@ static int histb_venc_build_pps(u8 *data, unsigned int size)
 	histb_venc_put_bits(&writer, 1, 1);
 	histb_venc_put_bits(&writer, 0, 1);
 	histb_venc_put_bits(&writer, 0, 1);
+	if (ctx->profile == V4L2_MPEG_VIDEO_H264_PROFILE_HIGH) {
+		/*
+		 * High profile PPS extension; CV200 uses 4x4 transforms and
+		 * the default scaling matrices.
+		 */
+		histb_venc_put_bits(&writer, 0, 1); /* transform_8x8_mode_flag */
+		histb_venc_put_bits(&writer, 0, 1); /* pic_scaling_matrix_present */
+		histb_venc_put_se(&writer, 0); /* second_chroma_qp_index_offset */
+	}
 
 	return histb_venc_finish_nal(&writer);
 }
@@ -582,8 +649,8 @@ static int histb_venc_configure_rc(struct histb_venc_ctx *ctx)
 		.fps_num = ctx->timeperframe.denominator,
 		.fps_den = ctx->timeperframe.numerator,
 		.gop_size = ctx->gop_size,
-		.width = ctx->src.pix.width,
-		.height = ctx->src.pix.height,
+		.width = ctx->crop.width,
+		.height = ctx->crop.height,
 		.min_qp = ctx->min_qp,
 		.max_qp = ctx->max_qp,
 	};
@@ -681,7 +748,7 @@ static int histb_venc_collect_stream(struct histb_venc_ctx *ctx,
 	payload = packet_len - HISTB_VENC_STREAM_DESC_SIZE - invalid;
 	if (intra) {
 		sps_len = histb_venc_build_sps(ctx, sps, sizeof(sps));
-		pps_len = histb_venc_build_pps(pps, sizeof(pps));
+		pps_len = histb_venc_build_pps(ctx, pps, sizeof(pps));
 		if (sps_len < 0 || pps_len < 0)
 			return -EINVAL;
 		prefix = sps_len + pps_len;
@@ -917,8 +984,10 @@ static void histb_venc_program_frame(struct histb_venc_ctx *ctx,
 				     u64 timestamp)
 {
 	struct histb_venc_dev *venc = ctx->venc;
-	unsigned int width = ctx->src.pix.width;
-	unsigned int height = ctx->src.pix.height;
+	unsigned int width = ctx->crop.width;
+	unsigned int height = ctx->crop.height;
+	unsigned int src_height = ctx->src.pix.height;
+	unsigned int recon_height = ALIGN(ctx->src.pix.height, 16);
 	unsigned int stride = ctx->src.pix.bytesperline;
 	unsigned int stream_len = (dst_size - HISTB_VENC_STREAM_META_SIZE) &
 				  ~(HISTB_VENC_STREAM_ALIGN - 1);
@@ -928,7 +997,7 @@ static void histb_venc_program_frame(struct histb_venc_ctx *ctx,
 	dma_addr_t reference = ctx->recon_dma +
 			       !recon_index * ctx->recon_frame_size;
 	u32 slice_header[8], slice_param, me_h, me_v;
-	u32 mode, qp, value;
+	u32 mode, ptbits, qp, value;
 	bool intra = ctx->curr_intra;
 	unsigned int i;
 
@@ -941,6 +1010,8 @@ static void histb_venc_program_frame(struct histb_venc_ctx *ctx,
 	writel_relaxed(mode, venc->regs + HISTB_VENC_MODE);
 	writel_relaxed(HISTB_VENC_PICFG0_PTBITS_ENABLE |
 			 (intra ? HISTB_VENC_PICFG0_I_PICTURE : 0) |
+			 (histb_venc_h264_cabac(ctx) ?
+			  HISTB_VENC_PICFG0_ENTROPY_CABAC : 0) |
 			 FIELD_PREP(HISTB_VENC_PICFG0_TRANSFORM, 1) |
 			 FIELD_PREP(HISTB_VENC_PICFG0_NAL_REF_IDC, 3),
 			 venc->regs + HISTB_VENC_PICFG0);
@@ -962,7 +1033,9 @@ static void histb_venc_program_frame(struct histb_venc_ctx *ctx,
 	writel_relaxed(FIELD_PREP(HISTB_VENC_IMAGE_WIDTH, width - 1) |
 			 FIELD_PREP(HISTB_VENC_IMAGE_HEIGHT, height - 1),
 			 venc->regs + HISTB_VENC_IMAGE_SIZE);
-	writel_relaxed(4000000, venc->regs + HISTB_VENC_PTBITS);
+	/* Limit the picture to the negotiated capture buffer, not 500 KiB. */
+	ptbits = (stream_len - HISTB_VENC_STREAM_DESC_SIZE) * 8;
+	writel_relaxed(ptbits, venc->regs + HISTB_VENC_PTBITS);
 
 	slice_param = histb_venc_build_slice_header(ctx, slice_header, intra);
 	for (i = 0; i < ARRAY_SIZE(slice_header); i++)
@@ -973,21 +1046,28 @@ static void histb_venc_program_frame(struct histb_venc_ctx *ctx,
 	writel_relaxed(upper_32_bits(timestamp), venc->regs + HISTB_VENC_PTS1);
 	writel_relaxed(0, venc->regs + HISTB_VENC_PTS2);
 	writel_relaxed(0, venc->regs + HISTB_VENC_PTS3);
-	writel_relaxed(10000000, venc->regs + HISTB_VENC_TIMEOUT);
-	writel_relaxed(FIELD_PREP(HISTB_VENC_OUTSTANDING_WRITE, 1) |
-			 FIELD_PREP(HISTB_VENC_OUTSTANDING_READ, 1),
-			 venc->regs + HISTB_VENC_OUTSTANDING);
+	/* 20M cycles leaves about 74 ms at the 270 MHz CV200 core rate. */
+	writel_relaxed(HISTB_VENC_HW_TIMEOUT_CYCLES,
+		       venc->regs + HISTB_VENC_TIMEOUT);
+	if (ctx->timeperframe.denominator >
+	    30 * ctx->timeperframe.numerator)
+		value = FIELD_PREP(HISTB_VENC_OUTSTANDING_WRITE, 3) |
+			FIELD_PREP(HISTB_VENC_OUTSTANDING_READ, 4);
+	else
+		value = FIELD_PREP(HISTB_VENC_OUTSTANDING_WRITE, 1) |
+			FIELD_PREP(HISTB_VENC_OUTSTANDING_READ, 1);
+	writel_relaxed(value, venc->regs + HISTB_VENC_OUTSTANDING);
 
 	writel_relaxed(lower_32_bits(src_dma), venc->regs + HISTB_VENC_SRC_Y);
-	writel_relaxed(lower_32_bits(src_dma + stride * height),
-		       venc->regs + HISTB_VENC_SRC_C);
+	writel_relaxed(lower_32_bits(src_dma + stride * src_height),
+			       venc->regs + HISTB_VENC_SRC_C);
 	writel_relaxed(0, venc->regs + HISTB_VENC_SRC_V);
 	writel_relaxed(lower_32_bits(recon), venc->regs + HISTB_VENC_RECON_Y);
-	writel_relaxed(lower_32_bits(recon + stride * height),
-		       venc->regs + HISTB_VENC_RECON_C);
+	writel_relaxed(lower_32_bits(recon + stride * recon_height),
+			       venc->regs + HISTB_VENC_RECON_C);
 	writel_relaxed(lower_32_bits(reference), venc->regs + HISTB_VENC_REF_Y);
-	writel_relaxed(lower_32_bits(reference + stride * height),
-		       venc->regs + HISTB_VENC_REF_C);
+	writel_relaxed(lower_32_bits(reference + stride * recon_height),
+			       venc->regs + HISTB_VENC_REF_C);
 	writel_relaxed(stride | stride << 16,
 		       venc->regs + HISTB_VENC_SRC_STRIDE);
 	writel_relaxed(stride | stride << 16,
@@ -1174,7 +1254,7 @@ static int histb_venc_alloc_recon(struct histb_venc_ctx *ctx)
 {
 	struct histb_venc_dev *venc = ctx->venc;
 	size_t frame_size = ctx->src.pix.bytesperline *
-			    ctx->src.pix.height * 3 / 2;
+				    ALIGN(ctx->src.pix.height, 16) * 3 / 2;
 	size_t size = ALIGN(frame_size, HISTB_VENC_STREAM_ALIGN) * 2;
 
 	frame_size = ALIGN(frame_size, HISTB_VENC_STREAM_ALIGN);
@@ -1420,7 +1500,7 @@ static int histb_venc_enum_framesizes(struct file *file, void *priv,
 	fsize->stepwise.step_width = 16;
 	fsize->stepwise.min_height = HISTB_VENC_MIN_HEIGHT;
 	fsize->stepwise.max_height = HISTB_VENC_MAX_HEIGHT;
-	fsize->stepwise.step_height = 16;
+	fsize->stepwise.step_height = 2;
 
 	return 0;
 }
@@ -1432,9 +1512,9 @@ static void histb_venc_try_raw_format(struct v4l2_pix_format *pix)
 	u32 bytesperline;
 
 	v4l_bound_align_image(&width, HISTB_VENC_MIN_WIDTH,
-			      HISTB_VENC_MAX_WIDTH, 4,
-			      &height, HISTB_VENC_MIN_HEIGHT,
-			      HISTB_VENC_MAX_HEIGHT, 4, 0);
+				      HISTB_VENC_MAX_WIDTH, 4,
+				      &height, HISTB_VENC_MIN_HEIGHT,
+				      HISTB_VENC_MAX_HEIGHT, 1, 0);
 	bytesperline = clamp_t(u32, pix->bytesperline, width,
 			       HISTB_VENC_MAX_STRIDE);
 	bytesperline = ALIGN(bytesperline, 16);
@@ -1454,14 +1534,16 @@ static void histb_venc_try_raw_format(struct v4l2_pix_format *pix)
 static void histb_venc_try_h264_format(struct histb_venc_ctx *ctx,
 				       struct v4l2_pix_format *pix)
 {
+	u32 width = ctx->crop.width ? ctx->crop.width : ctx->src.pix.width;
+	u32 height = ctx->crop.height ? ctx->crop.height : ctx->src.pix.height;
 	u32 min_size = max_t(u32,
-			     ALIGN(ctx->src.pix.width * ctx->src.pix.height +
+			     ALIGN(width * height +
 				   HISTB_VENC_STREAM_META_SIZE,
 				   HISTB_VENC_STREAM_ALIGN),
 			     HISTB_VENC_STREAM_MIN_SIZE);
 
-	pix->width = ctx->src.pix.width;
-	pix->height = ctx->src.pix.height;
+	pix->width = width;
+	pix->height = height;
 	pix->pixelformat = V4L2_PIX_FMT_H264;
 	pix->field = V4L2_FIELD_NONE;
 	pix->bytesperline = 0;
@@ -1497,12 +1579,14 @@ static int histb_venc_g_fmt(struct file *file, void *priv,
 }
 
 static int histb_venc_s_fmt(struct file *file, void *priv,
-			    struct v4l2_format *f)
+				    struct v4l2_format *f)
 {
 	struct histb_venc_ctx *ctx = priv;
 	struct vb2_queue *vq;
 	u32 visible_width = f->fmt.pix.width;
 	u32 visible_height = f->fmt.pix.height;
+	u32 width;
+	u32 height;
 	int ret;
 
 	ret = histb_venc_try_fmt(file, priv, f);
@@ -1516,8 +1600,6 @@ static int histb_venc_s_fmt(struct file *file, void *priv,
 	histb_venc_get_q_data(ctx, f->type)->pix = f->fmt.pix;
 	if (V4L2_TYPE_IS_OUTPUT(f->type)) {
 		struct v4l2_pix_format dst = ctx->dst.pix;
-		u32 width;
-		u32 height;
 
 		width = clamp_t(u32, ALIGN(visible_width, 2),
 				HISTB_VENC_MIN_WIDTH, ctx->src.pix.width);
@@ -1531,12 +1613,41 @@ static int histb_venc_s_fmt(struct file *file, void *priv,
 		ctx->crop.top = 0;
 		ctx->crop.width = width;
 		ctx->crop.height = height;
+		ctx->src_fmt_set = true;
 		ctx->rc_initialized = false;
 		ctx->rc_dirty = true;
 		ctx->force_idr = true;
 
 		histb_venc_try_h264_format(ctx, &dst);
 		ctx->dst.pix = dst;
+	} else {
+		/* The capture format is the encoded picture size. */
+		/*
+		 * FFmpeg may first TRY_FMT the capture queue with its generic
+		 * 1280x720 default and then set the raw queue to the real input
+		 * size.  CV200 VENC has no capture-side scaler, so accepting that
+		 * stale default would program a 1280x720 SPS while consuming a
+		 * 1920x1080 frame.  Once the raw queue is set, follow the crop
+		 * selected from that queue instead of the stale capture request.
+		 */
+		if (ctx->src_fmt_set) {
+			width = ctx->crop.width;
+			height = ctx->crop.height;
+		} else {
+			width = clamp_t(u32, ALIGN(visible_width, 4),
+					HISTB_VENC_MIN_WIDTH, HISTB_VENC_MAX_WIDTH);
+			height = clamp_t(u32, ALIGN(visible_height, 4),
+					HISTB_VENC_MIN_HEIGHT, HISTB_VENC_MAX_HEIGHT);
+		}
+		ctx->crop.left = 0;
+		ctx->crop.top = 0;
+		ctx->crop.width = width;
+		ctx->crop.height = height;
+		ctx->rc_initialized = false;
+		ctx->rc_dirty = true;
+		ctx->force_idr = true;
+		histb_venc_try_h264_format(ctx, &ctx->dst.pix);
+		f->fmt.pix = ctx->dst.pix;
 	}
 
 	return 0;
@@ -1585,19 +1696,26 @@ static int histb_venc_s_selection(struct file *file, void *priv,
 	if (vb2_is_busy(vq))
 		return -EBUSY;
 
-	width = ALIGN(selection->r.width, 2);
-	height = ALIGN(selection->r.height, 2);
+	width = ALIGN(selection->r.width, 4);
+	height = ALIGN(selection->r.height, 4);
 	if (selection->r.left || selection->r.top ||
 	    width < HISTB_VENC_MIN_WIDTH || height < HISTB_VENC_MIN_HEIGHT ||
-	    width > ctx->src.pix.width || height > ctx->src.pix.height ||
-	    ALIGN(width, 16) != ctx->src.pix.width ||
-	    ALIGN(height, 16) != ctx->src.pix.height)
+	    width > ctx->src.pix.width || height > ctx->src.pix.height)
 		return -EINVAL;
 
 	ctx->crop.left = 0;
 	ctx->crop.top = 0;
 	ctx->crop.width = width;
 	ctx->crop.height = height;
+	ctx->dst.pix.width = width;
+	ctx->dst.pix.height = height;
+	ctx->dst.pix.sizeimage = clamp_t(u32,
+			ALIGN(width * height + HISTB_VENC_STREAM_META_SIZE,
+			      HISTB_VENC_STREAM_ALIGN),
+			HISTB_VENC_STREAM_MIN_SIZE, HISTB_VENC_STREAM_MAX_SIZE);
+	ctx->rc_initialized = false;
+	ctx->rc_dirty = true;
+	ctx->force_idr = true;
 	selection->r = ctx->crop;
 
 	return 0;
@@ -1701,10 +1819,13 @@ static int histb_venc_s_ctrl(struct v4l2_ctrl *ctrl)
 		break;
 	case V4L2_CID_MPEG_VIDEO_BITRATE:
 		ctx->bitrate = ctrl->val;
+		ctx->rc_dirty = true;
 		break;
 	case V4L2_CID_MPEG_VIDEO_H264_PROFILE:
 		ctx->profile = ctrl->val;
 		ctx->rc_dirty = true;
+		/* SPS/PPS and CABAC mode must change on an IDR boundary. */
+		ctx->force_idr = true;
 		break;
 	case V4L2_CID_MPEG_VIDEO_FRAME_RC_ENABLE:
 		if (ctx->rc_job_pending)
@@ -1803,10 +1924,12 @@ static int histb_venc_open(struct file *file)
 			       V4L2_MPEG_VIDEO_BITRATE_MODE_CBR);
 	v4l2_ctrl_new_std(&ctx->ctrl_handler, &histb_venc_ctrl_ops,
 			  V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME, 0, 0, 0, 0);
-	v4l2_ctrl_new_std_menu(&ctx->ctrl_handler, NULL,
+	v4l2_ctrl_new_std_menu(&ctx->ctrl_handler, &histb_venc_ctrl_ops,
 			       V4L2_CID_MPEG_VIDEO_H264_PROFILE,
-			       V4L2_MPEG_VIDEO_H264_PROFILE_BASELINE,
-			       0, V4L2_MPEG_VIDEO_H264_PROFILE_BASELINE);
+			       V4L2_MPEG_VIDEO_H264_PROFILE_HIGH,
+			       BIT(V4L2_MPEG_VIDEO_H264_PROFILE_CONSTRAINED_BASELINE) |
+			       BIT(V4L2_MPEG_VIDEO_H264_PROFILE_EXTENDED),
+			       V4L2_MPEG_VIDEO_H264_PROFILE_HIGH);
 	ctrl = v4l2_ctrl_new_std(&ctx->ctrl_handler, NULL,
 				 V4L2_CID_MPEG_VIDEO_PREPEND_SPSPPS_TO_IDR,
 				 0, 1, 1, 1);
