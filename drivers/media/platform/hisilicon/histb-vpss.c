@@ -48,6 +48,46 @@
 #define HISTB_VPSS_ZME_CV_COEF_ADDR	0x20c
 #define HISTB_VPSS_RCH_BYPASS		0x280
 #define HISTB_VPSS_WCH_BYPASS		0x284
+/* De-interlacer field registers, in groups of four: control, Y, C, stride. */
+#define HISTB_VPSS_DEI_CUR_CTRL		0x100
+#define HISTB_VPSS_DEI_CURYADDR		0x104
+#define HISTB_VPSS_DEI_CURCADDR		0x108
+#define HISTB_VPSS_DEI_CURSTRIDE	0x10c
+#define HISTB_VPSS_DEI_REF_CTRL		0x110
+#define HISTB_VPSS_DEI_REFYADDR		0x114
+#define HISTB_VPSS_DEI_REFCADDR		0x118
+#define HISTB_VPSS_DEI_REFSTRIDE	0x11c
+#define HISTB_VPSS_DEI_NXT1_CTRL	0x120
+#define HISTB_VPSS_DEI_NXT1YADDR	0x124
+#define HISTB_VPSS_DEI_NXT1CADDR	0x128
+#define HISTB_VPSS_DEI_NXT1STRIDE	0x12c
+#define HISTB_VPSS_DEI_NXT2_CTRL	0x130
+#define HISTB_VPSS_DEI_NXT2YADDR	0x134
+#define HISTB_VPSS_DEI_NXT2CADDR	0x138
+#define HISTB_VPSS_DEI_NXT2STRIDE	0x13c
+#define HISTB_VPSS_DEI_ADDR		0x258
+#define HISTB_VPSS_DIECTRL		0x1000
+
+/* VPSS_CTRL */
+#define HISTB_VPSS_CTRL_DEI_EN		BIT(7)
+#define HISTB_VPSS_CTRL_MCDI_EN		BIT(8)
+#define HISTB_VPSS_CTRL_MEDS_EN		BIT(9)
+#define HISTB_VPSS_CTRL_IFMD_EN		BIT(25)
+#define HISTB_VPSS_CTRL_BFIELD_FIRST	BIT(29)
+#define HISTB_VPSS_CTRL_BFIELD_MODE	BIT(30)
+
+/* VPSS_DIECTRL */
+#define HISTB_VPSS_DIE_EDGE_SMOOTH_EN	BIT(20)
+#define HISTB_VPSS_DIE_L_MODE		GENMASK(27, 26)
+#define HISTB_VPSS_DIE_C_MODE		GENMASK(25, 24)
+
+/* Field control: bit for "this field is in the decoder's tile format". */
+#define HISTB_VPSS_DEI_TILE_FORMAT	BIT(0)
+
+/* The BSP bypasses the de-interlacer above these (vpss_in_3798cv200.c). */
+#define HISTB_VPSS_DEI_MAX_WIDTH	1920
+#define HISTB_VPSS_DEI_MAX_HEIGHT	1088
+
 #define HISTB_VPSS_ZME_ADDR		0x240
 #define HISTB_VPSS_NEXT			0x2fc
 #define HISTB_VPSS_START		0x300
@@ -487,6 +527,120 @@ static void histb_vpss_build_node(struct histb_vpss *vpss,
 	histb_vpss_node_write(vpss, HISTB_VPSS_NEXT, 0);
 	histb_vpss_node_write(vpss, HISTB_VPSS_MISC,
 			      HISTB_VPSS_MISC_DEFAULT);
+}
+
+static void histb_vpss_dei_field(struct histb_vpss *vpss, u32 ctrl_off,
+				 u32 y_off, u32 c_off, u32 stride_off,
+				 const struct histb_vpss_dei_frame *frame,
+				 dma_addr_t dma, u32 stride)
+{
+	writel(frame->tile ? HISTB_VPSS_DEI_TILE_FORMAT : 0,
+	       vpss->regs + ctrl_off);
+	writel(lower_32_bits(dma), vpss->regs + y_off);
+	writel(lower_32_bits(dma + stride * frame->height),
+	       vpss->regs + c_off);
+	writel(stride | stride << 16, vpss->regs + stride_off);
+}
+
+/*
+ * Hardware de-interlace: four consecutive fields in, one progressive frame
+ * out.  The block lives in the VPSS at DIECTRL (0x1000) and is switched on
+ * with VPSS_CTRL bit 7; it shares the input field registers with the ZME
+ * path this driver already uses, which is why it cannot run as an
+ * independent node at the same time as a scaler job.
+ *
+ * Thresholds are left at the block's own defaults.  The vendor tuning values
+ * live in a binary PQ table (PQ_HAL_SetDeiRegist reads a DEI_PARAMETER_S
+ * filled from PQ_FILE_HEADER_S), so there is no compiled-in set to copy;
+ * only edge smoothing is enabled explicitly, as the BSP does.
+ */
+int histb_vpss_dei(struct histb_vpss *vpss,
+		   const struct histb_vpss_dei_frame *frame,
+		   dma_addr_t output_dma)
+{
+	u32 stride = frame ? frame->stride : 0;
+	u32 ctrl;
+	unsigned long timeout;
+	int ret;
+
+	if (!vpss || !frame || !frame->width || !frame->height || !stride)
+		return -EINVAL;
+	if (frame->width > HISTB_VPSS_DEI_MAX_WIDTH ||
+	    frame->height * 2 > HISTB_VPSS_DEI_MAX_HEIGHT)
+		return -EINVAL;
+	if (stride & 15 || stride < frame->width * (frame->ten_bit ? 2 : 1))
+		return -EINVAL;
+	if (!frame->ref_dma || !frame->cur_dma || !frame->nxt1_dma ||
+	    !frame->nxt2_dma || !output_dma)
+		return -EINVAL;
+	if (upper_32_bits(frame->ref_dma) || upper_32_bits(frame->cur_dma) ||
+	    upper_32_bits(frame->nxt1_dma) || upper_32_bits(frame->nxt2_dma) ||
+	    upper_32_bits(output_dma))
+		return -EINVAL;
+
+	mutex_lock(&vpss->lock);
+
+	ret = pm_runtime_resume_and_get(vpss->dev);
+	if (ret < 0)
+		goto unlock;
+
+	/* Luma and chroma output of the de-interlacer. */
+	writel(lower_32_bits(output_dma), vpss->regs + HISTB_VPSS_LB_Y_ADDR);
+	writel(lower_32_bits(output_dma + stride *
+			     (frame->height * 2)),
+	       vpss->regs + HISTB_VPSS_LB_C_ADDR);
+	writel(stride, vpss->regs + HISTB_VPSS_LB_STRIDE);
+	writel(FIELD_PREP(GENMASK(15, 0), frame->width - 1) |
+	       FIELD_PREP(GENMASK(31, 16), frame->height * 2 - 1),
+	       vpss->regs + HISTB_VPSS_IMG_SIZE);
+
+	histb_vpss_dei_field(vpss, HISTB_VPSS_DEI_REF_CTRL,
+			     HISTB_VPSS_DEI_REFYADDR, HISTB_VPSS_DEI_REFCADDR,
+			     HISTB_VPSS_DEI_REFSTRIDE, frame, frame->ref_dma,
+			     stride);
+	histb_vpss_dei_field(vpss, HISTB_VPSS_DEI_CUR_CTRL,
+			     HISTB_VPSS_DEI_CURYADDR, HISTB_VPSS_DEI_CURCADDR,
+			     HISTB_VPSS_DEI_CURSTRIDE, frame, frame->cur_dma,
+			     stride);
+	histb_vpss_dei_field(vpss, HISTB_VPSS_DEI_NXT1_CTRL,
+			     HISTB_VPSS_DEI_NXT1YADDR, HISTB_VPSS_DEI_NXT1CADDR,
+			     HISTB_VPSS_DEI_NXT1STRIDE, frame, frame->nxt1_dma,
+			     stride);
+	histb_vpss_dei_field(vpss, HISTB_VPSS_DEI_NXT2_CTRL,
+			     HISTB_VPSS_DEI_NXT2YADDR, HISTB_VPSS_DEI_NXT2CADDR,
+			     HISTB_VPSS_DEI_NXT2STRIDE, frame, frame->nxt2_dma,
+			     stride);
+
+	/* 4-field mode, as the vendor HAL selects (`SetMode(..., 1)`). */
+	writel(FIELD_PREP(HISTB_VPSS_DIE_L_MODE, 1) |
+	       FIELD_PREP(HISTB_VPSS_DIE_C_MODE, 1) |
+	       HISTB_VPSS_DIE_EDGE_SMOOTH_EN, vpss->regs + HISTB_VPSS_DIECTRL);
+
+	ctrl = readl(vpss->regs + HISTB_VPSS_CTRL);
+	ctrl |= HISTB_VPSS_CTRL_DEI_EN;
+	ctrl &= ~HISTB_VPSS_CTRL_BFIELD_FIRST;
+	if (!frame->top_field_first)
+		ctrl |= HISTB_VPSS_CTRL_BFIELD_FIRST;
+	ctrl &= ~HISTB_VPSS_CTRL_BFIELD_MODE;
+	writel(ctrl, vpss->regs + HISTB_VPSS_CTRL);
+
+	reinit_completion(&vpss->completion);
+	vpss->irq_state = 0;
+	writel(HISTB_VPSS_INT_ALL, vpss->regs + HISTB_VPSS_INT_CLEAR);
+	writel(HISTB_VPSS_MISC_DEFAULT, vpss->regs + HISTB_VPSS_MISC);
+	writel(0, vpss->regs + HISTB_VPSS_NEXT);
+	wmb();
+	writel(1, vpss->regs + HISTB_VPSS_START);
+
+	timeout = wait_for_completion_timeout(&vpss->completion,
+					      msecs_to_jiffies(500));
+	ret = timeout ? 0 : -ETIMEDOUT;
+
+	writel(0, vpss->regs + HISTB_VPSS_CTRL);
+	pm_runtime_put(vpss->dev);
+unlock:
+	mutex_unlock(&vpss->lock);
+	return ret;
 }
 
 int histb_vpss_detile(struct histb_vpss *vpss,
