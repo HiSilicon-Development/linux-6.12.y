@@ -27,6 +27,9 @@
 #define MXL214_STATS_INTERVAL_MS		500
 #define MXL214_LOCK_QUALIFY_MS		500
 #define MXL214_CODEWORD_BITS		(204U * 8U)
+#define MXL214_STRENGTH_MIN_DBUV_X10	50
+#define MXL214_STRENGTH_RANGE_DBUV_X10	1000
+#define MXL214_CNR_FULL_SCALE_DB_X10	500
 
 static DEFINE_MUTEX(mxl214_device_id_lock);
 static unsigned long mxl214_device_ids;
@@ -165,11 +168,12 @@ static int mxl214_hw_init_locked(struct mxl214_state *state)
 		dev_info(&state->client->dev,
 			 "reference clock already running after reset request\n");
 
-	stage = "downstream calibration load";
-	status = MxLWare_HRCLS_API_CfgTunerDsCalDataLoad(state->device_id);
-	if (status != MXL_SUCCESS)
-		dev_warn(&state->client->dev,
-			 "calibration unavailable; RF power is approximate\n");
+	/*
+	 * The vendor nvram50.bin stores its coefficient table at byte 14,
+	 * while the native AArch64 API structure starts it at byte 16.  The
+	 * BSP consequently leaves this calibration path disabled.  Loading the
+	 * file succeeds its byte checksum but corrupts every power coefficient.
+	 */
 
 	stage = "pre-download version query";
 	status = MxLWare_HRCLS_API_ReqDevVersionInfo(state->device_id,
@@ -329,26 +333,55 @@ static void mxl214_stats_reset(struct mxl214_channel *channel)
 	channel->locked = false;
 }
 
+static int mxl214_read_rx_power_locked(struct mxl214_channel *channel,
+				       UINT16 *power)
+{
+	struct mxl214_state *state = channel->state;
+	MXL_HRCLS_RX_PWR_ACCURACY_E accuracy = MXL_HRCLS_PWR_INVALID;
+	MXL_STATUS_E status;
+
+	status = MxLWare_HRCLS_API_ReqTunerRxPwr(state->device_id,
+		channel->id, power, &accuracy);
+	if (status != MXL_SUCCESS || accuracy == MXL_HRCLS_PWR_INVALID)
+		return -EREMOTEIO;
+
+	return 0;
+}
+
+static u16 mxl214_strength_relative(UINT16 dbuv_x10)
+{
+	int relative;
+
+	relative = clamp_t(int, (int)dbuv_x10 -
+			       MXL214_STRENGTH_MIN_DBUV_X10, 0,
+			       MXL214_STRENGTH_RANGE_DBUV_X10);
+	return DIV_ROUND_CLOSEST((u32)relative * U16_MAX,
+				 MXL214_STRENGTH_RANGE_DBUV_X10);
+}
+
+static u16 mxl214_cnr_relative(UINT16 db_x10)
+{
+	return DIV_ROUND_CLOSEST(min_t(u32, db_x10,
+					     MXL214_CNR_FULL_SCALE_DB_X10) *
+				 U16_MAX, MXL214_CNR_FULL_SCALE_DB_X10);
+}
+
 static int mxl214_update_strength_locked(struct mxl214_channel *channel)
 {
 	struct dtv_frontend_properties *properties;
-	struct mxl214_state *state = channel->state;
-	MXL_HRCLS_RX_PWR_ACCURACY_E accuracy = MXL_HRCLS_PWR_INVALID;
-	UINT16 power = 0;
-	MXL_STATUS_E status;
-	int percent;
+	UINT16 power;
+	int ret;
 
 	properties = &channel->frontend.dtv_property_cache;
-	status = MxLWare_HRCLS_API_ReqTunerRxPwr(state->device_id,
-		channel->id, &power, &accuracy);
-	if (status != MXL_SUCCESS || accuracy == MXL_HRCLS_PWR_INVALID) {
+	ret = mxl214_read_rx_power_locked(channel, &power);
+	if (ret) {
 		properties->strength.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
-		return -EREMOTEIO;
+		return ret;
 	}
 
-	percent = clamp_t(int, (int)power / 10 - 5, 0, 100);
+	/* Present the 5..105 dBuV cable input range as 0..100 percent. */
 	properties->strength.stat[0].scale = FE_SCALE_RELATIVE;
-	properties->strength.stat[0].uvalue = percent * U16_MAX / 100;
+	properties->strength.stat[0].uvalue = mxl214_strength_relative(power);
 	return 0;
 }
 
@@ -367,8 +400,9 @@ static int mxl214_update_cnr_locked(struct mxl214_channel *channel)
 		return -EREMOTEIO;
 	}
 
-	properties->cnr.stat[0].scale = FE_SCALE_DECIBEL;
-	properties->cnr.stat[0].svalue = (s64)db_x10 * 100;
+	/* Keep the DVBv5 and legacy DVBv3 views on the same 0..50 dB scale. */
+	properties->cnr.stat[0].scale = FE_SCALE_RELATIVE;
+	properties->cnr.stat[0].uvalue = mxl214_cnr_relative(db_x10);
 	return 0;
 }
 
@@ -762,10 +796,9 @@ static int mxl214_read_signal_strength(struct dvb_frontend *frontend,
 {
 	struct mxl214_channel *channel = frontend->demodulator_priv;
 	struct mxl214_state *state = channel->state;
-	struct dtv_frontend_properties *properties;
+	UINT16 power;
 	int ret;
 
-	properties = &frontend->dtv_property_cache;
 	mutex_lock(&state->lock);
 	if (!channel->demod_enabled) {
 		*strength = 0;
@@ -773,9 +806,9 @@ static int mxl214_read_signal_strength(struct dvb_frontend *frontend,
 		goto unlock;
 	}
 
-	ret = mxl214_update_strength_locked(channel);
+	ret = mxl214_read_rx_power_locked(channel, &power);
 	if (!ret)
-		*strength = properties->strength.stat[0].uvalue;
+		*strength = mxl214_strength_relative(power);
 unlock:
 	mutex_unlock(&state->lock);
 	return ret;
@@ -785,10 +818,10 @@ static int mxl214_read_snr(struct dvb_frontend *frontend, u16 *snr)
 {
 	struct mxl214_channel *channel = frontend->demodulator_priv;
 	struct mxl214_state *state = channel->state;
-	struct dtv_frontend_properties *properties;
+	UINT16 db_x10 = 0;
+	MXL_STATUS_E status;
 	int ret;
 
-	properties = &frontend->dtv_property_cache;
 	mutex_lock(&state->lock);
 	if (!channel->demod_enabled) {
 		*snr = 0;
@@ -796,10 +829,11 @@ static int mxl214_read_snr(struct dvb_frontend *frontend, u16 *snr)
 		goto unlock;
 	}
 
-	ret = mxl214_update_cnr_locked(channel);
+	status = MxLWare_HRCLS_API_ReqDemodSnr(state->device_id,
+		channel->id, &db_x10);
+	ret = status == MXL_SUCCESS ? 0 : -EREMOTEIO;
 	if (!ret)
-		*snr = min_t(u64, properties->cnr.stat[0].svalue, 50000) *
-			U16_MAX / 50000;
+		*snr = mxl214_cnr_relative(db_x10);
 unlock:
 	mutex_unlock(&state->lock);
 	return ret;
