@@ -6954,8 +6954,15 @@ histb_vdec_validate_h264(struct histb_vdec_ctx *ctx,
 	field_pic = decode->flags & V4L2_H264_DECODE_PARAM_FLAG_FIELD_PIC;
 	bottom_field = decode->flags & V4L2_H264_DECODE_PARAM_FLAG_BOTTOM_FIELD;
 
+	/*
+	 * Baseline, Main and High, plus the two MVC profiles.  The MVC
+	 * front-end is not wired in yet, so accepting 118 and 128 only means
+	 * the parameters reach the same validation a non-MVC picture gets;
+	 * the multivew extension itself is still parsed and discarded.
+	 */
 	if ((sps->profile_idc != 66 && sps->profile_idc != 77 &&
-	     sps->profile_idc != 100) ||
+	     sps->profile_idc != 100 && sps->profile_idc != 118 &&
+	     sps->profile_idc != 128) ||
 	    sps->level_idc > 51 ||
 	    sps->chroma_format_idc != 1 || sps->bit_depth_luma_minus8 ||
 	    sps->bit_depth_chroma_minus8 ||
@@ -14394,7 +14401,7 @@ module_platform_driver(histb_vdec_driver);
 MODULE_AUTHOR("HiSilicon Technologies Co., Ltd.");
 MODULE_DESCRIPTION("HiSilicon Hi3798CV200 VDH video decoder");
 /* Build tag so a deployment can be proven to have taken effect. */
-#define HISTB_VDEC_BUILD_TAG "dvbip-20260915-dpb40"
+#define HISTB_VDEC_BUILD_TAG "dvbip-20260915-mvcprof"
 MODULE_VERSION(HISTB_VDEC_BUILD_TAG);
 /* dma_buf_export() lives in the DMA_BUF symbol namespace. */
 MODULE_IMPORT_NS(DMA_BUF);
