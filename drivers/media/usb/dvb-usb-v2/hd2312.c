@@ -219,6 +219,16 @@ static int hd2312_get_frontend(struct dvb_frontend *fe,
 	return 0;
 }
 
+static u16 hd2312_quality_to_u16(u8 snr)
+{
+	u16 quality = (u16)snr + 3;
+
+	/* Match the legacy HD2312 quality mapping used by DtmbUSB. */
+	if (quality >= 70)
+		return 0;
+	return quality * 0xffffU / 100;
+}
+
 static int hd2312_read_status(struct dvb_frontend *fe, enum fe_status *status)
 {
 	struct hd2312_state *state = fe->demodulator_priv;
@@ -246,12 +256,10 @@ static int hd2312_read_status(struct dvb_frontend *fe, enum fe_status *status)
 		ret = hd2312_ctrl(d, HD2312_REQ_SNR, true,
 				  state->statistics, 2);
 		if (!ret) {
-			c->cnr.stat[0].scale = FE_SCALE_DECIBEL;
-			c->cnr.stat[0].svalue =
-				(s64)state->statistics[0] * 1000 +
-				state->statistics[1] * 10;
-			state->cached_snr = (state->statistics[0] * 1000) +
-					    (state->statistics[1] * 10);
+			c->cnr.stat[0].scale = FE_SCALE_RELATIVE;
+			c->cnr.stat[0].uvalue =
+				hd2312_quality_to_u16(state->statistics[0]);
+			state->cached_snr = c->cnr.stat[0].uvalue;
 		}
 	}
 
