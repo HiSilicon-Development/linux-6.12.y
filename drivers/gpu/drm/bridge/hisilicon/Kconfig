@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+config DRM_HISI_HISTB_HDMI
+	tristate "HiSilicon HiSTB HDMI transmitter"
+	depends on DRM && OF && COMMON_CLK && I2C && RESET_CONTROLLER
+	depends on ARCH_HISI || COMPILE_TEST
+	select DRM_DISPLAY_HELPER
+	select DRM_DISPLAY_HDMI_STATE_HELPER
+	select DRM_KMS_HELPER
+	select MFD_SYSCON
+	help
+	  Enable support for the HDMI transmitter integrated in HiSilicon
+	  set-top box SoCs such as Hi3798CV200. The driver uses the DRM bridge
+	  API and provides hot-plug detection and access to the internal DDC
+	  controller for EDID reads.
+
+	  If M is selected, the module will be called histb-hdmi.

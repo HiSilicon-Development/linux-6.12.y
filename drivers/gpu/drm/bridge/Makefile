@@ -39,5 +39,6 @@ obj-$(CONFIG_DRM_ITE_IT66121) += ite-it66121.o
 
 obj-y += analogix/
 obj-y += cadence/
+obj-y += hisilicon/
 obj-y += imx/
 obj-y += synopsys/

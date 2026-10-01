@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+config DRM_HISI_HISTB
+	tristate "DRM support for HiSilicon HiSTB display controllers"
+	depends on DRM && OF && (ARCH_HISI || COMPILE_TEST)
+	select DRM_BRIDGE_CONNECTOR
+	select DRM_DISPLAY_HELPER
+	select DRM_GEM_DMA_HELPER
+	select DRM_KMS_HELPER
+	help
+	  Choose this option to enable DRM/KMS support for the video display
+	  processor found in HiSilicon set-top box SoCs such as Hi3798CV200.
+	  The driver exposes the primary graphics path through the atomic KMS
+	  API and connects the display controller to an OF graph bridge.
+
+	  If M is selected, the module will be called histb-vdp.
