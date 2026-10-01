@@ -1467,6 +1467,7 @@ int __init
 gic_of_init(struct device_node *node, struct device_node *parent)
 {
 	struct gic_chip_data *gic;
+	bool combined_eoi;
 	int irq, ret;
 
 	if (WARN_ON(!node))
@@ -1481,12 +1482,17 @@ gic_of_init(struct device_node *node, struct device_node *parent)
 	if (ret)
 		return ret;
 
-	/*
-	 * Disable split EOI/Deactivate if either HYP is not available
-	 * or the CPU interface is too small.
-	 */
-	if (gic_cnt == 0 && !gic_check_eoimode(node, &gic->raw_cpu_base))
+	combined_eoi = of_device_is_compatible(node,
+					       "hisilicon,hi3798cv200-gic");
+	if (gic_cnt == 0 && combined_eoi) {
+		/* The vendor firmware and Linux 4.4 both use GICC EOImode 0. */
 		static_branch_disable(&supports_deactivate_key);
+		pr_info("GIC: Hi3798CV200 using combined EOI mode\n");
+	} else if (gic_cnt == 0 &&
+		   !gic_check_eoimode(node, &gic->raw_cpu_base)) {
+		/* HYP is unavailable or the CPU interface is too small. */
+		static_branch_disable(&supports_deactivate_key);
+	}
 
 	ret = __gic_init_bases(gic, &node->fwnode);
 	if (ret) {

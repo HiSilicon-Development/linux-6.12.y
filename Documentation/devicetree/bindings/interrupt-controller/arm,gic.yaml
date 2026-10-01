@@ -25,6 +25,10 @@ properties:
   compatible:
     oneOf:
       - items:
+          - const: hisilicon,hi3798cv200-gic
+          - const: arm,gic-400
+
+      - items:
           - enum:
               - arm,arm11mp-gic
               - arm,cortex-a15-gic
