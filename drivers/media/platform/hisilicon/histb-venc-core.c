@@ -219,6 +219,10 @@ struct histb_venc_ctx {
 	u32 min_qp;
 	u32 max_qp;
 	struct v4l2_fract timeperframe;
+	u32 sar_idc;
+	u16 sar_width;
+	u16 sar_height;
+	bool sar_enabled;
 	struct histb_venc_rc rc;
 	struct histb_venc_rc_decision rc_decision;
 	u32 frame_num;
@@ -508,7 +512,16 @@ static int histb_venc_build_sps(struct histb_venc_ctx *ctx, u8 *data,
 	 * (2 * num_units_in_tick) for progressive fixed-rate video.
 	 */
 	histb_venc_put_bits(&writer, 1, 1); /* vui_parameters_present_flag */
-	histb_venc_put_bits(&writer, 0, 1); /* aspect_ratio_info_present */
+	histb_venc_put_bits(&writer, ctx->sar_enabled, 1);
+	if (ctx->sar_enabled) {
+		histb_venc_put_bits(&writer,
+			ctx->sar_idc == V4L2_MPEG_VIDEO_H264_VUI_SAR_IDC_EXTENDED ?
+			255 : ctx->sar_idc, 8);
+		if (ctx->sar_idc == V4L2_MPEG_VIDEO_H264_VUI_SAR_IDC_EXTENDED) {
+			histb_venc_put_bits(&writer, ctx->sar_width, 16);
+			histb_venc_put_bits(&writer, ctx->sar_height, 16);
+		}
+	}
 	histb_venc_put_bits(&writer, 0, 1); /* overscan_info_present */
 	histb_venc_put_bits(&writer, 0, 1); /* video_signal_type_present */
 	histb_venc_put_bits(&writer, 0, 1); /* chroma_loc_info_present */
@@ -2030,6 +2043,22 @@ static int histb_venc_s_ctrl(struct v4l2_ctrl *ctrl)
 	case V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME:
 		ctx->force_idr = true;
 		break;
+	case V4L2_CID_MPEG_VIDEO_H264_VUI_SAR_ENABLE:
+	case V4L2_CID_MPEG_VIDEO_H264_VUI_SAR_IDC:
+	case V4L2_CID_MPEG_VIDEO_H264_VUI_EXT_SAR_WIDTH:
+	case V4L2_CID_MPEG_VIDEO_H264_VUI_EXT_SAR_HEIGHT:
+		if (ctx->rc_job_pending)
+			return -EBUSY;
+		if (ctrl->id == V4L2_CID_MPEG_VIDEO_H264_VUI_SAR_ENABLE)
+			ctx->sar_enabled = ctrl->val;
+		else if (ctrl->id == V4L2_CID_MPEG_VIDEO_H264_VUI_SAR_IDC)
+			ctx->sar_idc = ctrl->val;
+		else if (ctrl->id == V4L2_CID_MPEG_VIDEO_H264_VUI_EXT_SAR_WIDTH)
+			ctx->sar_width = ctrl->val;
+		else
+			ctx->sar_height = ctrl->val;
+		ctx->force_idr = true;
+		break;
 	default:
 		return -EINVAL;
 	}
@@ -2092,7 +2121,7 @@ static int histb_venc_open(struct file *file)
 	v4l2_fh_init(&ctx->fh, video_devdata(file));
 	file->private_data = &ctx->fh;
 
-	v4l2_ctrl_handler_init(&ctx->ctrl_handler, 12);
+	v4l2_ctrl_handler_init(&ctx->ctrl_handler, 16);
 	v4l2_ctrl_new_std(&ctx->ctrl_handler, &histb_venc_ctrl_ops,
 			  V4L2_CID_MPEG_VIDEO_H264_I_FRAME_QP,
 			  0, 51, 1, HISTB_VENC_DEFAULT_QP);
@@ -2126,6 +2155,18 @@ static int histb_venc_open(struct file *file)
 			       BIT(V4L2_MPEG_VIDEO_H264_PROFILE_CONSTRAINED_BASELINE) |
 			       BIT(V4L2_MPEG_VIDEO_H264_PROFILE_EXTENDED),
 			       V4L2_MPEG_VIDEO_H264_PROFILE_HIGH);
+	v4l2_ctrl_new_std(&ctx->ctrl_handler, &histb_venc_ctrl_ops,
+			  V4L2_CID_MPEG_VIDEO_H264_VUI_EXT_SAR_WIDTH,
+			  1, 65535, 1, 1);
+	v4l2_ctrl_new_std(&ctx->ctrl_handler, &histb_venc_ctrl_ops,
+			  V4L2_CID_MPEG_VIDEO_H264_VUI_EXT_SAR_HEIGHT,
+			  1, 65535, 1, 1);
+	v4l2_ctrl_new_std_menu(&ctx->ctrl_handler, &histb_venc_ctrl_ops,
+			       V4L2_CID_MPEG_VIDEO_H264_VUI_SAR_IDC,
+			       V4L2_MPEG_VIDEO_H264_VUI_SAR_IDC_EXTENDED,
+			       0, V4L2_MPEG_VIDEO_H264_VUI_SAR_IDC_1x1);
+	v4l2_ctrl_new_std(&ctx->ctrl_handler, &histb_venc_ctrl_ops,
+			  V4L2_CID_MPEG_VIDEO_H264_VUI_SAR_ENABLE, 0, 1, 1, 0);
 	ctrl = v4l2_ctrl_new_std(&ctx->ctrl_handler, NULL,
 				 V4L2_CID_MPEG_VIDEO_PREPEND_SPSPPS_TO_IDR,
 				 0, 1, 1, 1);
