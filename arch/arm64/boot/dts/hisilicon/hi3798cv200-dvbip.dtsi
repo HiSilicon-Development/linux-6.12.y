@@ -1,0 +1,423 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/pinctrl/hisi.h>
+#include <dt-bindings/thermal/thermal.h>
+#include "hi3798cv200.dtsi"
+
+/* value, enable bits, disable bits, mask */
+#define PINCTRL_PULLDOWN(value, enable, disable, mask) \
+	(value << 13) (enable << 13) (disable << 13) (mask << 13)
+#define PINCTRL_PULLUP(value, enable, disable, mask) \
+	(value << 12) (enable << 12) (disable << 12) (mask << 12)
+#define PINCTRL_SLEW_RATE(value, mask)	  (value << 8) (mask << 8)
+#define PINCTRL_DRV_STRENGTH(value, mask) (value << 4) (mask << 4)
+
+/ {
+	/delete-node/ psci;
+
+	hdmi-connector {
+		compatible = "hdmi-connector";
+		type = "a";
+
+		port {
+			hdmi_connector_in: endpoint {
+				remote-endpoint = <&hdmi_out>;
+			};
+		};
+	};
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		smp_firmware: smp-firmware@11000000 {
+			reg = <0x0 0x11000000 0x0 0x00010000>;
+			no-map;
+		};
+
+		linux_cma: linux,cma {
+			compatible = "shared-dma-pool";
+			reusable;
+			/*
+			 * 192 MiB.  The display controller sits inside the soc
+			 * node and therefore needs its framebuffers below 1 GiB,
+			 * so the pool stays in the aperture - but 80 MiB was not
+			 * enough once the decoder, the desktop and the eMMC were
+			 * all allocating from it: CMA fell to 2739 of 20480 pages
+			 * while decoding, the decoder's own 360-page requests and
+			 * then dwmmc's DMA both failed (err=-110, eMMC command
+			 * timeout), and with the root filesystem unable to read
+			 * the machine looked hung - ping answered and TCP 22
+			 * accepted, but sshd never completed a handshake.
+			 */
+			size = <0x0 0x0c000000>;
+			alignment = <0x0 0x00800000>;
+			/*
+			 * The pool has to stay inside the SoC's 1 GiB DMA
+			 * aperture: the display path allocates its framebuffers
+			 * from it and cannot reach above 1 GiB, while the video
+			 * decoder can.  The GPU shares it too, which is why the
+			 * decoder got a pool of its own below instead of a
+			 * larger CMA - the two together are the 128 MiB that
+			 * this aperture was measured to support.
+			 */
+			alloc-ranges = <0x0 0x30000000 0x0 0x10000000>;
+			linux,cma-default;
+		};
+
+		/*
+		 * Dedicated decoder memory.
+		 *
+		 * The decoder asks for large physically contiguous bursts -
+		 * a 3 MiB reference tile at a time - and when those came out
+		 * of the shared, reusable CMA pool they failed as soon as the
+		 * desktop had been up for a while: movable user pages migrate
+		 * into a reusable CMA region and are not necessarily evicted
+		 * again, so 765-page allocations failed repeatedly and
+		 * hardware decode fell to 0.7x realtime.  The stock firmware
+		 * avoids exactly this by giving media its own carve-out
+		 * (mmz=ddr,0,0,60M on the stock bootargs); this is the
+		 * mainline equivalent, a pool the page allocator never takes
+		 * pages back from.  Like the CMA pool it must stay inside the
+		 * 1 GiB aperture.
+		 */
+		vdec_pool: vdec-pool@20000000 {
+			compatible = "shared-dma-pool";
+			/*
+			 * 128 MiB.  The original 128 MiB was sized for
+			 * 1080p HEVC: one frame is 816 contiguous pages
+			 * (3.2 MiB) and a reference set is around fifteen of
+			 * them, which a 48 MiB pool could not hold - the
+			 * decoder then fell back to the shared CMA, found it
+			 * fragmented, and stalled (measured: __cma_alloc
+			 * 128/816-page requests failing while 41 MiB of CMA
+			 * was still free).
+			 *
+			 * The resolution ceilings are now the datasheet's
+			 * (4096x2304 for H.264 and VP9), where a frame is
+			 * about 13 MiB and the same reference set needs
+			 * roughly 200 MiB, so 128 MiB would fail allocation
+			 * for anything above 1080p.
+			 *
+			 * It has to sit inside the 1 GiB aperture.  This
+			 * node used to be placed past 1 GiB, reasoning that
+			 * the Mali no longer needed the low window - but this
+			 * pool belongs to the decoder, and the decoder never
+			 * left the soc node, so it still carries the
+			 * aperture.  Measured: bus_dma_limit 0x3fffffff for
+			 * f8c30000.video-codec, while the pool was at
+			 * 0x50000000.  Every coherent allocation was then
+			 * served from memory the decoder cannot address, the
+			 * MSG buffer came back as DMA_MAPPING_ERROR, and
+			 * every frame was rejected with -EINVAL.
+			 *
+			 * 0x20000000 sits below the CMA window at
+			 * 0x30000000 and above the firmware at 0x11000000.
+			 */
+			/*
+			 * 240 MiB.  This is the size the comment above derives
+			 * for the 4K ceilings, and it is measured on IP1001:
+			 * with it, 3840x2160 H.264 decodes and three
+			 * consecutive runs are clean, while h264 1080p,
+			 * vp8 1080p and vp9 1080p stay byte-identical to
+			 * software - none of them draw from this pool at all,
+			 * because dma_alloc_noncoherent() bypasses dev->dma_mem
+			 * and only dma_alloc_coherent() uses it.
+			 *
+			 * An earlier attempt at this size was reverted because
+			 * the board appeared to break.  That was a
+			 * misattribution: the damage came from running VP9 at
+			 * 4096x2304, which waits forever on a capture buffer the
+			 * engine never completes and degrades the board as the
+			 * unfinished jobs accumulate.  H.264 4K is harmless and
+			 * does not affect the other codecs.  VP9 4K still has to
+			 * be fixed on its own merits; until it is, running it on
+			 * this pool will hang the board.
+			 *
+			 * The cost is 112 MiB of general-purpose RAM.
+			 */
+			reg = <0x0 0x20000000 0x0 0x0f000000>;
+			/*
+			 * keep the pool out of the linear map and out of the
+			 * System RAM resource, otherwise a write-combining
+			 * memremap of the region trips memremap()'s aliasing
+			 * check (kernel/iomem.c) - panfrost does exactly that
+			 * while udev probes it.
+			 */
+			no-map;
+		};
+	};
+
+	/*
+	 * The CV200 BSP exposes the Mali-T720 at six discrete clock points.
+	 * Keep the table in the common SoC include so all board variants use the
+	 * same verified clock selectors and regulator sequencing.  The voltage
+	 * values are the board-independent values used by the 4.4 BSP DTS; the
+	 * OPP core still performs the regulator transition before changing the
+	 * GPU clock.
+	 */
+	hi3798cv200_gpu_opp_table: opp-table-gpu {
+		compatible = "operating-points-v2";
+
+		opp-200000000 {
+			opp-hz = /bits/ 64 <200000000>;
+			opp-microvolt = <880000>;
+		};
+
+		opp-300000000 {
+			opp-hz = /bits/ 64 <300000000>;
+			opp-microvolt = <880000>;
+		};
+
+		opp-400000000 {
+			opp-hz = /bits/ 64 <400000000>;
+			opp-microvolt = <880000>;
+		};
+
+		opp-500000000 {
+			opp-hz = /bits/ 64 <500000000>;
+			opp-microvolt = <880000>;
+		};
+
+		opp-600000000 {
+			opp-hz = /bits/ 64 <600000000>;
+			opp-microvolt = <920000>;
+		};
+
+		opp-675000000 {
+			opp-hz = /bits/ 64 <675000000>;
+			opp-microvolt = <980000>;
+		};
+	};
+
+	dvbip_sound: sound {
+		compatible = "simple-audio-card";
+		simple-audio-card,name = "DVBIP-CV200";
+		simple-audio-card,format = "i2s";
+		simple-audio-card,bitclock-master = <&sound_cpu>;
+		simple-audio-card,frame-master = <&sound_cpu>;
+		simple-audio-card,widgets = "Line", "Line Out";
+		simple-audio-card,routing =
+			"Line Out", "LOUT",
+			"Line Out", "ROUT";
+
+		sound_cpu: simple-audio-card,cpu {
+			sound-dai = <&aiao>;
+		};
+
+		simple-audio-card,codec {
+			sound-dai = <&tianlai>;
+		};
+	};
+
+	thermal-zones {
+		soc-thermal {
+			polling-delay = <1000>;
+			polling-delay-passive = <100>;
+			sustainable-power = <2500>;
+			thermal-sensors = <&tsensor 0>;
+
+			trips {
+				soc_passive: soc-passive {
+					temperature = <95000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+
+				gpu_target: gpu-target {
+					temperature = <105000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+
+				soc_critical: soc-critical {
+					temperature = <120000>;
+					hysteresis = <5000>;
+					type = "critical";
+				};
+			};
+
+			dvbip_cooling_maps: cooling-maps {
+				map-gpu {
+					trip = <&gpu_target>;
+					cooling-device = <&gpu THERMAL_NO_LIMIT
+							       THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+	};
+};
+
+&{/cpus/cpu@0} {
+	/delete-property/ enable-method;
+};
+
+&{/cpus/cpu@1} {
+	enable-method = "spin-table";
+	cpu-release-addr = <0x0 0x1100f000>;
+};
+
+&{/cpus/cpu@2} {
+	enable-method = "spin-table";
+	cpu-release-addr = <0x0 0x1100f000>;
+};
+
+&{/cpus/cpu@3} {
+	enable-method = "spin-table";
+	cpu-release-addr = <0x0 0x1100f000>;
+};
+
+&uart0 {
+	status = "okay";
+};
+
+&uart2 {
+	status = "okay";
+};
+
+&sci0 {
+	hisilicon,vcc-active-low;
+	pinctrl-names = "default";
+	pinctrl-0 = <&sci0_pins>;
+	status = "okay";
+};
+
+&pmx0 {
+	sci0_pins: sci0-pins {
+		pinctrl-single,pins = <
+			0x054 MUX_M1 /* SIM0_DET */
+			0x058 MUX_M1 /* SIM0_DATA */
+			0x05c MUX_M1 /* SIM0_RST */
+			0x060 MUX_M1 /* SIM0_CLK */
+			0x064 MUX_M1 /* SIM0_PWREN */
+		>;
+	};
+
+};
+
+&demux {
+	assigned-clocks = <&crg HISTB_TSI_SHARED_CLK>;
+	assigned-clock-parents = <&crg HISTB_TSI2_CLK>;
+	status = "okay";
+
+	dvbip_demux_input0: input@0 {
+		reg = <0>;
+		hisilicon,ts-mode = "serial-nosync";
+		hisilicon,clock-inverted;
+		hisilicon,serial-data-line = <0>;
+	};
+
+	dvbip_demux_input1: input@1 {
+		reg = <1>;
+		hisilicon,ts-mode = "serial-nosync";
+		hisilicon,clock-inverted;
+		hisilicon,serial-data-line = <0>;
+	};
+
+	dvbip_demux_input2: input@2 {
+		reg = <2>;
+		hisilicon,ts-mode = "serial-nosync";
+		hisilicon,clock-inverted;
+		hisilicon,serial-data-line = <0>;
+	};
+
+	dvbip_demux_input3: input@3 {
+		reg = <3>;
+		hisilicon,ts-mode = "serial-nosync";
+		hisilicon,clock-inverted;
+		hisilicon,serial-data-line = <0>;
+	};
+};
+
+&gmac1 {
+	#address-cells = <1>;
+	#size-cells = <0>;
+	phy-handle = <&dvbip_phy3>;
+	status = "okay";
+
+	dvbip_phy3: ethernet-phy@3 {
+		reg = <3>;
+	};
+};
+
+&gpu {
+	operating-points-v2 = <&hi3798cv200_gpu_opp_table>;
+	status = "okay";
+};
+
+&hdmi {
+	status = "okay";
+	/* Poll the R002 TX status to avoid a stuck CV200 HPD interrupt. */
+	hisilicon,hpd-poll;
+};
+
+&hdmi_out {
+	remote-endpoint = <&hdmi_connector_in>;
+};
+
+&rng {
+	status = "okay";
+};
+
+&system_timer {
+	/* ARM64 uses the architected timer; the vendor SPI events lose ticks. */
+	status = "disabled";
+};
+
+&vdd_gpu {
+	status = "okay";
+};
+
+&gpio0 { status = "okay"; };
+&gpio1 { status = "okay"; };
+&gpio2 { status = "okay"; };
+&gpio3 { status = "okay"; };
+&gpio4 { status = "okay"; };
+&gpio5 { status = "okay"; };
+&gpio6 { status = "okay"; };
+&gpio7 { status = "okay"; };
+&gpio8 { status = "okay"; };
+&gpio9 { status = "okay"; };
+&gpio10 { status = "okay"; };
+&gpio11 { status = "okay"; };
+&gpio12 { status = "okay"; };
+
+&aiao {
+	status = "okay";
+};
+
+&tianlai {
+	status = "okay";
+};
+
+&tsensor {
+	status = "okay";
+};
+
+&jpge {
+	status = "okay";
+};
+
+&vdec {
+	memory-region = <&vdec_pool>;
+	status = "okay";
+};
+
+&vpss {
+	status = "okay";
+};
+
+&venc {
+	status = "okay";
+};
+
+&vdp {
+	status = "okay";
+};
+
+&ehci { status = "okay"; };
+&ohci { status = "okay"; };
+&xhci0 { status = "okay"; };
+&xhci1 { status = "okay"; };
