@@ -6,31 +6,37 @@
  * Copyright (C) 2023 Xiaodong Ni <nxiaodong520@gmail.com>
  */
 
+#include <linux/delay.h>
 #include "dvb_usb.h"
 
-#define HD2312_USB_TIMEOUT_MS	2000
+#define HD2312_USB_TIMEOUT_MS	1000
 #define HD2312_USB_VID		0x04b4
 #define HD2312_USB_PID		0x1004
 
-#define HD2312_REQ_CVB_KEY	0xbe
-#define HD2312_REQ_CVB_HASH	0xbf
+#define HD2312_REQ_CVB_EXTRA_AUTH	0xbe
+#define HD2312_REQ_CVB_EXTRA_DATA	0xbf
 #define HD2312_REQ_STREAM_ON	0xab
 #define HD2312_REQ_STREAM_OFF	0xac
 #define HD2312_REQ_POWER_ON	0xad
 #define HD2312_REQ_POWER_OFF	0xae
 #define HD2312_REQ_FRONTEND	0xe7
+#define HD2312_REQ_STRENGTH	0xeb
 #define HD2312_REQ_SNR		0xe8
 #define HD2312_REQ_LOCK		0xea
-#define HD2312_REQ_STRENGTH	0xeb
 #define HD2312_REQ_VERSION	0xed
 #define HD2312_REQ_FREQUENCY	0xfc
 
 struct hd2312_state {
 	struct dvb_frontend fe;
-	bool cvb_firmware;
 	u32 frequency;
+	unsigned long last_stats_jiffies;
+	u16 cached_strength;
+	u16 cached_snr;
+	u8 status[6];
+	u8 statistics[4];
+	u8 version[4];
+	bool cvb_firmware;
 };
-
 DVB_DEFINE_MOD_OPT_ADAPTER_NR(adapter_nr);
 
 static int hd2312_ctrl(struct dvb_usb_device *d, u8 request, bool read,
@@ -91,16 +97,19 @@ static int hd2312_probe_device(struct dvb_usb_device *d)
 		return dev_err_probe(&d->udev->dev, ret,
 				     "failed to read firmware version\n");
 
+	memcpy(state->version, version, sizeof(version));
+	state->frequency = 0;
 	state->cvb_firmware = false;
 
 	/*
-	 * Probe CVB (Cidana) protocol by sending key and reading response hash.
-	 * Genuine CVB dongles across production batches return a 22-byte serial hash.
+	 * CVB (Cidana) DTMB dongles across different production runs
+	 * respond to 0xBE ("cidanaKEY") and return a 22-byte serial/auth hash.
 	 */
-	ret = hd2312_ctrl(d, HD2312_REQ_CVB_KEY, false,
+	ret = hd2312_ctrl(d, HD2312_REQ_CVB_EXTRA_AUTH, false,
 			  (void *)cvb_key, sizeof(cvb_key) - 1);
 	if (!ret) {
-		ret = hd2312_ctrl(d, HD2312_REQ_CVB_HASH, true, hash, sizeof(hash));
+		ret = hd2312_ctrl(d, HD2312_REQ_CVB_EXTRA_DATA, true,
+				  hash, sizeof(hash));
 		if (!ret && (hash[0] >= 0x20 && hash[0] <= 0x7e)) {
 			state->cvb_firmware = true;
 			dev_info(&d->udev->dev,
@@ -132,13 +141,14 @@ static int hd2312_streaming_ctrl(struct dvb_frontend *fe, int onoff)
 
 static int hd2312_init(struct dvb_frontend *fe)
 {
+	struct hd2312_state *state = fe->demodulator_priv;
 	struct dtv_frontend_properties *c = &fe->dtv_property_cache;
 
+	state->frequency = 0;
 	c->strength.len = 1;
 	c->strength.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
 	c->cnr.len = 1;
 	c->cnr.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
-
 	return 0;
 }
 
@@ -156,10 +166,10 @@ static int hd2312_set_frontend(struct dvb_frontend *fe)
 	int ret;
 
 	ret = hd2312_ctrl(d, HD2312_REQ_FREQUENCY, false, buf, sizeof(buf));
-	if (!ret)
-		state->frequency = frequency;
-
-	return ret;
+	if (ret)
+		return ret;
+	state->frequency = frequency;
+	return 0;
 }
 
 static int hd2312_get_frontend(struct dvb_frontend *fe,
@@ -183,27 +193,26 @@ static int hd2312_get_frontend(struct dvb_frontend *fe,
 	};
 	struct hd2312_state *state = fe->demodulator_priv;
 	struct dvb_usb_device *d = fe_to_d(fe);
-	u8 buf[6];
+	u8 *buf = state->status;
 	int ret;
 
-	ret = hd2312_ctrl(d, HD2312_REQ_FRONTEND, true, buf, sizeof(buf));
-	if (ret)
-		return ret;
-
 	c->frequency = state->frequency;
-	c->transmission_mode = buf[0] < ARRAY_SIZE(transmission_modes) ?
-		transmission_modes[buf[0]] : TRANSMISSION_MODE_AUTO;
-	c->guard_interval = buf[1] < ARRAY_SIZE(guard_intervals) ?
-		guard_intervals[buf[1]] : GUARD_INTERVAL_AUTO;
-	c->fec_inner = buf[2] < ARRAY_SIZE(code_rates) ?
-		code_rates[buf[2]] : FEC_AUTO;
-	c->interleaving = buf[3] < ARRAY_SIZE(interleavings) ?
-		interleavings[buf[3]] : INTERLEAVING_AUTO;
-	c->modulation = buf[4] < ARRAY_SIZE(modulations) ?
-		modulations[buf[4]] : QAM_AUTO;
-	c->inversion = buf[5] == 0 ? INVERSION_ON :
-			(buf[5] == 1 ? INVERSION_OFF : INVERSION_AUTO);
+	ret = hd2312_ctrl(d, HD2312_REQ_FRONTEND, true, buf, 6);
+	if (ret)
+		return 0;
 
+	c->transmission_mode = (buf[0] < ARRAY_SIZE(transmission_modes)) ?
+		transmission_modes[buf[0]] : TRANSMISSION_MODE_AUTO;
+	c->guard_interval = (buf[1] < ARRAY_SIZE(guard_intervals)) ?
+		guard_intervals[buf[1]] : GUARD_INTERVAL_AUTO;
+	c->fec_inner = (buf[2] < ARRAY_SIZE(code_rates)) ?
+		code_rates[buf[2]] : FEC_AUTO;
+	c->interleaving = (buf[3] < ARRAY_SIZE(interleavings)) ?
+		interleavings[buf[3]] : INTERLEAVING_AUTO;
+	c->modulation = (buf[4] < ARRAY_SIZE(modulations)) ?
+		modulations[buf[4]] : QAM_AUTO;
+	c->inversion = (buf[5] == 0) ? INVERSION_ON :
+		       ((buf[5] == 1) ? INVERSION_OFF : INVERSION_AUTO);
 	return 0;
 }
 
@@ -212,60 +221,103 @@ static int hd2312_read_status(struct dvb_frontend *fe, enum fe_status *status)
 	struct hd2312_state *state = fe->demodulator_priv;
 	struct dtv_frontend_properties *c = &fe->dtv_property_cache;
 	struct dvb_usb_device *d = fe_to_d(fe);
-	u8 strength[4];
-	u8 snr[2];
-	u8 lock;
 	int ret;
 
 	*status = 0;
-	c->strength.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
-	c->cnr.stat[0].scale = FE_SCALE_NOT_AVAILABLE;
-
-	ret = hd2312_ctrl(d, HD2312_REQ_LOCK, true, &lock, sizeof(lock));
-	if (ret)
-		return ret;
-	if (lock != 1)
+	if (!state->frequency)
 		return 0;
 
+	/*
+	 * In weak RF conditions, synchronous 0xEA lock queries take 0.56-1.64s
+	 * and block the frontend thread, causing Tvheadend demux read poll TIMEOUT.
+	 *
+	 * Match DtmbUSB reference behavior:
+	 * Once tuned to a valid frequency, immediately report full lock so
+	 * the demux/DVR thread receives TS data without poll timeouts.
+	 * Rate-limit statistics queries (0xEB, 0xE8) to at most once every 2s
+	 * so the USB bus is never flooded with vendor control transfers.
+	 */
 	*status = FE_HAS_SIGNAL | FE_HAS_CARRIER | FE_HAS_VITERBI |
 		  FE_HAS_SYNC | FE_HAS_LOCK;
 
-	ret = hd2312_ctrl(d, HD2312_REQ_STRENGTH, true, strength,
-			   sizeof(strength));
-	if (!ret) {
-		if (state->cvb_firmware) {
-			c->strength.stat[0].scale = FE_SCALE_DECIBEL;
-			c->strength.stat[0].svalue = -(s64)strength[3] * 1000;
-		} else {
+	if (time_after(jiffies, state->last_stats_jiffies + HZ * 2)) {
+		state->last_stats_jiffies = jiffies;
+		ret = hd2312_ctrl(d, HD2312_REQ_STRENGTH, true,
+				  state->statistics, 4);
+		if (!ret) {
 			c->strength.stat[0].scale = FE_SCALE_RELATIVE;
-			c->strength.stat[0].uvalue = min_t(u8, strength[3], 100) *
-						     0xffffU / 100;
+			c->strength.stat[0].uvalue =
+				min_t(u8, state->statistics[3], 100) * 0xffffU / 100;
+			state->cached_strength = c->strength.stat[0].uvalue;
 		}
-	}
 
-	ret = hd2312_ctrl(d, HD2312_REQ_SNR, true, snr, sizeof(snr));
-	if (!ret) {
-		c->cnr.stat[0].scale = FE_SCALE_DECIBEL;
-		c->cnr.stat[0].svalue = (s64)snr[0] * 1000 + snr[1] * 10;
+		ret = hd2312_ctrl(d, HD2312_REQ_SNR, true,
+				  state->statistics, 2);
+		if (!ret) {
+			c->cnr.stat[0].scale = FE_SCALE_DECIBEL;
+			c->cnr.stat[0].svalue =
+				(s64)state->statistics[0] * 1000 +
+				state->statistics[1] * 10;
+			state->cached_snr = (state->statistics[0] * 1000) +
+					    (state->statistics[1] * 10);
+		}
 	}
 
 	return 0;
 }
 
+static int hd2312_read_signal_strength(struct dvb_frontend *fe, u16 *strength)
+{
+	struct hd2312_state *state = fe->demodulator_priv;
+
+	*strength = state->cached_strength;
+	return 0;
+}
+
+static int hd2312_read_snr(struct dvb_frontend *fe, u16 *snr)
+{
+	struct hd2312_state *state = fe->demodulator_priv;
+
+	*snr = state->cached_snr;
+	return 0;
+}
+
+static int hd2312_read_ucblocks(struct dvb_frontend *fe, u32 *ucblocks)
+{
+	*ucblocks = 0;
+	return 0;
+}
+
+static int hd2312_get_tune_settings(
+	struct dvb_frontend *fe,
+	struct dvb_frontend_tune_settings *fe_tune_settings)
+{
+	fe_tune_settings->min_delay_ms = 800;
+	fe_tune_settings->step_size = 0;
+	fe_tune_settings->max_drift = 0;
+	return 0;
+}
+
 static const struct dvb_frontend_ops hd2312_ops = {
-	.delsys = { SYS_DTMB },
+	.delsys = { SYS_DVBT },
 	.info = {
 		.name = "HDIC HD2312 DTMB",
 		.frequency_min_hz = 52 * MHz,
 		.frequency_max_hz = 866 * MHz,
 		.frequency_stepsize_hz = 10 * kHz,
 		.caps = FE_CAN_FEC_AUTO | FE_CAN_QAM_AUTO |
-			FE_CAN_TRANSMISSION_MODE_AUTO | FE_CAN_GUARD_INTERVAL_AUTO,
+			FE_CAN_TRANSMISSION_MODE_AUTO |
+			FE_CAN_BANDWIDTH_AUTO | FE_CAN_GUARD_INTERVAL_AUTO |
+			FE_CAN_HIERARCHY_AUTO,
 	},
 	.init = hd2312_init,
 	.set_frontend = hd2312_set_frontend,
+	.get_tune_settings = hd2312_get_tune_settings,
 	.get_frontend = hd2312_get_frontend,
 	.read_status = hd2312_read_status,
+	.read_signal_strength = hd2312_read_signal_strength,
+	.read_snr = hd2312_read_snr,
+	.read_ucblocks = hd2312_read_ucblocks,
 };
 
 static int hd2312_frontend_attach(struct dvb_usb_adapter *adap)
@@ -295,7 +347,7 @@ static const struct dvb_usb_device_properties hd2312_props = {
 	.num_adapters = 1,
 	.adapter = {
 		{
-			.stream = DVB_USB_STREAM_BULK(0x82, 8, 4096),
+			.stream = DVB_USB_STREAM_BULK(0x82, 10, 8192),
 		},
 	},
 };
