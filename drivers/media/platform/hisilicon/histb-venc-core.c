@@ -12,6 +12,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/interrupt.h>
 #include <linux/module.h>
+#include <linux/of_reserved_mem.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
@@ -253,6 +254,8 @@ struct histb_venc_dev {
 	struct delayed_work watchdog_work;
 	u64 watchdog_deadline_ns;
 	bool engine_faulted;
+	/* Coherent VENC pool buffers do not need cache maintenance. */
+	bool reserved_mem;
 	/* Count each active hardware job once, shared with sysfs readers. */
 	bool job_count_pending;
 	u64 jobs;
@@ -735,7 +738,8 @@ static int histb_venc_collect_stream(struct histb_venc_ctx *ctx,
 	if (!cpu)
 		return -EFAULT;
 
-	dma_sync_single_for_cpu(venc->dev, dma, size, DMA_BIDIRECTIONAL);
+	if (!venc->reserved_mem)
+		dma_sync_single_for_cpu(venc->dev, dma, size, DMA_BIDIRECTIONAL);
 	desc = cpu + HISTB_VENC_STREAM_META_SIZE;
 	packet_len = le32_to_cpu(desc->packet_len);
 	invalid = le32_to_cpu(desc->invalid_bytes);
@@ -1198,8 +1202,9 @@ static void histb_venc_device_run(void *priv)
 	}
 
 	memset(dst_cpu, 0, HISTB_VENC_STREAM_META_SIZE);
-	dma_sync_single_for_device(venc->dev, dst_dma, dst_size,
-				   DMA_BIDIRECTIONAL);
+	if (!venc->reserved_mem)
+		dma_sync_single_for_device(venc->dev, dst_dma, dst_size,
+					   DMA_BIDIRECTIONAL);
 
 	spin_lock_irqsave(&venc->irqlock, flags);
 	if (WARN_ON(venc->curr_ctx)) {
@@ -2065,6 +2070,10 @@ static const struct dev_pm_ops histb_venc_pm_ops = {
 			   histb_venc_runtime_resume, NULL)
 	SET_SYSTEM_SLEEP_PM_OPS(histb_venc_suspend, histb_venc_resume)
 };
+static void histb_venc_release_mem(void *data)
+{
+	of_reserved_mem_device_release(data);
+}
 
 static int histb_venc_probe(struct platform_device *pdev)
 {
@@ -2103,6 +2112,16 @@ static int histb_venc_probe(struct platform_device *pdev)
 	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to set DMA mask\n");
+	ret = of_reserved_mem_device_init(dev);
+	if (ret && ret != -ENODEV)
+		return dev_err_probe(dev, ret,
+				     "failed to get the encoder memory pool\n");
+	if (!ret) {
+		venc->reserved_mem = true;
+		ret = devm_add_action_or_reset(dev, histb_venc_release_mem, dev);
+		if (ret)
+			return ret;
+	}
 
 	venc->irq = platform_get_irq(pdev, 0);
 	if (venc->irq < 0)
