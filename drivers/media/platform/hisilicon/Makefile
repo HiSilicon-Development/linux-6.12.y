@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 
 obj-$(CONFIG_DVB_HISTB_DMX) += histb-dmx.o
+obj-$(CONFIG_VIDEO_HISTB_JPGE) += histb-jpge.o
 obj-$(CONFIG_VIDEO_HISTB_VDEC) += histb-vdec.o
 obj-$(CONFIG_VIDEO_HISTB_VPSS) += histb-vpss.o
 

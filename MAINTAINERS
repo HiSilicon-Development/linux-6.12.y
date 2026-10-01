@@ -10227,6 +10227,12 @@ F:	Documentation/ABI/testing/sysfs-driver-hi3798cv200-sci
 F:	Documentation/devicetree/bindings/serial/hisilicon,hi3798cv200-sci.yaml
 F:	drivers/tty/serial/hi3798cv200-sci.c
 
+HISILICON HISTB JPEG ENCODER DRIVER
+L:	linux-media@vger.kernel.org
+S:	Supported
+F:	Documentation/devicetree/bindings/media/hisilicon,hi3798cv200-jpge.yaml
+F:	drivers/media/platform/hisilicon/histb-jpge.c
+
 HISILICON HISTB TRANSPORT STREAM DEMULTIPLEXER DRIVER
 L:	linux-media@vger.kernel.org
 S:	Supported

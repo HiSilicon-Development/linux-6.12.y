@@ -16,6 +16,22 @@ config DVB_HISTB_DMX
 	  To compile this driver as a module, choose M here. The module will be
 	  called histb-dmx.
 
+config VIDEO_HISTB_JPGE
+	tristate "HiSilicon HiSTB JPEG encoder"
+	depends on V4L_MEM2MEM_DRIVERS
+	depends on ARCH_HISI || COMPILE_TEST
+	depends on HAS_DMA && OF
+	select V4L2_JPEG_HELPER
+	select V4L2_MEM2MEM_DEV
+	select VIDEOBUF2_DMA_CONTIG
+	help
+	  Support the stand-alone baseline JPEG encoder found in HiSilicon
+	  Hi3798CV200 SoCs. The driver exposes a standard V4L2 memory-to-memory
+	  encoder with NV12 input and JPEG output.
+
+	  To compile this driver as a module, choose M here. The module will be
+	  called histb-jpge.
+
 config VIDEO_HISTB_VDEC
 	tristate "HiSilicon Hi3798CV200 video decoder"
 	depends on V4L_MEM2MEM_DRIVERS
