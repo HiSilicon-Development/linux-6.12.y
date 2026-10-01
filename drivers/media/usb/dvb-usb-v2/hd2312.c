@@ -169,6 +169,9 @@ static int hd2312_set_frontend(struct dvb_frontend *fe)
 	if (ret)
 		return ret;
 	state->frequency = frequency;
+	state->last_stats_jiffies = 0;
+	state->cached_snr = 0;
+	state->cached_strength = 0;
 	return 0;
 }
 
@@ -221,26 +224,15 @@ static int hd2312_read_status(struct dvb_frontend *fe, enum fe_status *status)
 	struct hd2312_state *state = fe->demodulator_priv;
 	struct dtv_frontend_properties *c = &fe->dtv_property_cache;
 	struct dvb_usb_device *d = fe_to_d(fe);
+	unsigned long interval = state->cached_snr ? (HZ * 2) : (HZ / 10);
 	int ret;
 
 	*status = 0;
 	if (!state->frequency)
 		return 0;
 
-	/*
-	 * In weak RF conditions, synchronous 0xEA lock queries take 0.56-1.64s
-	 * and block the frontend thread, causing Tvheadend demux read poll TIMEOUT.
-	 *
-	 * Match DtmbUSB reference behavior:
-	 * Once tuned to a valid frequency, immediately report full lock so
-	 * the demux/DVR thread receives TS data without poll timeouts.
-	 * Rate-limit statistics queries (0xEB, 0xE8) to at most once every 2s
-	 * so the USB bus is never flooded with vendor control transfers.
-	 */
-	*status = FE_HAS_SIGNAL | FE_HAS_CARRIER | FE_HAS_VITERBI |
-		  FE_HAS_SYNC | FE_HAS_LOCK;
-
-	if (time_after(jiffies, state->last_stats_jiffies + HZ * 2)) {
+	if (!state->last_stats_jiffies ||
+	    time_after(jiffies, state->last_stats_jiffies + interval)) {
 		state->last_stats_jiffies = jiffies;
 		ret = hd2312_ctrl(d, HD2312_REQ_STRENGTH, true,
 				  state->statistics, 4);
@@ -262,6 +254,12 @@ static int hd2312_read_status(struct dvb_frontend *fe, enum fe_status *status)
 					    (state->statistics[1] * 10);
 		}
 	}
+
+	if (state->cached_snr > 0)
+		*status = FE_HAS_SIGNAL | FE_HAS_CARRIER | FE_HAS_VITERBI |
+			  FE_HAS_SYNC | FE_HAS_LOCK;
+	else if (state->cached_strength > 0)
+		*status = FE_HAS_SIGNAL;
 
 	return 0;
 }
@@ -347,7 +345,7 @@ static const struct dvb_usb_device_properties hd2312_props = {
 	.num_adapters = 1,
 	.adapter = {
 		{
-			.stream = DVB_USB_STREAM_BULK(0x82, 10, 8192),
+			.stream = DVB_USB_STREAM_BULK(0x82, 8, 24064),
 		},
 	},
 };
