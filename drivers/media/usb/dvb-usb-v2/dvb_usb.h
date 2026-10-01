@@ -98,6 +98,7 @@
 
 struct dvb_usb_device;
 struct dvb_usb_adapter;
+struct usb_data_stream;
 
 /**
  * struct dvb_usb_driver_info - structure for carrying all needed data from the
@@ -167,6 +168,7 @@ struct usb_data_stream_properties {
  * @pid_filter_count: pid count of adapter pid-filter
  * @pid_filter_ctrl: called to enable/disable pid-filter
  * @pid_filter: called to set/unset pid for filtering
+ * @stream_complete: optional callback for device-specific USB stream framing
  * @stream: adapter usb stream configuration
  */
 struct dvb_usb_adapter_properties {
@@ -179,6 +181,8 @@ struct dvb_usb_adapter_properties {
 	u8 pid_filter_count;
 	int (*pid_filter_ctrl) (struct dvb_usb_adapter *, int);
 	int (*pid_filter) (struct dvb_usb_adapter *, int, u16, int);
+	void (*stream_complete)(struct usb_data_stream *stream, u8 *buffer,
+				size_t length);
 
 	struct usb_data_stream_properties stream;
 };

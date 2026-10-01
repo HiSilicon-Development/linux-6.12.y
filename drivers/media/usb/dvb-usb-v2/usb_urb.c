@@ -20,6 +20,7 @@ static void usb_urb_complete(struct urb *urb)
 {
 	struct usb_data_stream *stream = urb->context;
 	int ptype = usb_pipetype(urb->pipe);
+	int ret;
 	int i;
 	u8 *b;
 
@@ -73,7 +74,11 @@ static void usb_urb_complete(struct urb *urb)
 				KBUILD_MODNAME);
 		return;
 	}
-	usb_submit_urb(urb, GFP_ATOMIC);
+	ret = usb_submit_urb(urb, GFP_ATOMIC);
+	if (ret && ret != -ENODEV && ret != -ENOENT && ret != -ESHUTDOWN)
+		dev_err_ratelimited(&stream->udev->dev,
+				    "%s: URB resubmit failed=%d\n",
+				    KBUILD_MODNAME, ret);
 }
 
 int usb_urb_killv2(struct usb_data_stream *stream)
