@@ -9,6 +9,8 @@ struct histb_vpss;
 
 struct histb_vpss_frame {
 	dma_addr_t input_dma;
+	/* Size of the complete decoder tile surface, when known. */
+	size_t input_size;
 	dma_addr_t output_dma;
 	void *output_cpu;
 	u32 input_width;
@@ -32,23 +34,27 @@ int histb_vpss_detile(struct histb_vpss *vpss,
  *
  * It consumes four consecutive fields and emits one progressive frame.
  * Field address registers sit at 0x100..0x13c in groups of four - control,
- * Y, C, stride - with REF at 0x110, CUR at 0x100, NXT1 at 0x120 and NXT2 at
- * 0x130.  That last group is the block this driver already drives as
- * INPUT_CTRL/INPUT_Y_ADDR/INPUT_C_ADDR/INPUT_STRIDE for the scaler, so the
- * de-interlacer and the scaler share one input register set and cannot run
- * as two independent nodes.
+ * Y, C, stride - with LAST at 0x110, CUR at 0x100, NXT1 at 0x120 and NEXT2
+ * at 0x130, and the block is handed them oldest first.
  *
- * The input is expected in the decoder's tile format, which is what
- * histb_vdec already produces.
+ * A field is not a surface of its own: it lives inside a frame sized surface,
+ * two fields per surface.  The vendor path programs the same woven-frame base
+ * for both parities and selects field reads through CTRL.bfield_mode.  The
+ * pair's chroma plane sits a full woven frame height beyond the shared luma
+ * base.  Four inputs therefore refer to consecutive frame sized surfaces in
+ * display-field order, with duplicate bases for the two fields of each frame.
+ *
+ * The input is linear NV12.  Decoder tile surfaces must be detiled first.
  */
 struct histb_vpss_dei_frame {
-	dma_addr_t ref_dma;	/* last field, for motion estimation */
+	dma_addr_t ref_dma;	/* oldest field, for motion estimation */
 	dma_addr_t cur_dma;
 	dma_addr_t nxt1_dma;
-	dma_addr_t nxt2_dma;
+	dma_addr_t nxt2_dma;	/* newest field */
 	u32 width;
 	u32 height;		/* height of one field */
-	u32 stride;		/* Y stride; C follows the same pitch */
+	u32 stride;		/* frame pitch of the input surfaces */
+	u32 output_stride;	/* pitch the de-interlaced frame is written at */
 	bool top_field_first;
 	bool ten_bit;
 	bool	bottom_field;	/* HI_DRV_FIELD_BOTTOM */

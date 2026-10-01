@@ -825,7 +825,11 @@ struct histb_vdec_dev {
 	enum histb_vdec_job_phase phase;
 	bool job_cancelled;
 	struct histb_vdec_ctx *post_ctx;
+	struct vb2_v4l2_buffer *post_src;
+	struct vb2_v4l2_buffer *post_dst;
 	bool post_abort;
+	bool post_pipelined;
+	bool post_draining;
 	struct delayed_work watchdog_work;
 	struct work_struct postprocess_work;
 	struct completion postprocess_idle;
@@ -833,6 +837,12 @@ struct histb_vdec_dev {
 	bool job_count_pending;
 	u64 jobs;
 	u64 errors;
+	u64 perf_job_start_ns;
+	u64 perf_hw_start_ns;
+	u64 perf_setup_ns;
+	u64 perf_hw_ns;
+	u64 perf_post_ns;
+	u32 perf_frames;
 };
 
 struct histb_vdec_capture_mem {
@@ -2649,10 +2659,16 @@ histb_vdec_free_decoded_buffers(struct histb_vdec_ctx *ctx,
 {
 	struct device *dev = ctx->vdec->dev;
 
-	if (decoded->pmv.cpu)
-		dma_free_noncoherent(dev, decoded->pmv.size, decoded->pmv.cpu,
-				  decoded->pmv.dma,
+	if (decoded->pmv.cpu) {
+		if (decoded->pmv_noncoherent)
+			dma_free_noncoherent(dev, decoded->pmv.size,
+					     decoded->pmv.cpu,
+					     decoded->pmv.dma,
 					     DMA_BIDIRECTIONAL);
+		else
+			dma_free_coherent(dev, decoded->pmv.size,
+					  decoded->pmv.cpu, decoded->pmv.dma);
+	}
 	if (decoded->tile.cpu) {
 		if (decoded->tile_noncoherent)
 			dma_free_noncoherent(dev, decoded->tile.size,
@@ -2669,6 +2685,7 @@ histb_vdec_free_decoded_buffers(struct histb_vdec_ctx *ctx,
 	decoded->tile.cpu = NULL;
 	decoded->tile.dma = 0;
 	decoded->tile_noncoherent = true;
+	decoded->pmv_noncoherent = true;
 	memset(&decoded->avs, 0, sizeof(decoded->avs));
 	decoded->vp9_dpb_valid = false;
 	decoded->vp9_logic_id = HISTB_VDEC_APC_INVALID;
@@ -2685,7 +2702,8 @@ histb_vdec_alloc_decoded_buffers(struct histb_vdec_ctx *ctx,
 		histb_vdec_free_decoded_buffers(ctx, decoded);
 
 	/*
-	 * Cacheable surfaces at every size.  This used to switch to
+	 * Cacheable surfaces at every size outside field-rate DEI. This used to
+	 * switch to
 	 * dma_alloc_coherent() at 3840 and above, i.e. the 4K decode output
 	 * (~12 MB per frame) was mapped uncached while every smaller size was
 	 * cacheable.  The explicit dma_sync_single_for_device() below covers
@@ -2693,7 +2711,15 @@ histb_vdec_alloc_decoded_buffers(struct histb_vdec_ctx *ctx,
 	 * large multiple of the decode time - measured 6 fps for 4K HEVC
 	 * Main10 against a 50 fps stream.
 	 */
-	decoded->tile_noncoherent = true;
+	/*
+	 * Field-rate DEI doubles every capture surface and keeps a three-frame
+	 * linear history.  Keeping its reconstruction surfaces in the shared
+	 * 192 MiB CMA pool leaves too little contiguous memory for those outputs
+	 * and the encoder queues.  They are bus-only while DEI is active, so use
+	 * the board's dedicated coherent VDEC pool without putting the normal or
+	 * UHD paths back on uncached memory.
+	 */
+	decoded->tile_noncoherent = !ctx->dei_field_rate;
 	if (decoded->tile_noncoherent)
 		decoded->tile.cpu = dma_alloc_noncoherent(dev, decoded->tile.size,
 							  &decoded->tile.dma,
@@ -2705,17 +2731,22 @@ histb_vdec_alloc_decoded_buffers(struct histb_vdec_ctx *ctx,
 	if (!decoded->tile.cpu)
 		return -ENOMEM;
 	if (decoded->pmv.size) {
-		/* Same reasoning as the tile surface: the engine only ever reads
-		 * it through the bus, and the CPU never touches it mid-decode. */
-		decoded->pmv.cpu = dma_alloc_noncoherent(dev, decoded->pmv.size,
-							 &decoded->pmv.dma,
-							 DMA_BIDIRECTIONAL,
-							 GFP_KERNEL);
+		decoded->pmv_noncoherent = !ctx->dei_field_rate;
+		if (decoded->pmv_noncoherent)
+			decoded->pmv.cpu = dma_alloc_noncoherent(dev,
+								 decoded->pmv.size,
+								 &decoded->pmv.dma,
+								 DMA_BIDIRECTIONAL,
+								 GFP_KERNEL);
+		else
+			decoded->pmv.cpu = dma_alloc_coherent(dev,
+							     decoded->pmv.size,
+							     &decoded->pmv.dma,
+							     GFP_KERNEL);
 		if (!decoded->pmv.cpu) {
 			histb_vdec_free_decoded_buffers(ctx, decoded);
 			return -ENOMEM;
 		}
-		decoded->pmv_noncoherent = true;
 	}
 	if (upper_32_bits(decoded->tile.dma) ||
 	    (decoded->pmv.size && upper_32_bits(decoded->pmv.dma))) {
@@ -2728,8 +2759,13 @@ histb_vdec_alloc_decoded_buffers(struct histb_vdec_ctx *ctx,
 		dma_sync_single_for_device(dev, decoded->tile.dma,
 					   decoded->tile.size,
 					   DMA_BIDIRECTIONAL);
-	if (decoded->pmv.cpu)
+	if (decoded->pmv.cpu) {
 		memset(decoded->pmv.cpu, 0, decoded->pmv.size);
+		if (decoded->pmv_noncoherent)
+			dma_sync_single_for_device(dev, decoded->pmv.dma,
+						   decoded->pmv.size,
+						   DMA_BIDIRECTIONAL);
+	}
 	return 0;
 }
 
@@ -3440,7 +3476,22 @@ histb_vdec_sync_apc(struct histb_vdec_ctx *ctx,
 	return 0;
 }
 
-static bool histb_vdec_retain_hevc_surfaces(const struct histb_vdec_ctx *ctx)
+static bool
+histb_vdec_post_owns_decoded(struct histb_vdec_ctx *ctx,
+			     struct histb_vdec_decoded_buffer *decoded)
+{
+	struct histb_vdec_dev *vdec = ctx->vdec;
+	struct vb2_v4l2_buffer *post_dst;
+	unsigned long flags;
+
+	spin_lock_irqsave(&vdec->irqlock, flags);
+	post_dst = vdec->post_ctx == ctx ? vdec->post_dst : NULL;
+	spin_unlock_irqrestore(&vdec->irqlock, flags);
+
+	return post_dst && histb_vdec_decoded_buffer(post_dst) == decoded;
+}
+
+static bool histb_vdec_use_hevc_surface_pool(const struct histb_vdec_ctx *ctx)
 {
 	return ctx->src.pix.pixelformat == V4L2_PIX_FMT_HEVC_SLICE &&
 		(ctx->dst.pix.width < ctx->src.pix.width ||
@@ -3479,7 +3530,8 @@ histb_vdec_sync_hevc_apc(struct histb_vdec_ctx *ctx,
 		if (!ctx->apc[slot] || keep[slot])
 			continue;
 		ctx->apc[slot]->apc_slot = HISTB_VDEC_APC_INVALID;
-		if (!histb_vdec_retain_hevc_surfaces(ctx))
+		if (!histb_vdec_use_hevc_surface_pool(ctx) &&
+		    !histb_vdec_post_owns_decoded(ctx, ctx->apc[slot]))
 			histb_vdec_free_decoded_buffers(ctx, ctx->apc[slot]);
 		ctx->apc[slot] = NULL;
 	}
@@ -3670,6 +3722,7 @@ histb_vdec_reclaim_decoded_buffers(struct histb_vdec_ctx *ctx,
 				   struct histb_vdec_decoded_buffer *output)
 {
 	struct vb2_queue *queue = v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx);
+	bool hevc_pool = histb_vdec_use_hevc_surface_pool(ctx);
 	unsigned int i;
 
 	for (i = 0; i < queue->max_num_buffers; i++) {
@@ -3683,12 +3736,27 @@ histb_vdec_reclaim_decoded_buffers(struct histb_vdec_ctx *ctx,
 		/* H.264 references may leave the request DPB and reappear after MMCO. */
 		if (decoded == output ||
 		    ctx->src.pix.pixelformat == V4L2_PIX_FMT_H264_SLICE ||
-		    histb_vdec_retain_hevc_surfaces(ctx) ||
+		    histb_vdec_post_owns_decoded(ctx, decoded) ||
 		    (ctx->src.pix.pixelformat == V4L2_PIX_FMT_AVS_SLICE &&
 		     decoded->avs.valid) ||
 		    decoded->vp9_dpb_valid ||
 		    decoded->apc_slot != HISTB_VDEC_APC_INVALID)
 			continue;
+		if (hevc_pool) {
+			if (!output->tile.cpu && decoded->tile.cpu &&
+			    decoded->tile.size == output->tile.size &&
+			    decoded->pmv.size == output->pmv.size) {
+				output->tile = decoded->tile;
+				output->pmv = decoded->pmv;
+				output->tile_noncoherent = decoded->tile_noncoherent;
+				output->pmv_noncoherent = decoded->pmv_noncoherent;
+				memset(&decoded->tile, 0, sizeof(decoded->tile));
+				memset(&decoded->pmv, 0, sizeof(decoded->pmv));
+				decoded->tile_noncoherent = true;
+				decoded->pmv_noncoherent = true;
+			}
+			continue;
+		}
 		histb_vdec_free_decoded_buffers(ctx, decoded);
 	}
 }
@@ -4117,18 +4185,19 @@ histb_vdec_dei_picture(const struct histb_vdec_ctx *ctx,
 	return true;
 }
 
-static int histb_vdec_copy_capture(struct histb_vdec_ctx *ctx)
+static int histb_vdec_copy_capture(struct histb_vdec_ctx *ctx,
+				   struct vb2_v4l2_buffer *dst_buf)
 {
 	struct histb_vdec_decoded_buffer *decoded;
 	struct histb_vpss_frame frame;
-	struct vb2_v4l2_buffer *dst_buf;
 	dma_addr_t dst_dma;
 	u8 *dst;
 	bool top_field_first;
 	bool deinterlace;
 	int ret;
 
-	dst_buf = v4l2_m2m_next_dst_buf(ctx->fh.m2m_ctx);
+	if (!dst_buf)
+		dst_buf = v4l2_m2m_next_dst_buf(ctx->fh.m2m_ctx);
 	if (!dst_buf)
 		return -EPIPE;
 	decoded = histb_vdec_decoded_buffer(dst_buf);
@@ -10690,6 +10759,97 @@ static void histb_vdec_watchdog(struct work_struct *work)
 		histb_vdec_finish_job(ctx, VB2_BUF_STATE_ERROR);
 }
 
+/*
+ * HEVC at UHD resolution spends a comparable amount of time in request
+ * preparation, VDH and VPSS.  Keeping the mem2mem job current until VPSS has
+ * copied the reconstruction surface serializes all three stages.  Once VDH
+ * has completed, detach this request's buffers and release the scheduler so
+ * the next request can be prepared and decoded while VPSS consumes the
+ * previous, immutable reconstruction surface.
+ *
+ * The detached capture buffer is still owned by vb2 and remains discoverable
+ * by timestamp for stateless reference lookup.  It is returned to userspace
+ * only after VPSS completion; destination is completed before source so a
+ * request waiter cannot run ahead of its capture result.
+ */
+static int histb_vdec_begin_hevc_pipeline(struct histb_vdec_ctx *ctx)
+{
+	struct histb_vdec_dev *vdec = ctx->vdec;
+	struct v4l2_m2m_ctx *m2m_ctx = ctx->fh.m2m_ctx;
+	struct vb2_v4l2_buffer *src, *dst;
+	unsigned long flags;
+	bool draining;
+
+	src = v4l2_m2m_next_src_buf(m2m_ctx);
+	dst = v4l2_m2m_next_dst_buf(m2m_ctx);
+	if (WARN_ON(!src || !dst))
+		return -EPIPE;
+
+	draining = v4l2_m2m_is_last_draining_src_buf(m2m_ctx, src);
+	histb_vdec_prepare_capture_buffer(ctx, src, dst, VB2_BUF_STATE_DONE,
+					  ctx->frame_flags);
+	dst->sequence = ctx->dst.sequence++;
+
+	WARN_ON(v4l2_m2m_src_buf_remove(m2m_ctx) != src);
+	WARN_ON(v4l2_m2m_dst_buf_remove(m2m_ctx) != dst);
+
+	spin_lock_irqsave(&vdec->irqlock, flags);
+	vdec->post_src = src;
+	vdec->post_dst = dst;
+	vdec->post_pipelined = true;
+	vdec->post_draining = draining;
+	spin_unlock_irqrestore(&vdec->irqlock, flags);
+
+	/* VDH no longer owns registers or memory; VPSS holds its own PM ref. */
+	pm_runtime_mark_last_busy(vdec->dev);
+	pm_runtime_put_autosuspend(vdec->dev);
+	v4l2_m2m_job_finish(vdec->m2m_dev, m2m_ctx);
+	return 0;
+}
+
+static void histb_vdec_finish_hevc_pipeline(struct histb_vdec_ctx *ctx,
+					     int post_ret, bool aborted)
+{
+	struct histb_vdec_dev *vdec = ctx->vdec;
+	struct v4l2_m2m_ctx *m2m_ctx = ctx->fh.m2m_ctx;
+	struct histb_vdec_decoded_buffer *decoded;
+	struct vb2_v4l2_buffer *src, *dst;
+	enum vb2_buffer_state decode_state, capture_state;
+	unsigned long flags;
+	bool draining;
+
+	spin_lock_irqsave(&vdec->irqlock, flags);
+	src = vdec->post_src;
+	dst = vdec->post_dst;
+	draining = vdec->post_draining;
+	spin_unlock_irqrestore(&vdec->irqlock, flags);
+	if (WARN_ON(!src || !dst))
+		return;
+
+	decoded = histb_vdec_decoded_buffer(dst);
+	decode_state = !post_ret && !aborted ?
+		VB2_BUF_STATE_DONE : VB2_BUF_STATE_ERROR;
+	if (decode_state != VB2_BUF_STATE_DONE)
+		decoded->error_tainted = true;
+	capture_state = decoded->error_tainted ?
+		VB2_BUF_STATE_ERROR : decode_state;
+	if (capture_state != VB2_BUF_STATE_DONE)
+		vb2_set_plane_payload(&dst->vb2_buf, 0, 0);
+
+	if (draining && decode_state == VB2_BUF_STATE_DONE) {
+		dst->flags |= V4L2_BUF_FLAG_LAST;
+		v4l2_m2m_mark_stopped(m2m_ctx);
+	}
+	v4l2_m2m_buf_done(dst, capture_state);
+	v4l2_m2m_buf_done(src, decode_state);
+	if (!draining)
+		return;
+	if (decode_state == VB2_BUF_STATE_DONE)
+		v4l2_event_queue_fh(&ctx->fh, &histb_vdec_eos_event);
+	else
+		histb_vdec_complete_empty_last(ctx);
+}
+
 static void histb_vdec_postprocess(struct work_struct *work)
 {
 	struct histb_vdec_dev *vdec =
@@ -10698,17 +10858,22 @@ static void histb_vdec_postprocess(struct work_struct *work)
 	struct histb_mpeg4_display_plan mpeg4_display_plan;
 	struct histb_mpeg4_display_state mpeg4_display_state;
 	struct vb2_v4l2_buffer *mpeg4_src;
+	struct vb2_v4l2_buffer *post_dst;
 	unsigned long flags;
 	bool aborted;
+	bool pipelined;
 	bool mpeg2_first_field = false;
 	bool vc1_first_field = false;
 	bool vc1_commit_ok = false;
 	bool mpeg4_draining;
 	bool mpeg4_first_anchor = false;
+	u64 post_start_ns = ktime_get_ns();
 	int ret;
 
 	spin_lock_irqsave(&vdec->irqlock, flags);
 	ctx = vdec->post_ctx;
+	pipelined = vdec->post_pipelined;
+	post_dst = vdec->post_dst;
 	spin_unlock_irqrestore(&vdec->irqlock, flags);
 	if (!ctx)
 		return;
@@ -10719,7 +10884,7 @@ static void histb_vdec_postprocess(struct work_struct *work)
 	mpeg2_first_field = ctx->mpeg2 && ctx->mpeg2_picture_valid &&
 		ctx->mpeg2_field_picture && !ctx->mpeg2_second_field;
 	ret = vc1_first_field || mpeg2_first_field ?
-		0 : histb_vdec_copy_capture(ctx);
+		0 : histb_vdec_copy_capture(ctx, post_dst);
 	spin_lock_irqsave(&vdec->irqlock, flags);
 	aborted = vdec->post_abort;
 	spin_unlock_irqrestore(&vdec->irqlock, flags);
@@ -10727,6 +10892,31 @@ static void histb_vdec_postprocess(struct work_struct *work)
 		spin_lock_irqsave(&vdec->irqlock, flags);
 		vdec->errors++;
 		spin_unlock_irqrestore(&vdec->irqlock, flags);
+	}
+	if (pipelined) {
+		u32 frames = ++vdec->perf_frames;
+
+		vdec->perf_post_ns += ktime_get_ns() - post_start_ns;
+		if (!(frames % 100))
+			dev_info(vdec->dev,
+				 "HEVC pipeline %u: setup=%llu us hw=%llu us post=%llu us\n",
+				 frames,
+				 div_u64(vdec->perf_setup_ns, frames * 1000ULL),
+				 div_u64(vdec->perf_hw_ns, frames * 1000ULL),
+				 div_u64(vdec->perf_post_ns, frames * 1000ULL));
+		histb_vdec_finish_hevc_pipeline(ctx, ret, aborted);
+		spin_lock_irqsave(&vdec->irqlock, flags);
+		if (vdec->post_ctx == ctx) {
+			vdec->post_ctx = NULL;
+			vdec->post_src = NULL;
+			vdec->post_dst = NULL;
+			vdec->post_abort = false;
+			vdec->post_pipelined = false;
+			vdec->post_draining = false;
+		}
+		spin_unlock_irqrestore(&vdec->irqlock, flags);
+		complete(&vdec->postprocess_idle);
+		return;
 	}
 	if (ctx->vp8) {
 		/* Keep the VDH-updated state when only capture conversion failed. */
@@ -11135,6 +11325,7 @@ static irqreturn_t histb_vdec_irq_thread(int irq, void *data)
 	bool cabac_end_error, cancelled = false, decode_failed, message_error;
 	bool phase_error = false, post_busy = false;
 	bool post_published = false;
+	bool hevc_pipelined = false;
 	u32 smmu_state_secure, smmu_state_nonsecure;
 
 	/* Serialize status sampling/acknowledgement with the launch path.  Without
@@ -11171,7 +11362,8 @@ static irqreturn_t histb_vdec_irq_thread(int irq, void *data)
 		vdec->job_cancelled = false;
 		if (cancelled || phase_error) {
 			/* Abort or a wrong-phase IRQ owns error completion, never display. */
-		} else if (WARN_ON(vdec->post_ctx)) {
+		} else if (vdec->post_ctx) {
+			WARN_ON(!ctx->hevc);
 			post_busy = true;
 		} else {
 			vdec->post_ctx = ctx;
@@ -11184,6 +11376,28 @@ static irqreturn_t histb_vdec_irq_thread(int irq, void *data)
 	mutex_unlock(&vdec->launch_lock);
 	if (!ctx)
 		return IRQ_HANDLED;
+	if (ctx->hevc && vdec->perf_hw_start_ns) {
+		u64 now = ktime_get_ns();
+
+		vdec->perf_setup_ns += vdec->perf_hw_start_ns -
+					vdec->perf_job_start_ns;
+		vdec->perf_hw_ns += now - vdec->perf_hw_start_ns;
+	}
+	if (post_busy && ctx->hevc) {
+		/* The normal HEVC cadence finishes VPSS before the next VDH IRQ.
+		 * If a slow frame overlaps, wait here rather than dropping a valid
+		 * decode or reusing the single postprocess transaction. */
+		flush_work(&vdec->postprocess_work);
+		spin_lock_irqsave(&vdec->irqlock, flags);
+		if (!vdec->post_ctx) {
+			vdec->post_ctx = ctx;
+			vdec->post_abort = false;
+			reinit_completion(&vdec->postprocess_idle);
+			post_published = true;
+			post_busy = false;
+		}
+		spin_unlock_irqrestore(&vdec->irqlock, flags);
+	}
 	if (cancelled || phase_error) {
 		cancel_delayed_work(&vdec->watchdog_work);
 		mutex_lock(&vdec->launch_lock);
@@ -11319,6 +11533,18 @@ static irqreturn_t histb_vdec_irq_thread(int irq, void *data)
 	if (!decode_failed &&
 	    ctx->src.pix.pixelformat == V4L2_PIX_FMT_H264_SLICE)
 		histb_vdec_reset_h264_slices(ctx);
+	if (!decode_failed && ctx->hevc) {
+		int ret = histb_vdec_begin_hevc_pipeline(ctx);
+
+		if (ret) {
+			decode_failed = true;
+			spin_lock_irqsave(&vdec->irqlock, flags);
+			vdec->errors++;
+			spin_unlock_irqrestore(&vdec->irqlock, flags);
+		} else {
+			hevc_pipelined = true;
+		}
+	}
 	if (!decode_failed) {
 		if (!queue_work(system_long_wq, &vdec->postprocess_work)) {
 			if (ctx->vp8)
@@ -11333,13 +11559,19 @@ static irqreturn_t histb_vdec_irq_thread(int irq, void *data)
 				histb_vdec_discard_vc1_runtime_error(ctx, false);
 			if (ctx->vc1)
 				histb_vdec_finish_vc1_error(ctx);
+			else if (hevc_pipelined)
+				histb_vdec_finish_hevc_pipeline(ctx, -EIO, false);
 			else
 				histb_vdec_finish_job(ctx, VB2_BUF_STATE_ERROR);
 			if (post_published) {
 				spin_lock_irqsave(&vdec->irqlock, flags);
 				if (vdec->post_ctx == ctx) {
 					vdec->post_ctx = NULL;
+					vdec->post_src = NULL;
+					vdec->post_dst = NULL;
 					vdec->post_abort = false;
+					vdec->post_pipelined = false;
+					vdec->post_draining = false;
 				}
 				spin_unlock_irqrestore(&vdec->irqlock, flags);
 				complete(&vdec->postprocess_idle);
@@ -11376,7 +11608,11 @@ static irqreturn_t histb_vdec_irq_thread(int irq, void *data)
 			spin_lock_irqsave(&vdec->irqlock, flags);
 			if (vdec->post_ctx == ctx) {
 				vdec->post_ctx = NULL;
+				vdec->post_src = NULL;
+				vdec->post_dst = NULL;
 				vdec->post_abort = false;
+				vdec->post_pipelined = false;
+				vdec->post_draining = false;
 			}
 			spin_unlock_irqrestore(&vdec->irqlock, flags);
 			complete(&vdec->postprocess_idle);
@@ -11391,13 +11627,17 @@ static void histb_vdec_abort(struct histb_vdec_ctx *ctx)
 	struct histb_vdec_dev *vdec = ctx->vdec;
 	enum histb_vdec_job_phase phase = HISTB_VDEC_PHASE_IDLE;
 	unsigned long flags;
-	bool active, post, taken = false;
+	bool active, pipelined = false, post, taken = false;
 
 	spin_lock_irqsave(&vdec->irqlock, flags);
 	active = vdec->curr_ctx == ctx;
 	if (active) {
 		phase = vdec->phase;
 		vdec->job_cancelled = true;
+	}
+	if (vdec->post_ctx == ctx && vdec->post_pipelined) {
+		vdec->post_abort = true;
+		pipelined = true;
 	}
 	spin_unlock_irqrestore(&vdec->irqlock, flags);
 	if (ctx->vc1) {
@@ -11445,6 +11685,10 @@ static void histb_vdec_abort(struct histb_vdec_ctx *ctx)
 		/* Let this context's IRQ finish queueing its postprocess work. */
 		synchronize_irq(vdec->irq);
 		cancel_delayed_work_sync(&vdec->watchdog_work);
+		if (pipelined) {
+			flush_work(&vdec->postprocess_work);
+			return;
+		}
 		cancel_work_sync(&vdec->postprocess_work);
 		spin_lock_irqsave(&vdec->irqlock, flags);
 		post = vdec->post_ctx == ctx;
@@ -11486,6 +11730,8 @@ static void histb_vdec_abort(struct histb_vdec_ctx *ctx)
 	synchronize_irq(vdec->irq);
 	histb_vdec_account_job(vdec, true);
 	histb_vdec_finish_job(ctx, VB2_BUF_STATE_ERROR);
+	if (pipelined)
+		flush_work(&vdec->postprocess_work);
 }
 
 static void histb_vdec_program_mpeg2_registers(
@@ -12635,7 +12881,7 @@ static void histb_vdec_run_vc1_job(struct histb_vdec_ctx *ctx,
 	}
 	if (ctx->vc1_pending_picture.skipped) {
 		ret = histb_vdec_copy_vc1_skipped_surface(ctx, decoded);
-		capture_ret = ret ? ret : histb_vdec_copy_capture(ctx);
+		capture_ret = ret ? ret : histb_vdec_copy_capture(ctx, NULL);
 
 		mutex_lock(&ctx->vc1_lock);
 		mutex_lock(&vdec->launch_lock);
@@ -12730,12 +12976,15 @@ static void histb_vdec_device_run(void *priv)
 	u32 total_mbs;
 	int ret;
 
-	wait_for_completion(&vdec->postprocess_idle);
-	/* The completion is signalled by the worker after finish_job, but the
-	 * work callback has not returned yet.  Flush that final interval before
-	 * allowing a new IRQ/postprocess transaction to reuse the owner. */
-	flush_work(&vdec->postprocess_work);
-	complete(&vdec->postprocess_idle);
+	if (ctx->src.pix.pixelformat != V4L2_PIX_FMT_HEVC_SLICE) {
+		wait_for_completion(&vdec->postprocess_idle);
+		/* The completion is signalled by the worker after finish_job, but
+		 * the callback has not returned yet.  Non-pipelined codecs must not
+		 * reuse the postprocess owner during that final interval. */
+		flush_work(&vdec->postprocess_work);
+		complete(&vdec->postprocess_idle);
+	}
+	vdec->perf_job_start_ns = ktime_get_ns();
 
 	src = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
 	dst = v4l2_m2m_next_dst_buf(ctx->fh.m2m_ctx);
@@ -13522,10 +13771,11 @@ start_hardware:
 							   total_mbs);
 	} else if (ctx->mpeg4)
 		histb_vdec_program_mpeg4_registers(ctx);
-	else if (ctx->hevc)
+	else if (ctx->hevc) {
+		vdec->perf_hw_start_ns = ktime_get_ns();
 		histb_vdec_program_hevc_registers(ctx, decoded, src_dma,
-							  total_mbs);
-	else
+						  total_mbs);
+	} else
 		histb_vdec_program_registers(ctx, decoded, src_dma, total_mbs,
 						     ctx->mbaff,
 						     ctx->h264_field_picture);
@@ -15550,7 +15800,7 @@ module_platform_driver(histb_vdec_driver);
 MODULE_AUTHOR("HiSilicon Technologies Co., Ltd.");
 MODULE_DESCRIPTION("HiSilicon Hi3798CV200 VDH video decoder");
 /* Build tag so a deployment can be proven to have taken effect. */
-#define HISTB_VDEC_BUILD_TAG "dvbip-20260915-rvwire"
+#define HISTB_VDEC_BUILD_TAG "dvbip-20260916-align2"
 MODULE_VERSION(HISTB_VDEC_BUILD_TAG);
 /* dma_buf_export() lives in the DMA_BUF symbol namespace. */
 MODULE_IMPORT_NS(DMA_BUF);
