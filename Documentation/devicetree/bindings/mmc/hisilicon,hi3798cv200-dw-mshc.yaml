@@ -44,6 +44,44 @@ properties:
       - description: A phandle pointed to the CRG syscon node
       - description: Sample DLL register offset in CRG address space
 
+  hisilicon,io-voltage-reg:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    description: |
+      A phandle to the system controller and the register offset whose bit 0
+      reports the eMMC I/O voltage selected by the board. A set bit reports
+      1.8 V and a clear bit reports 3.3 V. The driver uses the read-only value
+      to select the captured DDR52 sample phase; it never changes the voltage.
+    items:
+      - items:
+          - description: A phandle to the system controller syscon node
+          - description: I/O voltage status register offset
+
+  hisilicon,hs400-strobe-reg:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    description: |
+      CRG syscon register containing the CV200 HS400 data-strobe enable
+      bit and delay field. The driver either inherits a bootloader-qualified
+      delay or tunes phases 1 through 15 with repeated EXT_CSD reads.
+    items:
+      - items:
+          - description: A phandle to the CRG syscon node
+          - description: HS400 data-strobe register offset
+
+  hisilicon,inherit-boot-tuning:
+    type: boolean
+    description: |
+      Preserve the HS200 sample phase and HS400 data-strobe delay qualified by
+      the bootloader when they are usable. The driver captures both values
+      before its first timing transition and validates the sample phase with
+      CMD21. A stale or invalid hand-off is not fatal: Linux disables
+      inheritance and actively retunes the sample and data-strobe windows.
+      Validated values are restored whenever the card returns to HS400.
+
+dependencies:
+  hisilicon,inherit-boot-tuning:
+    - hisilicon,hs400-strobe-reg
+    - hisilicon,io-voltage-reg
+
 required:
   - compatible
   - reg
@@ -62,6 +100,10 @@ allOf:
     then:
       required:
         - hisilicon,sap-dll-reg
+      properties:
+        hisilicon,io-voltage-reg: false
+        hisilicon,hs400-strobe-reg: false
+        hisilicon,inherit-boot-tuning: false
     else:
       properties:
         hisilicon,sap-dll-reg: false
@@ -84,14 +126,20 @@ examples:
         clock-names = "ciu", "biu", "ciu-sample", "ciu-drive";
         resets = <&crg 0xa0 4>;
         reset-names = "reset";
-        pinctrl-names = "default";
-        pinctrl-0 = <&emmc_pins_1 &emmc_pins_2
-                     &emmc_pins_3 &emmc_pins_4>;
+        hisilicon,io-voltage-reg = <&sysctrl 0xf4>;
+        hisilicon,hs400-strobe-reg = <&crg 0x290>;
+        hisilicon,inherit-boot-tuning;
+        pinctrl-names = "default", "hs200", "hs400";
+        pinctrl-0 = <&emmc_pins_1>;
+        pinctrl-1 = <&emmc_hs200_pins>;
+        pinctrl-2 = <&emmc_hs400_pins>;
         fifo-depth = <256>;
-        clock-frequency = <200000000>;
+        clock-frequency = <150000000>;
+        max-frequency = <150000000>;
         cap-mmc-highspeed;
         mmc-ddr-1_8v;
         mmc-hs200-1_8v;
+        mmc-hs400-1_8v;
         non-removable;
         bus-width = <8>;
     };

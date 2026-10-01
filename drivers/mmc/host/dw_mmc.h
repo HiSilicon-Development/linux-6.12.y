@@ -591,9 +591,12 @@ struct dw_mci_slot {
  * @set_ios: handle bus specific extensions.
  * @parse_dt: parse implementation specific device tree properties.
  * @execute_tuning: implementation specific tuning procedure.
+ * @prepare_hs400_tuning: prepare implementation specific HS400 parameters.
+ * @execute_hs400_tuning: implementation specific data-strobe tuning.
  * @set_data_timeout: implementation specific timeout.
  * @get_drto_clks: implementation specific cycle count for data read timeout.
  * @hw_reset: implementation specific HW reset.
+ * @strict_reset: fail probe when the controller reset sequence fails.
  *
  * Provide controller implementation specific extensions. The usage of this
  * data structure is fully optional and usage of each member in this structure
@@ -609,11 +612,14 @@ struct dw_mci_drv_data {
 	int		(*execute_tuning)(struct dw_mci_slot *slot, u32 opcode);
 	int		(*prepare_hs400_tuning)(struct dw_mci *host,
 						struct mmc_ios *ios);
+	int		(*execute_hs400_tuning)(struct dw_mci *host,
+						struct mmc_card *card);
 	int		(*switch_voltage)(struct mmc_host *mmc,
 					  struct mmc_ios *ios);
 	void		(*set_data_timeout)(struct dw_mci *host,
 					  unsigned int timeout_ns);
 	u32		(*get_drto_clks)(struct dw_mci *host);
 	void		(*hw_reset)(struct dw_mci *host);
+	bool		strict_reset;
 };
 #endif /* _DW_MMC_H_ */
