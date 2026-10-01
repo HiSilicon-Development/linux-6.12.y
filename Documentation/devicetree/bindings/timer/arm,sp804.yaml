@@ -31,11 +31,15 @@ select:
 
 properties:
   compatible:
-    items:
+    oneOf:
       - enum:
           - arm,sp804
           - hisilicon,sp804
-      - const: arm,primecell
+      - items:
+          - enum:
+              - arm,sp804
+              - hisilicon,sp804
+          - const: arm,primecell
 
   interrupts:
     description: |
