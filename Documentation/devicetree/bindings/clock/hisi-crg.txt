@@ -33,6 +33,11 @@ The reset specifier consists of two cells. The first cell represents the
 register offset relative to the base address. The second cell represents the
 bit index in the register.
 
+For "hisilicon,hi3798cv200-crg", the second cell may be ORed with
+HI3798CV200_RESET_ACTIVE_LOW from
+<dt-bindings/reset/hisilicon,hi3798cv200-reset.h>. This describes reset bits
+which are cleared to assert reset and set to deassert it.
+
 Example: CRG nodes
 CRG: clock-reset-controller@12010000 {
 	compatible = "hisilicon,hi3519-crg";

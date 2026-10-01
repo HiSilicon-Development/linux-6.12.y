@@ -21,7 +21,8 @@
 
 #include "clk.h"
 
-static DEFINE_SPINLOCK(hisi_clk_lock);
+DEFINE_SPINLOCK(hisi_clk_lock);
+EXPORT_SYMBOL_GPL(hisi_clk_lock);
 
 struct hisi_clock_data *hisi_clk_alloc(struct platform_device *pdev,
 						int nr_clks)
