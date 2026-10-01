@@ -545,6 +545,19 @@ source "drivers/media/dvb-frontends/cxd2880/Kconfig"
 comment "DVB-C (cable) frontends"
 	depends on DVB_CORE
 
+config DVB_MXL214
+	tristate "MaxLinear MxL214 DVB-C receiver"
+	depends on DVB_CORE && I2C && GPIOLIB && OF
+	select FW_LOADER
+	help
+	  Support the four-channel MaxLinear MxL214 cable tuner and
+	  demodulator through the Linux DVB frontend API. The device needs
+	  firmware installed as mxl214/mxl214.fw and can use optional board
+	  calibration data from mxl214/nvram50.bin.
+
+	  To compile this driver as a module, choose M here. The module will
+	  be called mxl214.
+
 config DVB_STV0297
 	tristate "ST STV0297 based"
 	depends on DVB_CORE && I2C

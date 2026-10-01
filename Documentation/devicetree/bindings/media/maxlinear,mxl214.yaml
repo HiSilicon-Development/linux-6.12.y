@@ -1,0 +1,197 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/media/maxlinear,mxl214.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: MaxLinear MxL214 and MxL214C four-channel DVB-C receiver
+
+maintainers:
+  - linux-media@vger.kernel.org
+
+description:
+  The MxL214 family contains a full-band cable tuner and four DVB-C demodulators.
+  Each demodulator has an independent MPEG transport stream output while all
+  channels share one I2C control interface and reset input.
+
+properties:
+  compatible:
+    oneOf:
+      - const: maxlinear,mxl214
+      - items:
+          - const: maxlinear,mxl214c
+          - const: maxlinear,mxl214
+
+  reg:
+    maxItems: 1
+
+  reset-gpios:
+    description: Active-low hardware reset input
+    maxItems: 1
+
+  maxlinear,ts-mode:
+    description: >-
+      Three-wire outputs use independent gated clocks with SYNC and DATA.
+      Four-wire outputs use the common clock with SYNC, VALID and DATA and
+      require a silicon revision supporting that mode.
+    enum: [serial-3wire, serial-4wire]
+    default: serial-4wire
+
+  ports:
+    $ref: /schemas/graph.yaml#/properties/ports
+
+    properties:
+      port@0:
+        $ref: /schemas/graph.yaml#/$defs/port-base
+        unevaluatedProperties: false
+        description: MPEG transport stream output
+
+        properties:
+          reg:
+            const: 0
+
+          endpoint:
+            $ref: /schemas/graph.yaml#/$defs/endpoint-base
+            unevaluatedProperties: false
+
+            properties:
+              remote-endpoint: true
+
+            required:
+              - remote-endpoint
+
+        required:
+          - endpoint
+
+      port@1:
+        $ref: /schemas/graph.yaml#/$defs/port-base
+        unevaluatedProperties: false
+        description: MPEG transport stream output
+
+        properties:
+          reg:
+            const: 1
+
+          endpoint:
+            $ref: /schemas/graph.yaml#/$defs/endpoint-base
+            unevaluatedProperties: false
+
+            properties:
+              remote-endpoint: true
+
+            required:
+              - remote-endpoint
+
+        required:
+          - endpoint
+
+      port@2:
+        $ref: /schemas/graph.yaml#/$defs/port-base
+        unevaluatedProperties: false
+        description: MPEG transport stream output
+
+        properties:
+          reg:
+            const: 2
+
+          endpoint:
+            $ref: /schemas/graph.yaml#/$defs/endpoint-base
+            unevaluatedProperties: false
+
+            properties:
+              remote-endpoint: true
+
+            required:
+              - remote-endpoint
+
+        required:
+          - endpoint
+
+      port@3:
+        $ref: /schemas/graph.yaml#/$defs/port-base
+        unevaluatedProperties: false
+        description: MPEG transport stream output
+
+        properties:
+          reg:
+            const: 3
+
+          endpoint:
+            $ref: /schemas/graph.yaml#/$defs/endpoint-base
+            unevaluatedProperties: false
+
+            properties:
+              remote-endpoint: true
+
+            required:
+              - remote-endpoint
+
+        required:
+          - endpoint
+
+    required:
+      - port@0
+      - port@1
+      - port@2
+      - port@3
+
+required:
+  - compatible
+  - reg
+  - reset-gpios
+  - ports
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/gpio/gpio.h>
+
+    i2c {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        demodulator@50 {
+            compatible = "maxlinear,mxl214";
+            reg = <0x50>;
+            reset-gpios = <&gpio7 4 GPIO_ACTIVE_LOW>;
+
+            ports {
+                #address-cells = <1>;
+                #size-cells = <0>;
+
+                port@0 {
+                    reg = <0>;
+
+                    endpoint {
+                        remote-endpoint = <&demux_input0>;
+                    };
+                };
+
+                port@1 {
+                    reg = <1>;
+
+                    endpoint {
+                        remote-endpoint = <&demux_input1>;
+                    };
+                };
+
+                port@2 {
+                    reg = <2>;
+
+                    endpoint {
+                        remote-endpoint = <&demux_input2>;
+                    };
+                };
+
+                port@3 {
+                    reg = <3>;
+
+                    endpoint {
+                        remote-endpoint = <&demux_input3>;
+                    };
+                };
+            };
+        };
+    };
+...

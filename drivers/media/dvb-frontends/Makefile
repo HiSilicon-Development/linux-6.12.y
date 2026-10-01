@@ -13,6 +13,13 @@ endif
 cxd2820r-objs := cxd2820r_core.o cxd2820r_c.o cxd2820r_t.o cxd2820r_t2.o
 drxd-objs := drxd_firm.o drxd_hard.o
 drxk-objs := drxk_hard.o
+mxl214-y := mxl2x4/mxl214.o \
+	    mxl2x4/mxl2x4-oem.o \
+	    mxl2x4/MxL_HRCLS_CalCtrl.o \
+	    mxl2x4/MxL_HRCLS_CommonApi.o \
+	    mxl2x4/MxL_HRCLS_DemodApi.o \
+	    mxl2x4/MxL_HRCLS_PhyCtrl.o \
+	    mxl2x4/MxL_HRCLS_XptApi.o
 stb0899-objs := stb0899_drv.o stb0899_algo.o
 stv0900-objs := stv0900_core.o stv0900_sw.o
 
@@ -79,6 +86,7 @@ obj-$(CONFIG_DVB_MN88472) += mn88472.o
 obj-$(CONFIG_DVB_MN88473) += mn88473.o
 obj-$(CONFIG_DVB_MT312) += mt312.o
 obj-$(CONFIG_DVB_MT352) += mt352.o
+obj-$(CONFIG_DVB_MXL214) += mxl214.o
 obj-$(CONFIG_DVB_MXL5XX) += mxl5xx.o
 obj-$(CONFIG_DVB_MXL692) += mxl692.o
 obj-$(CONFIG_DVB_NXT200X) += nxt200x.o
