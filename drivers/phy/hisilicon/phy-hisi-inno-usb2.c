@@ -9,6 +9,7 @@
 #include <linux/delay.h>
 #include <linux/io.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
@@ -45,6 +46,7 @@
 struct hisi_inno_phy_port {
 	struct reset_control *utmi_rst;
 	struct hisi_inno_phy_priv *priv;
+	u8 index;
 };
 
 struct hisi_inno_phy_priv {
@@ -52,6 +54,10 @@ struct hisi_inno_phy_priv {
 	struct clk *ref_clk;
 	struct reset_control *por_rst;
 	unsigned int type;
+	unsigned int port_count;
+	unsigned int active_ports;
+	bool is_hi3798cv200;
+	struct mutex lock;
 	struct hisi_inno_phy_port ports[INNO_PHY_PORT_NUM];
 };
 
@@ -84,14 +90,82 @@ static void hisi_inno_phy_write_reg(struct hisi_inno_phy_priv *priv,
 	writel(val, reg);
 }
 
-static void hisi_inno_phy_setup(struct hisi_inno_phy_priv *priv)
+static void hisi_inno_phy_setup_2p_port0(struct hisi_inno_phy_priv *priv)
 {
-	/* The phy clk is controlled by the port0 register 0x06. */
+	/* The vendor host-0 path enables the shared PHY clock first. */
 	hisi_inno_phy_write_reg(priv, 0, 0x06, PHY_CLK_ENABLE);
-	msleep(PHY_CLK_STABLE_TIME);
+	usleep_range(1000, 1100);
+
+	hisi_inno_phy_write_reg(priv, 0, 0x00, 0x1c);
+	udelay(20);
+
+	hisi_inno_phy_write_reg(priv, 0, 0x07, 0x00);
+	udelay(20);
+
+	hisi_inno_phy_write_reg(priv, 0, 0x11, 0x40);
+	udelay(20);
 }
 
-static int hisi_inno_phy_init(struct phy *phy)
+static void hisi_inno_phy_setup_2p_port1(struct hisi_inno_phy_priv *priv)
+{
+	/* The PHY clock is controlled by the port 0 register 0x06. */
+	hisi_inno_phy_write_reg(priv, 0, 0x06, PHY_CLK_ENABLE);
+	usleep_range(1000, 1100);
+
+	hisi_inno_phy_write_reg(priv, 1, 0x00, 0x1c);
+	udelay(20);
+
+	hisi_inno_phy_write_reg(priv, 0, 0x06, 0x07);
+	udelay(20);
+
+	hisi_inno_phy_write_reg(priv, 1, 0x07, 0x00);
+	udelay(20);
+
+	hisi_inno_phy_write_reg(priv, 0, 0x0a, 0xab);
+	udelay(20);
+
+	hisi_inno_phy_write_reg(priv, 1, 0x11, 0x40);
+	udelay(20);
+
+	hisi_inno_phy_write_reg(priv, 1, 0x10, 0x41);
+	udelay(20);
+}
+
+static void hisi_inno_phy_setup_1p(struct hisi_inno_phy_priv *priv)
+{
+	hisi_inno_phy_write_reg(priv, 0, 0x06, PHY_CLK_ENABLE);
+	usleep_range(1000, 1100);
+
+	hisi_inno_phy_write_reg(priv, 0, 0x00, 0x1c);
+	udelay(20);
+
+	hisi_inno_phy_write_reg(priv, 0, 0x05, 0x92);
+	hisi_inno_phy_write_reg(priv, 0, 0x06, 0x06);
+	udelay(20);
+
+	hisi_inno_phy_write_reg(priv, 0, 0x0a, 0xab);
+	udelay(20);
+
+	hisi_inno_phy_write_reg(priv, 0, 0x07, 0x00);
+	udelay(20);
+
+	hisi_inno_phy_write_reg(priv, 0, 0x11, 0xc0);
+	udelay(20);
+}
+
+static void hisi_inno_phy_setup_cv200(struct hisi_inno_phy_port *port)
+{
+	struct hisi_inno_phy_priv *priv = port->priv;
+
+	if (priv->port_count == 1)
+		hisi_inno_phy_setup_1p(priv);
+	else if (port->index == 0)
+		hisi_inno_phy_setup_2p_port0(priv);
+	else
+		hisi_inno_phy_setup_2p_port1(priv);
+}
+
+static int hisi_inno_phy_init_legacy(struct phy *phy)
 {
 	struct hisi_inno_phy_port *port = phy_get_drvdata(phy);
 	struct hisi_inno_phy_priv *priv = port->priv;
@@ -105,8 +179,9 @@ static int hisi_inno_phy_init(struct phy *phy)
 	reset_control_deassert(priv->por_rst);
 	udelay(POR_RST_COMPLETE_TIME);
 
-	/* Set up phy registers */
-	hisi_inno_phy_setup(priv);
+	/* Preserve the setup used by the pre-CV200 integrations. */
+	hisi_inno_phy_write_reg(priv, 0, 0x06, PHY_CLK_ENABLE);
+	msleep(PHY_CLK_STABLE_TIME);
 
 	reset_control_deassert(port->utmi_rst);
 	udelay(UTMI_RST_COMPLETE_TIME);
@@ -114,7 +189,69 @@ static int hisi_inno_phy_init(struct phy *phy)
 	return 0;
 }
 
-static int hisi_inno_phy_exit(struct phy *phy)
+static int hisi_inno_phy_init_cv200(struct phy *phy)
+{
+	struct hisi_inno_phy_port *port = phy_get_drvdata(phy);
+	struct hisi_inno_phy_priv *priv = port->priv;
+	bool first_port;
+	int ret;
+
+	mutex_lock(&priv->lock);
+	first_port = !priv->active_ports;
+
+	if (first_port) {
+		ret = clk_prepare_enable(priv->ref_clk);
+		if (ret)
+			goto out_unlock;
+		udelay(REF_CLK_STABLE_TIME);
+	}
+
+	ret = reset_control_assert(port->utmi_rst);
+	if (ret)
+		goto err_disable_ref_clk;
+	usleep_range(UTMI_RST_COMPLETE_TIME * 1000,
+		     UTMI_RST_COMPLETE_TIME * 1000 + 100);
+
+	if (first_port) {
+		/* POR and ref_clk are shared by every port in this provider. */
+		ret = reset_control_assert(priv->por_rst);
+		if (ret)
+			goto err_disable_ref_clk;
+		udelay(POR_RST_COMPLETE_TIME);
+
+		ret = reset_control_deassert(priv->por_rst);
+		if (ret)
+			goto err_assert_por;
+		udelay(POR_RST_COMPLETE_TIME);
+	}
+
+	/* Set up phy registers */
+	hisi_inno_phy_setup_cv200(port);
+
+	ret = reset_control_deassert(port->utmi_rst);
+	if (ret)
+		goto err_assert_utmi;
+	usleep_range(UTMI_RST_COMPLETE_TIME * 1000,
+		     UTMI_RST_COMPLETE_TIME * 1000 + 100);
+
+	priv->active_ports++;
+	mutex_unlock(&priv->lock);
+	return 0;
+
+err_assert_utmi:
+	reset_control_assert(port->utmi_rst);
+err_assert_por:
+	if (first_port)
+		reset_control_assert(priv->por_rst);
+err_disable_ref_clk:
+	if (first_port)
+		clk_disable_unprepare(priv->ref_clk);
+out_unlock:
+	mutex_unlock(&priv->lock);
+	return ret;
+}
+
+static int hisi_inno_phy_exit_legacy(struct phy *phy)
 {
 	struct hisi_inno_phy_port *port = phy_get_drvdata(phy);
 	struct hisi_inno_phy_priv *priv = port->priv;
@@ -124,6 +261,52 @@ static int hisi_inno_phy_exit(struct phy *phy)
 	clk_disable_unprepare(priv->ref_clk);
 
 	return 0;
+}
+
+static int hisi_inno_phy_exit_cv200(struct phy *phy)
+{
+	struct hisi_inno_phy_port *port = phy_get_drvdata(phy);
+	struct hisi_inno_phy_priv *priv = port->priv;
+	int ret;
+	int tmp;
+
+	mutex_lock(&priv->lock);
+	ret = reset_control_assert(port->utmi_rst);
+
+	if (WARN_ON(!priv->active_ports))
+		goto out_unlock;
+
+	priv->active_ports--;
+	if (!priv->active_ports) {
+		tmp = reset_control_assert(priv->por_rst);
+		if (!ret)
+			ret = tmp;
+		clk_disable_unprepare(priv->ref_clk);
+	}
+
+out_unlock:
+	mutex_unlock(&priv->lock);
+	return ret;
+}
+
+static int hisi_inno_phy_init(struct phy *phy)
+{
+	struct hisi_inno_phy_port *port = phy_get_drvdata(phy);
+
+	if (!port->priv->is_hi3798cv200)
+		return hisi_inno_phy_init_legacy(phy);
+
+	return hisi_inno_phy_init_cv200(phy);
+}
+
+static int hisi_inno_phy_exit(struct phy *phy)
+{
+	struct hisi_inno_phy_port *port = phy_get_drvdata(phy);
+
+	if (!port->priv->is_hi3798cv200)
+		return hisi_inno_phy_exit_legacy(phy);
+
+	return hisi_inno_phy_exit_cv200(phy);
 }
 
 static const struct phy_ops hisi_inno_phy_ops = {
@@ -160,6 +343,9 @@ static int hisi_inno_phy_probe(struct platform_device *pdev)
 		return PTR_ERR(priv->por_rst);
 
 	priv->type = (uintptr_t) of_device_get_match_data(dev);
+	priv->is_hi3798cv200 =
+		of_device_is_compatible(np, "hisilicon,hi3798cv200-usb2-phy");
+	mutex_init(&priv->lock);
 
 	for_each_child_of_node_scoped(np, child) {
 		struct reset_control *rst;
@@ -171,6 +357,7 @@ static int hisi_inno_phy_probe(struct platform_device *pdev)
 
 		priv->ports[i].utmi_rst = rst;
 		priv->ports[i].priv = priv;
+		priv->ports[i].index = i;
 
 		phy = devm_phy_create(dev, child, &hisi_inno_phy_ops);
 		if (IS_ERR(phy))
@@ -185,6 +372,7 @@ static int hisi_inno_phy_probe(struct platform_device *pdev)
 			break;
 		}
 	}
+	priv->port_count = i;
 
 	provider = devm_of_phy_provider_register(dev, of_phy_simple_xlate);
 	return PTR_ERR_OR_ZERO(provider);

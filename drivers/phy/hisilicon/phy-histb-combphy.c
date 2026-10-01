@@ -32,6 +32,8 @@
 #define COMBPHY_TEST_ADDR_SHIFT		12
 #define COMBPHY_TEST_ADDR_MASK		GENMASK(16, 12)
 #define COMBPHY_CLKREF_OUT_OEN		BIT(0)
+#define COMBPHY_REF_CLK_STABLE_TIME	200	/* unit: us */
+#define COMBPHY_POR_STABLE_TIME		1	/* unit: ms */
 
 struct histb_combphy_mode {
 	int fixed;
@@ -113,16 +115,26 @@ static int histb_combphy_init(struct phy *phy)
 	if (ret)
 		return ret;
 
+	ret = clk_prepare_enable(priv->ref_clk);
+	if (ret)
+		return ret;
+	udelay(COMBPHY_REF_CLK_STABLE_TIME);
+
+	/* Preserve a real POR edge across warm reboot. */
+	ret = reset_control_assert(priv->por_rst);
+	if (ret)
+		goto err_disable_ref_clk;
+	udelay(COMBPHY_REF_CLK_STABLE_TIME);
+
+	ret = reset_control_deassert(priv->por_rst);
+	if (ret)
+		goto err_disable_ref_clk;
+	mdelay(COMBPHY_POR_STABLE_TIME);
+
 	/* Clear bypass bit to enable encoding/decoding */
 	val = readl(priv->mmio + COMBPHY_CFG_REG);
 	val &= ~COMBPHY_BYPASS_CODEC;
 	writel(val, priv->mmio + COMBPHY_CFG_REG);
-
-	ret = clk_prepare_enable(priv->ref_clk);
-	if (ret)
-		return ret;
-
-	reset_control_deassert(priv->por_rst);
 
 	/* Enable EP clock */
 	val = readl(priv->mmio + COMBPHY_CFG_REG);
@@ -138,22 +150,27 @@ static int histb_combphy_init(struct phy *phy)
 	nano_register_write(priv, 0x1a, 0x4);
 
 	return 0;
+
+err_disable_ref_clk:
+	clk_disable_unprepare(priv->ref_clk);
+	return ret;
 }
 
 static int histb_combphy_exit(struct phy *phy)
 {
 	struct histb_combphy_priv *priv = phy_get_drvdata(phy);
 	u32 val;
+	int ret;
 
 	/* Disable EP clock */
 	val = readl(priv->mmio + COMBPHY_CFG_REG);
 	val &= ~COMBPHY_CLKREF_OUT_OEN;
 	writel(val, priv->mmio + COMBPHY_CFG_REG);
 
-	reset_control_assert(priv->por_rst);
+	ret = reset_control_assert(priv->por_rst);
 	clk_disable_unprepare(priv->ref_clk);
 
-	return 0;
+	return ret;
 }
 
 static const struct phy_ops histb_combphy_ops = {

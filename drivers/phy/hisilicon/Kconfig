@@ -45,7 +45,7 @@ config PHY_HI3670_PCIE
 
 config PHY_HISTB_COMBPHY
 	tristate "HiSilicon STB SoCs COMBPHY support"
-	depends on (ARCH_HISI && ARM64) || COMPILE_TEST
+	depends on (ARCH_HISI && ARM64) || (SOC_HI3798CV200 && ARM) || COMPILE_TEST
 	select GENERIC_PHY
 	select MFD_SYSCON
 	help
