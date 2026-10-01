@@ -292,6 +292,9 @@ static int dvb_frontend_get_event(struct dvb_frontend *fe,
 		return -EOVERFLOW;
 	}
 
+	if (READ_ONCE(fe->exit) == DVB_FE_DEVICE_REMOVED)
+		return -ENODEV;
+
 	if (events->eventw == events->eventr) {
 		struct wait_queue_entry wait;
 		int ret = 0;
@@ -301,7 +304,8 @@ static int dvb_frontend_get_event(struct dvb_frontend *fe,
 
 		init_waitqueue_entry(&wait, current);
 		add_wait_queue(&events->wait_queue, &wait);
-		while (!dvb_frontend_test_event(fepriv, events)) {
+		while (!dvb_frontend_test_event(fepriv, events) &&
+		       READ_ONCE(fe->exit) != DVB_FE_DEVICE_REMOVED) {
 			wait_woken(&wait, TASK_INTERRUPTIBLE, 0);
 			if (signal_pending(current)) {
 				ret = -ERESTARTSYS;
@@ -309,6 +313,8 @@ static int dvb_frontend_get_event(struct dvb_frontend *fe,
 			}
 		}
 		remove_wait_queue(&events->wait_queue, &wait);
+		if (READ_ONCE(fe->exit) == DVB_FE_DEVICE_REMOVED)
+			return -ENODEV;
 		if (ret < 0)
 			return ret;
 	}
@@ -2754,6 +2760,9 @@ static __poll_t dvb_frontend_poll(struct file *file, struct poll_table_struct *w
 
 	poll_wait(file, &fepriv->events.wait_queue, wait);
 
+	if (READ_ONCE(fe->exit) == DVB_FE_DEVICE_REMOVED)
+		return EPOLLERR | EPOLLHUP;
+
 	if (fepriv->events.eventw != fepriv->events.eventr)
 		return (EPOLLIN | EPOLLRDNORM | EPOLLPRI);
 
@@ -3077,6 +3086,8 @@ int dvb_unregister_frontend(struct dvb_frontend *fe)
 
 	mutex_lock(&frontend_mutex);
 	dvb_frontend_stop(fe);
+	WRITE_ONCE(fe->exit, DVB_FE_DEVICE_REMOVED);
+	wake_up_interruptible(&fepriv->events.wait_queue);
 	dvb_remove_device(fepriv->dvbdev);
 
 	/* fe is invalid now */

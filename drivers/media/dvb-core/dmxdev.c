@@ -1195,7 +1195,7 @@ static __poll_t dvb_demux_poll(struct file *file, poll_table *wait)
 	poll_wait(file, &dmxdevfilter->buffer.queue, wait);
 
 	if ((!dmxdevfilter) || dmxdevfilter->dev->exit)
-		return EPOLLERR;
+		return EPOLLERR | EPOLLHUP;
 	if (dvb_vb2_is_streaming(&dmxdevfilter->vb2_ctx))
 		return dvb_vb2_poll(&dmxdevfilter->vb2_ctx, file, wait);
 
@@ -1346,7 +1346,7 @@ static __poll_t dvb_dvr_poll(struct file *file, poll_table *wait)
 	poll_wait(file, &dmxdev->dvr_buffer.queue, wait);
 
 	if (dmxdev->exit)
-		return EPOLLERR;
+		return EPOLLERR | EPOLLHUP;
 	if (dvb_vb2_is_streaming(&dmxdev->dvr_vb2_ctx))
 		return dvb_vb2_poll(&dmxdev->dvr_vb2_ctx, file, wait);
 
@@ -1455,8 +1455,20 @@ EXPORT_SYMBOL(dvb_dmxdev_init);
 
 void dvb_dmxdev_release(struct dmxdev *dmxdev)
 {
+	int i;
+
 	mutex_lock(&dmxdev->mutex);
 	dmxdev->exit = 1;
+	WRITE_ONCE(dmxdev->dvr_buffer.error, -ENODEV);
+	wake_up_interruptible(&dmxdev->dvr_buffer.queue);
+	for (i = 0; i < dmxdev->filternum; i++) {
+		struct dmxdev_filter *filter = &dmxdev->filter[i];
+
+		if (READ_ONCE(filter->state) == DMXDEV_STATE_FREE)
+			continue;
+		WRITE_ONCE(filter->buffer.error, -ENODEV);
+		wake_up_interruptible(&filter->buffer.queue);
+	}
 	mutex_unlock(&dmxdev->mutex);
 
 	if (dmxdev->dvbdev->users > 1) {
