@@ -8,6 +8,7 @@
  */
 
 #include <linux/clk.h>
+#include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
@@ -20,6 +21,9 @@
 
 #define GTXTHRCFG		0xc108
 #define GRXTHRCFG		0xc10c
+#define REG_GCTL		0xc110
+#define GCTL_PRTCAPDIR_MASK	GENMASK(13, 12)
+#define GCTL_PRTCAP_HOST	BIT(12)
 #define REG_GUSB2PHYCFG0	0xc200
 #define BIT_UTMI_8_16		BIT(3)
 #define BIT_UTMI_ULPI		BIT(4)
@@ -29,6 +33,12 @@
 #define USB3_DEEMPHASIS_MASK	GENMASK(2, 1)
 #define USB3_DEEMPHASIS0	BIT(1)
 #define USB3_TX_MARGIN1		BIT(4)
+#define USB3_SUSPEND_EN		BIT(17)
+
+#define GTXTHRCFG_VALUE		0x23100000
+#define GRXTHRCFG_VALUE		0x23180000
+#define CTRL_RST_ASSERT_TIME	100	/* unit: us */
+#define CTRL_RST_COMPLETE_TIME	200	/* unit: us */
 
 struct xhci_hcd_histb {
 	struct device		*dev;
@@ -60,23 +70,33 @@ static int xhci_histb_config(struct xhci_hcd_histb *histb)
 		writel(regval, histb->ctrl + REG_GUSB2PHYCFG0);
 	}
 
+	/* Select host mode explicitly; the reset value is not board invariant. */
+	regval = readl(histb->ctrl + REG_GCTL);
+	regval &= ~GCTL_PRTCAPDIR_MASK;
+	regval |= GCTL_PRTCAP_HOST;
+	writel(regval, histb->ctrl + REG_GCTL);
+
 	if (of_property_match_string(np, "phys-names", "combo") >= 0) {
 		/*
 		 * write 0x010c0012 to GUSB3PIPECTL0
-		 * GUSB3PIPECTL0[5:3] = 010 : Tx Margin = 900mV ,
+		 * GUSB3PIPECTL0[17] = 0 : disable U3 suspend
+		 * GUSB3PIPECTL0[5:3] = 010 : Tx Margin = 900mV,
 		 * decrease TX voltage
 		 * GUSB3PIPECTL0[2:1] = 01 : Tx Deemphasis = -3.5dB,
 		 * refer to xHCI spec
 		 */
 		regval = readl(histb->ctrl + REG_GUSB3PIPECTL0);
+		regval &= ~USB3_SUSPEND_EN;
 		regval &= ~USB3_DEEMPHASIS_MASK;
 		regval |= USB3_DEEMPHASIS0;
 		regval |= USB3_TX_MARGIN1;
 		writel(regval, histb->ctrl + REG_GUSB3PIPECTL0);
+		udelay(20);
 	}
 
-	writel(0x23100000, histb->ctrl + GTXTHRCFG);
-	writel(0x23100000, histb->ctrl + GRXTHRCFG);
+	writel(GTXTHRCFG_VALUE, histb->ctrl + GTXTHRCFG);
+	writel(GRXTHRCFG_VALUE, histb->ctrl + GRXTHRCFG);
+	udelay(200);
 
 	return 0;
 }
@@ -140,10 +160,25 @@ static int xhci_histb_host_enable(struct xhci_hcd_histb *histb)
 		goto err_suspend_clk;
 	}
 
-	reset_control_deassert(histb->soft_reset);
+	/* Warm reboot does not guarantee that the controller starts in reset. */
+	ret = reset_control_assert(histb->soft_reset);
+	if (ret) {
+		dev_err(histb->dev, "failed to assert soft reset\n");
+		goto err_soft_reset;
+	}
+	udelay(CTRL_RST_ASSERT_TIME);
+
+	ret = reset_control_deassert(histb->soft_reset);
+	if (ret) {
+		dev_err(histb->dev, "failed to deassert soft reset\n");
+		goto err_soft_reset;
+	}
+	udelay(CTRL_RST_COMPLETE_TIME);
 
 	return 0;
 
+err_soft_reset:
+	clk_disable_unprepare(histb->suspend_clk);
 err_suspend_clk:
 	clk_disable_unprepare(histb->pipe_clk);
 err_pipe_clk:
@@ -156,12 +191,15 @@ err_utmi_clk:
 
 static void xhci_histb_host_disable(struct xhci_hcd_histb *histb)
 {
-	reset_control_assert(histb->soft_reset);
-
 	clk_disable_unprepare(histb->suspend_clk);
 	clk_disable_unprepare(histb->pipe_clk);
 	clk_disable_unprepare(histb->utmi_clk);
 	clk_disable_unprepare(histb->bus_clk);
+}
+
+static void xhci_histb_quirks(struct device *dev, struct xhci_hcd *xhci)
+{
+	xhci->quirks |= XHCI_SLOW_SUSPEND;
 }
 
 /* called during probe() after chip reset completes */
@@ -176,7 +214,7 @@ static int xhci_histb_setup(struct usb_hcd *hcd)
 			return ret;
 	}
 
-	return xhci_gen_setup(hcd, NULL);
+	return xhci_gen_setup(hcd, xhci_histb_quirks);
 }
 
 static const struct xhci_driver_overrides xhci_histb_overrides __initconst = {
@@ -339,11 +377,13 @@ static int __maybe_unused xhci_histb_suspend(struct device *dev)
 	int ret;
 
 	ret = xhci_suspend(xhci, device_may_wakeup(dev));
+	if (ret)
+		return ret;
 
-	if (!device_may_wakeup(dev))
-		xhci_histb_host_disable(histb);
+	/* The official platform callback drops the clocks unconditionally. */
+	xhci_histb_host_disable(histb);
 
-	return ret;
+	return 0;
 }
 
 static int __maybe_unused xhci_histb_resume(struct device *dev)
@@ -351,11 +391,17 @@ static int __maybe_unused xhci_histb_resume(struct device *dev)
 	struct xhci_hcd_histb *histb = dev_get_drvdata(dev);
 	struct usb_hcd *hcd = histb->hcd;
 	struct xhci_hcd *xhci = hcd_to_xhci(hcd);
+	int ret;
 
-	if (!device_may_wakeup(dev))
-		xhci_histb_host_enable(histb);
+	ret = xhci_histb_host_enable(histb);
+	if (ret)
+		return ret;
 
-	return xhci_resume(xhci, PMSG_RESUME);
+	ret = xhci_resume(xhci, PMSG_RESUME);
+	if (ret)
+		xhci_histb_host_disable(histb);
+
+	return ret;
 }
 
 static const struct dev_pm_ops xhci_histb_pm_ops = {
