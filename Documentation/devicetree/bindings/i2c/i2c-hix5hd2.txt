@@ -1,7 +1,8 @@
 I2C for Hisilicon hix5hd2 chipset platform
 
 Required properties:
-- compatible: Must be "hisilicon,hix5hd2-i2c"
+- compatible: Must be "hisilicon,hix5hd2-i2c". Hi3798CV200 controllers
+  should use "hisilicon,hi3798cv200-i2c", "hisilicon,hix5hd2-i2c".
 - reg: physical base address of the controller and length of memory mapped
      region.
 - interrupts: interrupt number to the cpu.
@@ -11,6 +12,7 @@ Required properties:
 
 Optional properties:
 - clock-frequency: Desired I2C bus frequency in Hz, otherwise defaults to 100000
+- resets: phandle to the controller reset line.
 - Child nodes conforming to i2c bus binding
 
 Examples:
@@ -19,6 +21,7 @@ I2C0@f8b10000 {
 	reg = <0xf8b10000 0x1000>;
 	interrupts = <0 38 4>;
 	clocks = <&clock HIX5HD2_I2C0_RST>;
+	resets = <&crg 0x6c 5>;
 	#address-cells = <1>;
 	#size-cells = <0>;
 }

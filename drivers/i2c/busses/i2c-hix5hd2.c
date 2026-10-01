@@ -15,6 +15,7 @@
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
+#include <linux/reset.h>
 
 /* Register Map */
 #define HIX5I2C_CTRL		0x00
@@ -86,10 +87,15 @@ struct hix5hd2_i2c_priv {
 	void __iomem *regs;
 	struct clk *clk;
 	struct device *dev;
+	int irq;
 	spinlock_t lock;	/* IRQ synchronization */
 	int err;
 	unsigned int freq;
 	enum hix5hd2_i2c_state state;
+	bool is_hi3798cv200;
+	struct reset_control *rst;
+	u32 failure_status;
+	const char *failure_reason;
 };
 
 static u32 hix5hd2_i2c_clr_pend_irq(struct hix5hd2_i2c_priv *priv)
@@ -115,6 +121,30 @@ static void hix5hd2_i2c_enable_irq(struct hix5hd2_i2c_priv *priv)
 {
 	writel_relaxed(I2C_ENABLE | I2C_UNMASK_TOTAL | I2C_UNMASK_ALL,
 		       priv->regs + HIX5I2C_CTRL);
+}
+
+/* Keep the first failed peripheral transaction diagnosable on deployed boards. */
+static void hix5hd2_i2c_log_state(struct hix5hd2_i2c_priv *priv,
+				  const char *reason, u32 int_status)
+{
+	struct i2c_msg *msg = priv->msg;
+	u16 addr = msg ? msg->addr : 0;
+	u16 flags = msg ? msg->flags : 0;
+	unsigned int len = msg ? msg->len : 0;
+	u8 wire_addr = msg ? i2c_8bit_addr_from_msg(msg) : 0;
+
+	dev_err_ratelimited(priv->dev,
+		"xfer %s bus=%d addr=0x%02x wire=0x%02x flags=0x%04x len=%u idx=%u rem=%u irq=0x%02x sr=0x%02x ctrl=0x%03x "
+		"com=0x%02x txr=0x%02x rxr=0x%02x sclh=0x%08x scll=0x%08x\n",
+		reason, priv->adap.nr, addr, wire_addr, flags, len,
+		priv->msg_idx, priv->msg_len, int_status,
+		readl_relaxed(priv->regs + HIX5I2C_SR),
+		readl_relaxed(priv->regs + HIX5I2C_CTRL),
+		readl_relaxed(priv->regs + HIX5I2C_COM),
+		readl_relaxed(priv->regs + HIX5I2C_TXR),
+		readl_relaxed(priv->regs + HIX5I2C_RXR),
+		readl_relaxed(priv->regs + HIX5I2C_SCL_H),
+		readl_relaxed(priv->regs + HIX5I2C_SCL_L));
 }
 
 static void hix5hd2_i2c_drv_setrate(struct hix5hd2_i2c_priv *priv)
@@ -147,12 +177,43 @@ static void hix5hd2_i2c_init(struct hix5hd2_i2c_priv *priv)
 	hix5hd2_i2c_enable_irq(priv);
 }
 
-static void hix5hd2_i2c_reset(struct hix5hd2_i2c_priv *priv)
+static int hix5hd2_i2c_reset(struct hix5hd2_i2c_priv *priv)
 {
+	unsigned long flags;
+	int ret;
+
+	spin_lock_irqsave(&priv->lock, flags);
+	hix5hd2_i2c_disable_irq(priv);
+	hix5hd2_i2c_clr_all_irq(priv);
+	spin_unlock_irqrestore(&priv->lock, flags);
+	synchronize_irq(priv->irq);
+
+	if (priv->rst) {
+		ret = reset_control_assert(priv->rst);
+		if (ret)
+			return ret;
+		usleep_range(10, 20);
+		ret = reset_control_deassert(priv->rst);
+		if (ret)
+			return ret;
+		hix5hd2_i2c_init(priv);
+		return 0;
+	}
+
 	clk_disable_unprepare(priv->clk);
 	msleep(20);
-	clk_prepare_enable(priv->clk);
+	ret = clk_prepare_enable(priv->clk);
+	if (ret) {
+		if (priv->is_hi3798cv200)
+			dev_err(priv->dev,
+				"failed to re-enable clock during recovery: %d\n",
+				ret);
+		return ret;
+	}
+
 	hix5hd2_i2c_init(priv);
+
+	return 0;
 }
 
 static int hix5hd2_i2c_wait_bus_idle(struct hix5hd2_i2c_priv *priv)
@@ -253,13 +314,15 @@ static irqreturn_t hix5hd2_i2c_irq(int irqno, void *dev_id)
 	/* handle error */
 	if (int_status & I2C_ARBITRATE_INTR) {
 		/* bus error */
-		dev_dbg(priv->dev, "ARB bus loss\n");
+		priv->failure_reason = "arbitration-loss";
+		priv->failure_status = int_status;
 		priv->err = -EAGAIN;
 		priv->state = HIX5I2C_STAT_RW_ERR;
 		goto stop;
 	} else if (int_status & I2C_ACK_INTR) {
 		/* ack error */
-		dev_dbg(priv->dev, "No ACK from device\n");
+		priv->failure_reason = "no-ack";
+		priv->failure_status = int_status;
 		priv->err = -ENXIO;
 		priv->state = HIX5I2C_STAT_RW_ERR;
 		goto stop;
@@ -316,6 +379,7 @@ static int hix5hd2_i2c_xfer_msg(struct hix5hd2_i2c_priv *priv,
 {
 	unsigned long time_left;
 	int ret;
+	int reset_ret;
 
 	priv->msg = msgs;
 	priv->msg_idx = 0;
@@ -323,6 +387,8 @@ static int hix5hd2_i2c_xfer_msg(struct hix5hd2_i2c_priv *priv,
 	priv->stop = stop;
 	priv->err = 0;
 	priv->state = HIX5I2C_STAT_INIT;
+	priv->failure_status = 0;
+	priv->failure_reason = NULL;
 
 	reinit_completion(&priv->msg_complete);
 	hix5hd2_i2c_message_start(priv, stop);
@@ -330,11 +396,18 @@ static int hix5hd2_i2c_xfer_msg(struct hix5hd2_i2c_priv *priv,
 	time_left = wait_for_completion_timeout(&priv->msg_complete,
 						priv->adap.timeout);
 	if (time_left == 0) {
-		priv->state = HIX5I2C_STAT_RW_ERR;
-		priv->err = -ETIMEDOUT;
-		dev_warn(priv->dev, "%s timeout=%d\n",
-			 msgs->flags & I2C_M_RD ? "rx" : "tx",
-			 priv->adap.timeout);
+		unsigned long flags;
+
+		spin_lock_irqsave(&priv->lock, flags);
+		if (priv->state != HIX5I2C_STAT_RW_SUCCESS) {
+			hix5hd2_i2c_disable_irq(priv);
+			priv->failure_status = hix5hd2_i2c_clr_pend_irq(priv);
+			priv->failure_reason = "timeout";
+			priv->state = HIX5I2C_STAT_RW_ERR;
+			priv->err = -ETIMEDOUT;
+		}
+		spin_unlock_irqrestore(&priv->lock, flags);
+		synchronize_irq(priv->irq);
 	}
 	ret = priv->state;
 
@@ -344,9 +417,23 @@ static int hix5hd2_i2c_xfer_msg(struct hix5hd2_i2c_priv *priv,
 	 */
 	if (priv->state == HIX5I2C_STAT_RW_SUCCESS && stop)
 		ret = hix5hd2_i2c_wait_bus_idle(priv);
-
+	if (ret == -EBUSY) {
+		priv->failure_reason = "bus-busy";
+		priv->failure_status = readl_relaxed(priv->regs + HIX5I2C_SR);
+		priv->err = ret;
+	}
 	if (ret < 0)
-		hix5hd2_i2c_reset(priv);
+		hix5hd2_i2c_log_state(priv,
+				      priv->failure_reason ?: "transfer-error",
+			priv->failure_status);
+
+	if (ret < 0) {
+		reset_ret = hix5hd2_i2c_reset(priv);
+		if (reset_ret && priv->is_hi3798cv200)
+			priv->err = reset_ret;
+		else if (!priv->err)
+			priv->err = ret;
+	}
 
 	return priv->err;
 }
@@ -357,7 +444,13 @@ static int hix5hd2_i2c_xfer(struct i2c_adapter *adap,
 	struct hix5hd2_i2c_priv *priv = i2c_get_adapdata(adap);
 	int i, ret, stop;
 
-	pm_runtime_get_sync(priv->dev);
+	if (priv->is_hi3798cv200) {
+		ret = pm_runtime_resume_and_get(priv->dev);
+		if (ret)
+			return ret;
+	} else {
+		pm_runtime_get_sync(priv->dev);
+	}
 
 	for (i = 0; i < num; i++, msgs++) {
 		if ((i == num - 1) || (msgs->flags & I2C_M_STOP))
@@ -398,6 +491,9 @@ static int hix5hd2_i2c_probe(struct platform_device *pdev)
 	priv = devm_kzalloc(&pdev->dev, sizeof(*priv), GFP_KERNEL);
 	if (!priv)
 		return -ENOMEM;
+	priv->dev = &pdev->dev;
+	priv->is_hi3798cv200 = of_device_is_compatible(
+		np, "hisilicon,hi3798cv200-i2c");
 
 	if (of_property_read_u32(np, "clock-frequency", &freq)) {
 		/* use 100k as default value */
@@ -426,8 +522,16 @@ static int hix5hd2_i2c_probe(struct platform_device *pdev)
 		return PTR_ERR(priv->clk);
 	}
 
+	if (priv->is_hi3798cv200) {
+		priv->rst = devm_reset_control_get_optional_exclusive_deasserted(
+			&pdev->dev, NULL);
+		if (IS_ERR(priv->rst))
+			return dev_err_probe(&pdev->dev, PTR_ERR(priv->rst),
+					     "cannot deassert reset\n");
+	}
+
 	strscpy(priv->adap.name, "hix5hd2-i2c", sizeof(priv->adap.name));
-	priv->dev = &pdev->dev;
+	priv->irq = irq;
 	priv->adap.owner = THIS_MODULE;
 	priv->adap.algo = &hix5hd2_i2c_algorithm;
 	priv->adap.retries = 3;
@@ -479,6 +583,10 @@ static int hix5hd2_i2c_runtime_suspend(struct device *dev)
 {
 	struct hix5hd2_i2c_priv *priv = dev_get_drvdata(dev);
 
+	if (priv->is_hi3798cv200) {
+		hix5hd2_i2c_disable_irq(priv);
+		hix5hd2_i2c_clr_all_irq(priv);
+	}
 	clk_disable_unprepare(priv->clk);
 
 	return 0;
@@ -487,20 +595,49 @@ static int hix5hd2_i2c_runtime_suspend(struct device *dev)
 static int hix5hd2_i2c_runtime_resume(struct device *dev)
 {
 	struct hix5hd2_i2c_priv *priv = dev_get_drvdata(dev);
+	int ret;
 
-	clk_prepare_enable(priv->clk);
+	ret = clk_prepare_enable(priv->clk);
+	if (ret) {
+		if (priv->is_hi3798cv200)
+			dev_err(dev, "failed to enable clock on resume: %d\n",
+				ret);
+		return ret;
+	}
 	hix5hd2_i2c_init(priv);
 
 	return 0;
 }
 
+static int hix5hd2_i2c_suspend(struct device *dev)
+{
+	struct hix5hd2_i2c_priv *priv = dev_get_drvdata(dev);
+
+	if (!priv->is_hi3798cv200)
+		return 0;
+
+	return pm_runtime_force_suspend(dev);
+}
+
+static int hix5hd2_i2c_resume(struct device *dev)
+{
+	struct hix5hd2_i2c_priv *priv = dev_get_drvdata(dev);
+
+	if (!priv->is_hi3798cv200)
+		return 0;
+
+	return pm_runtime_force_resume(dev);
+}
+
 static const struct dev_pm_ops hix5hd2_i2c_pm_ops = {
+	NOIRQ_SYSTEM_SLEEP_PM_OPS(hix5hd2_i2c_suspend, hix5hd2_i2c_resume)
 	RUNTIME_PM_OPS(hix5hd2_i2c_runtime_suspend,
 		       hix5hd2_i2c_runtime_resume,
 		       NULL)
 };
 
 static const struct of_device_id hix5hd2_i2c_match[] = {
+	{ .compatible = "hisilicon,hi3798cv200-i2c" },
 	{ .compatible = "hisilicon,hix5hd2-i2c" },
 	{},
 };
