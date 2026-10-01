@@ -128,15 +128,6 @@ Compressed Formats
 	this pixel format. The output buffer must contain the appropriate number
 	of macroblocks to decode a full corresponding frame to the matching
 	capture buffer.
-    * .. _V4L2-PIX-FMT-MPEG1-SLICE:
-
-      - ``V4L2_PIX_FMT_MPEG1_SLICE``
-      - 'MG1S'
-      - MPEG-1 parsed slice data for a :ref:`stateless_decoder`. Metadata is
-	passed through ``V4L2_CID_STATELESS_MPEG1_SEQUENCE`` and
-	``V4L2_CID_STATELESS_MPEG1_PICTURE``; quantisation matrices use
-	``V4L2_CID_STATELESS_MPEG1_QUANTISATION``. See the :ref:`associated Codec
-	Control IDs <v4l2-codec-stateless-mpeg1>`.
     * .. _V4L2-PIX-FMT-MPEG4:
 
       - ``V4L2_PIX_FMT_MPEG4``

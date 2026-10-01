@@ -1236,10 +1236,6 @@ const char *v4l2_ctrl_get_name(u32 id)
 	case V4L2_CID_STATELESS_MPEG2_SEQUENCE:			return "MPEG-2 Sequence Header";
 	case V4L2_CID_STATELESS_MPEG2_PICTURE:			return "MPEG-2 Picture Header";
 	case V4L2_CID_STATELESS_MPEG2_QUANTISATION:		return "MPEG-2 Quantisation Matrices";
-	case V4L2_CID_STATELESS_MPEG1_SEQUENCE:		return "MPEG-1 Sequence Header";
-	case V4L2_CID_STATELESS_MPEG1_PICTURE:			return "MPEG-1 Picture Header";
-	case V4L2_CID_STATELESS_MPEG1_QUANTISATION:
-		return "MPEG-1 Quantisation Matrices";
 	case V4L2_CID_STATELESS_VP9_COMPRESSED_HDR:	return "VP9 Probabilities Updates";
 	case V4L2_CID_STATELESS_VP9_FRAME:			return "VP9 Frame Decode Parameters";
 	case V4L2_CID_STATELESS_HEVC_SPS:			return "HEVC Sequence Parameter Set";
@@ -1558,15 +1554,6 @@ void v4l2_ctrl_fill(u32 id, const char **name, enum v4l2_ctrl_type *type,
 		break;
 	case V4L2_CID_STATELESS_MPEG2_QUANTISATION:
 		*type = V4L2_CTRL_TYPE_MPEG2_QUANTISATION;
-		break;
-	case V4L2_CID_STATELESS_MPEG1_SEQUENCE:
-		*type = V4L2_CTRL_TYPE_MPEG1_SEQUENCE;
-		break;
-	case V4L2_CID_STATELESS_MPEG1_PICTURE:
-		*type = V4L2_CTRL_TYPE_MPEG1_PICTURE;
-		break;
-	case V4L2_CID_STATELESS_MPEG1_QUANTISATION:
-		*type = V4L2_CTRL_TYPE_MPEG1_QUANTISATION;
 		break;
 	case V4L2_CID_STATELESS_FWHT_PARAMS:
 		*type = V4L2_CTRL_TYPE_FWHT_PARAMS;

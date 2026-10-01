@@ -2073,66 +2073,6 @@ struct v4l2_ctrl_mpeg2_quantisation {
 	__u8	chroma_non_intra_quantiser_matrix[64];
 };
 
-/* Stateless MPEG-1 controls */
-
-#define V4L2_CID_STATELESS_MPEG1_SEQUENCE \
-	(V4L2_CID_CODEC_STATELESS_BASE + 223)
-/**
- * struct v4l2_ctrl_mpeg1_sequence - MPEG-1 sequence header
- *
- * @horizontal_size: horizontal_size_value from the sequence header.
- * @vertical_size: vertical_size_value from the sequence header.
- * @vbv_buffer_size: vbv_buffer_size_value from the sequence header.
- */
-struct v4l2_ctrl_mpeg1_sequence {
-	__u16	horizontal_size;
-	__u16	vertical_size;
-	__u32	vbv_buffer_size;
-};
-
-#define V4L2_MPEG1_PIC_CODING_TYPE_I			1
-#define V4L2_MPEG1_PIC_CODING_TYPE_P			2
-#define V4L2_MPEG1_PIC_CODING_TYPE_B			3
-
-#define V4L2_MPEG1_PIC_FLAG_FULL_PEL_FORWARD		0x01
-#define V4L2_MPEG1_PIC_FLAG_FULL_PEL_BACKWARD		0x02
-
-#define V4L2_CID_STATELESS_MPEG1_PICTURE \
-	(V4L2_CID_CODEC_STATELESS_BASE + 224)
-/**
- * struct v4l2_ctrl_mpeg1_picture - MPEG-1 picture header
- *
- * @backward_ref_ts: timestamp of the capture buffer used for backward
- * prediction.
- * @forward_ref_ts: timestamp of the capture buffer used for forward
- * prediction. Timestamps refer to struct v4l2_buffer and are expressed in ns.
- * @f_code: motion vector f_code values, in forward, backward order.
- * @picture_coding_type: see V4L2_MPEG1_PIC_CODING_TYPE_{}.
- * @flags: see V4L2_MPEG1_PIC_FLAG_{}.
- * @reserved: padding field. Applications must set it to zero.
- */
-struct v4l2_ctrl_mpeg1_picture {
-	__u64	backward_ref_ts;
-	__u64	forward_ref_ts;
-	__u8	f_code[2];
-	__u8	picture_coding_type;
-	__u8	flags;
-	__u8	reserved[3];
-};
-
-#define V4L2_CID_STATELESS_MPEG1_QUANTISATION \
-	(V4L2_CID_CODEC_STATELESS_BASE + 225)
-/**
- * struct v4l2_ctrl_mpeg1_quantisation - MPEG-1 quantisation matrices
- *
- * @intra_quantiser_matrix: intra matrix in zigzag scanning order.
- * @non_intra_quantiser_matrix: non-intra matrix in zigzag scanning order.
- */
-struct v4l2_ctrl_mpeg1_quantisation {
-	__u8	intra_quantiser_matrix[64];
-	__u8	non_intra_quantiser_matrix[64];
-};
-
 #define V4L2_CID_STATELESS_HEVC_SPS		(V4L2_CID_CODEC_STATELESS_BASE + 400)
 #define V4L2_CID_STATELESS_HEVC_PPS		(V4L2_CID_CODEC_STATELESS_BASE + 401)
 #define V4L2_CID_STATELESS_HEVC_SLICE_PARAMS	(V4L2_CID_CODEC_STATELESS_BASE + 402)

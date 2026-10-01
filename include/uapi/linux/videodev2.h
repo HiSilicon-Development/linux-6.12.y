@@ -750,7 +750,6 @@ struct v4l2_pix_format {
 #define V4L2_PIX_FMT_H263     v4l2_fourcc('H', '2', '6', '3') /* H263          */
 #define V4L2_PIX_FMT_MPEG1    v4l2_fourcc('M', 'P', 'G', '1') /* MPEG-1 ES     */
 #define V4L2_PIX_FMT_MPEG2    v4l2_fourcc('M', 'P', 'G', '2') /* MPEG-2 ES     */
-#define V4L2_PIX_FMT_MPEG1_SLICE v4l2_fourcc('M', 'G', '1', 'S') /* MPEG-1 parsed slice data */
 #define V4L2_PIX_FMT_MPEG2_SLICE v4l2_fourcc('M', 'G', '2', 'S') /* MPEG-2 parsed slice data */
 #define V4L2_PIX_FMT_MPEG4    v4l2_fourcc('M', 'P', 'G', '4') /* MPEG-4 part 2 ES */
 #define V4L2_PIX_FMT_XVID     v4l2_fourcc('X', 'V', 'I', 'D') /* Xvid           */
@@ -1866,9 +1865,6 @@ struct v4l2_ext_control {
 		struct v4l2_ctrl_mpeg2_sequence __user *p_mpeg2_sequence;
 		struct v4l2_ctrl_mpeg2_picture __user *p_mpeg2_picture;
 		struct v4l2_ctrl_mpeg2_quantisation __user *p_mpeg2_quantisation;
-		struct v4l2_ctrl_mpeg1_sequence __user *p_mpeg1_sequence;
-		struct v4l2_ctrl_mpeg1_picture __user *p_mpeg1_picture;
-		struct v4l2_ctrl_mpeg1_quantisation __user *p_mpeg1_quantisation;
 		struct v4l2_ctrl_vp9_compressed_hdr __user *p_vp9_compressed_hdr_probs;
 		struct v4l2_ctrl_vp9_frame __user *p_vp9_frame;
 		struct v4l2_ctrl_hevc_sps __user *p_hevc_sps;
@@ -1950,9 +1946,6 @@ enum v4l2_ctrl_type {
 	V4L2_CTRL_TYPE_MPEG2_QUANTISATION   = 0x0250,
 	V4L2_CTRL_TYPE_MPEG2_SEQUENCE       = 0x0251,
 	V4L2_CTRL_TYPE_MPEG2_PICTURE        = 0x0252,
-	V4L2_CTRL_TYPE_MPEG1_SEQUENCE       = 0x0253,
-	V4L2_CTRL_TYPE_MPEG1_PICTURE        = 0x0254,
-	V4L2_CTRL_TYPE_MPEG1_QUANTISATION   = 0x0255,
 
 	V4L2_CTRL_TYPE_VP9_COMPRESSED_HDR	= 0x0260,
 	V4L2_CTRL_TYPE_VP9_FRAME		= 0x0261,

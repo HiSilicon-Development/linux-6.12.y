@@ -1269,7 +1269,6 @@ static bool histb_vdec_is_stateless_format(u32 pixelformat)
 	switch (pixelformat) {
 	case V4L2_PIX_FMT_H264_SLICE:
 	case V4L2_PIX_FMT_HEVC_SLICE:
-	case V4L2_PIX_FMT_MPEG1_SLICE:
 	case V4L2_PIX_FMT_MPEG2_SLICE:
 	case V4L2_PIX_FMT_VP8_FRAME:
 	case V4L2_PIX_FMT_VP9_FRAME:
@@ -2546,8 +2545,7 @@ static size_t histb_vdec_tile_size(struct histb_vdec_ctx *ctx)
 	 * A field pair may need one extra macroblock row even though S_FMT keeps
 	 * the visible frame height (for example, 240 lines use a 256-line surface).
 	 */
-	if (ctx->src.pix.pixelformat == V4L2_PIX_FMT_MPEG1_SLICE ||
-	    ctx->src.pix.pixelformat == V4L2_PIX_FMT_MPEG2_SLICE)
+	if (ctx->src.pix.pixelformat == V4L2_PIX_FMT_MPEG2_SLICE)
 		height = ALIGN(ctx->src.pix.height, 32);
 	else
 		height = ALIGN(ctx->src.pix.height,
@@ -3163,9 +3161,8 @@ histb_vdec_find_reference(struct histb_vdec_ctx *ctx, u64 timestamp)
 	struct vb2_buffer *buffer;
 	unsigned int i;
 
-	/* MPEG-1/2 keeps references after userspace may dequeue their capture. */
-	if (ctx->src.pix.pixelformat == V4L2_PIX_FMT_MPEG1_SLICE ||
-	    ctx->src.pix.pixelformat == V4L2_PIX_FMT_MPEG2_SLICE) {
+	/* MPEG-2 keeps references after userspace may dequeue their capture. */
+	if (ctx->src.pix.pixelformat == V4L2_PIX_FMT_MPEG2_SLICE) {
 		for (i = 0; i < ARRAY_SIZE(ctx->apc); i++) {
 			struct histb_vdec_decoded_buffer *ref = ctx->apc[i];
 
@@ -6921,88 +6918,6 @@ static int histb_vdec_parse_mpeg2_slices(
 	return 0;
 }
 
-static int
-histb_vdec_parse_mpeg1_slices(const u8 *data, size_t payload,
-				      u32 width_mbs, u32 total_mbs,
-		struct histb_vdec_mpeg2_slice *slices, unsigned int *num_slices)
-{
-	size_t start = 0;
-	u32 previous_mb = 0;
-	unsigned int count = 0;
-
-	while (start < payload) {
-		struct histb_vdec_bitreader br;
-		size_t end, byte_position, tail;
-		u32 code, qscale, extra, increment, vertical_position, start_mb;
-		bool sequence_end = false;
-
-		if (count == HISTB_VDEC_MPEG2_MAX_SLICES || start + 4 > payload ||
-		    data[start] || data[start + 1] || data[start + 2] != 1)
-			return -EINVAL;
-		code = data[start + 3];
-		if (code < 1 || code > 0xaf)
-			return -EINVAL;
-		for (end = start + 4; end + 3 < payload; end++) {
-			if (!data[end] && !data[end + 1] && data[end + 2] == 1)
-				break;
-		}
-		if (end + 3 >= payload) {
-			end = payload;
-		} else if (data[end + 3] < 1 || data[end + 3] > 0xaf) {
-			if (data[end + 3] != 0xb7)
-				return -EINVAL;
-			for (tail = end + 4; tail < payload; tail++) {
-				if (data[tail])
-					return -EINVAL;
-			}
-			sequence_end = true;
-		}
-		br.data = data + start;
-		br.size = end - start;
-		br.bitpos = 32;
-		vertical_position = code;
-		if (histb_vdec_read_bits(&br, 5, &qscale) || !qscale)
-			return -EINVAL;
-		/* MPEG-1 has extra_bit_slice, not MPEG-2's intra_slice_flag. */
-		for (;;) {
-			if (histb_vdec_read_bits(&br, 1, &extra))
-				return -EINVAL;
-			if (!extra)
-				break;
-			if (histb_vdec_read_bits(&br, 8, &extra))
-				return -EINVAL;
-		}
-		if (histb_vdec_mpeg2_mbaddr_increment(&br, &increment))
-			return -EINVAL;
-		start_mb = (vertical_position - 1) * width_mbs + increment - 1;
-		if (start_mb >= total_mbs || (count && start_mb <= previous_mb))
-			return -EINVAL;
-		byte_position = start + br.bitpos / 8;
-		slices[count].data_offset = round_down(byte_position, 16);
-		slices[count].bit_offset = (byte_position & 15) * 8 +
-			(br.bitpos & 7);
-		slices[count].valid_bits =
-			(sequence_end ? end : payload) * 8 -
-			(start * 8 + br.bitpos);
-		if (slices[count].data_offset > GENMASK(23, 0) ||
-		    !slices[count].valid_bits ||
-		    slices[count].valid_bits > GENMASK(23, 0))
-			return -EINVAL;
-		slices[count].start_mb = start_mb;
-		slices[count].quantiser_scale = qscale;
-		slices[count].intra = 0;
-		previous_mb = start_mb;
-		count++;
-		if (sequence_end)
-			break;
-		start = end;
-	}
-	if (!count || slices[0].start_mb)
-		return -EINVAL;
-	*num_slices = count;
-	return 0;
-}
-
 static int histb_vdec_validate_mpeg2(
 		struct histb_vdec_ctx *ctx,
 		const struct v4l2_ctrl_mpeg2_sequence *sequence,
@@ -7051,29 +6966,6 @@ static int histb_vdec_validate_mpeg2(
 		if (!((const u8 *)picture->f_code)[i] ||
 		    ((const u8 *)picture->f_code)[i] > 15)
 			return -EINVAL;
-	return 0;
-}
-
-static int
-histb_vdec_validate_mpeg1(struct histb_vdec_ctx *ctx,
-				   const struct v4l2_ctrl_mpeg1_sequence *sequence,
-		const struct v4l2_ctrl_mpeg1_picture *picture,
-		const struct v4l2_ctrl_mpeg1_quantisation *quantisation)
-{
-	if (!sequence || !picture || !quantisation ||
-	    picture->picture_coding_type < V4L2_MPEG1_PIC_CODING_TYPE_I ||
-	    picture->picture_coding_type > V4L2_MPEG1_PIC_CODING_TYPE_B ||
-	    picture->flags & ~(V4L2_MPEG1_PIC_FLAG_FULL_PEL_FORWARD |
-				V4L2_MPEG1_PIC_FLAG_FULL_PEL_BACKWARD) ||
-	    !picture->f_code[0] || picture->f_code[0] > 7 ||
-	    !picture->f_code[1] || picture->f_code[1] > 7 ||
-	    ALIGN(sequence->horizontal_size, 16) !=
-			ALIGN(ctx->src.pix.width, 16) ||
-	    ALIGN(sequence->vertical_size, 16) !=
-			ALIGN(ctx->src.pix.height, 16) ||
-	    ctx->src.pix.width > HISTB_VDEC_MPEG2_MAX_WIDTH ||
-	    ctx->src.pix.height > HISTB_VDEC_MPEG2_MAX_HEIGHT)
-		return -EINVAL;
 	return 0;
 }
 
@@ -8413,51 +8305,6 @@ static int histb_vdec_prepare_mpeg2_messages(
 				(i + 1) * HISTB_VDEC_MPEG2_SLICE_MSG_SIZE));
 	}
 
-	return 0;
-}
-
-static int
-histb_vdec_prepare_mpeg1_messages(struct histb_vdec_ctx *ctx,
-					   struct histb_vdec_decoded_buffer *decoded,
-		const struct v4l2_ctrl_mpeg2_sequence *sequence,
-		const struct v4l2_ctrl_mpeg2_picture *picture,
-		const struct v4l2_ctrl_mpeg2_quantisation *quantisation,
-		const struct v4l2_ctrl_mpeg1_picture *mpeg1_picture,
-		const struct histb_vdec_mpeg2_slice *slices,
-		unsigned int num_slices, size_t payload)
-{
-	__le32 *pic = ctx->buffers[HISTB_VDEC_BUF_MSG].cpu +
-		HISTB_VDEC_MPEG2_PIC_MSG_OFFSET;
-	u32 value;
-	int ret;
-
-	ret = histb_vdec_prepare_mpeg2_messages(
-		ctx, decoded, sequence, picture, quantisation, slices, num_slices,
-		payload);
-	if (ret)
-		return ret;
-
-	/*
-	 * CV200 MP2_DEC_PARAM_S maps Mpeg1Flag to word 0 bit 25, and the
-	 * forward/backward full-pel flags to word 1 bits 3/4 respectively.
-	 *
-	 * Bit 25 was measured, not read: with bit 9 the engine ignores the flag
-	 * entirely and decodes an MPEG-1 stream through the MPEG-2 path, which
-	 * returns blocks that differ from the software decoder by 58/255 on
-	 * average with a correlation of 0.02.  Sweeping every bit of word 0 and
-	 * comparing block DC against the software decoder gives bit 25 with a
-	 * correlation of exactly 1.000 and a byte difference of 1..3 grey
-	 * levels, which is the same rounding spread MPEG-2 shows.
-	 * See MPEG1-FLAG-BIT-25.md.
-	 */
-	value = le32_to_cpu(pic[0]) | BIT(25);
-	pic[0] = cpu_to_le32(value);
-	value = le32_to_cpu(pic[1]);
-	if (mpeg1_picture->flags & V4L2_MPEG1_PIC_FLAG_FULL_PEL_FORWARD)
-		value |= BIT(3);
-	if (mpeg1_picture->flags & V4L2_MPEG1_PIC_FLAG_FULL_PEL_BACKWARD)
-		value |= BIT(4);
-	pic[1] = cpu_to_le32(value);
 	return 0;
 }
 
@@ -10827,7 +10674,7 @@ static bool histb_vdec_is_cabac_end_error(struct histb_vdec_ctx *ctx,
 		       !up1 && up2 == ctx->total_mbs - 1 &&
 		       !smmu_state_secure && !smmu_state_nonsecure;
 
-	if (ctx->mpeg2 && ctx->src.pix.pixelformat != V4L2_PIX_FMT_MPEG1_SLICE) {
+	if (ctx->mpeg2) {
 		u32 next_mb = 0;
 
 		/*
@@ -10852,23 +10699,6 @@ static bool histb_vdec_is_cabac_end_error(struct histb_vdec_ctx *ctx,
 		}
 
 		return next_mb == ctx->total_mbs;
-	}
-
-	/*
-	 * MPEG-1 shares this path but not this report format.  See
-	 * MPEG1-SHARES-THE-MPEG2-COMPLETION-RULE.md: the engine reports slice 0
-	 * as macroblocks 0..7 and slice 1 as 315..333 for a 1620-macroblock
-	 * picture, while the driver already knows the real start macroblock of
-	 * every slice.  Applying the MPEG-2 continuity rule rejected the whole
-	 * picture, which threw the frame away and left the client a zero buffer.
-	 */
-	if (ctx->src.pix.pixelformat == V4L2_PIX_FMT_MPEG1_SLICE) {
-		if (state != ((HISTB_VDEC_STATE_CABAC_END_ERROR &
-				~GENMASK(16, 0)) | ctx->mpeg2_slices) ||
-		    smmu_state_secure || smmu_state_nonsecure)
-			return false;
-
-		return true;
 	}
 
 	if (ctx->hevc) {
@@ -13054,109 +12884,6 @@ static void histb_vdec_device_run(void *priv)
 		histb_vdec_complete_request(ctx, request);
 		goto start_hardware;
 	}
-	if (ctx->src.pix.pixelformat == V4L2_PIX_FMT_MPEG1_SLICE) {
-		const struct v4l2_ctrl_mpeg1_sequence *mpeg1_sequence;
-		const struct v4l2_ctrl_mpeg1_picture *mpeg1_picture;
-		const struct v4l2_ctrl_mpeg1_quantisation *mpeg1_quantisation;
-		struct v4l2_ctrl_mpeg2_sequence sequence = {
-			.chroma_format = 1,
-			.flags = V4L2_MPEG2_SEQ_FLAG_PROGRESSIVE,
-		};
-		struct v4l2_ctrl_mpeg2_picture picture = {
-			.flags = V4L2_MPEG2_PIC_FLAG_FRAME_PRED_DCT |
-				 V4L2_MPEG2_PIC_FLAG_PROGRESSIVE,
-			.picture_structure = V4L2_MPEG2_PIC_FRAME,
-		};
-		struct v4l2_ctrl_mpeg2_quantisation quantisation = {};
-		unsigned int num_slices;
-
-		mpeg1_sequence = histb_vdec_ctrl_data(ctx,
-						      V4L2_CID_STATELESS_MPEG1_SEQUENCE);
-		mpeg1_picture = histb_vdec_ctrl_data(ctx,
-						     V4L2_CID_STATELESS_MPEG1_PICTURE);
-		mpeg1_quantisation = histb_vdec_ctrl_data(ctx,
-							  V4L2_CID_STATELESS_MPEG1_QUANTISATION);
-		ret = histb_vdec_validate_mpeg1(
-			ctx, mpeg1_sequence, mpeg1_picture, mpeg1_quantisation);
-		if (ret)
-			goto finish_request;
-		sequence.horizontal_size = mpeg1_sequence->horizontal_size;
-		sequence.vertical_size = mpeg1_sequence->vertical_size;
-		sequence.vbv_buffer_size = mpeg1_sequence->vbv_buffer_size;
-		picture.backward_ref_ts = mpeg1_picture->backward_ref_ts;
-		picture.forward_ref_ts = mpeg1_picture->forward_ref_ts;
-		picture.picture_coding_type = mpeg1_picture->picture_coding_type;
-		picture.f_code[0][0] = mpeg1_picture->f_code[0];
-		picture.f_code[0][1] = mpeg1_picture->f_code[0];
-		picture.f_code[1][0] = mpeg1_picture->f_code[1];
-		picture.f_code[1][1] = mpeg1_picture->f_code[1];
-		memcpy(quantisation.intra_quantiser_matrix,
-		       mpeg1_quantisation->intra_quantiser_matrix,
-		       sizeof(quantisation.intra_quantiser_matrix));
-		memcpy(quantisation.non_intra_quantiser_matrix,
-		       mpeg1_quantisation->non_intra_quantiser_matrix,
-		       sizeof(quantisation.non_intra_quantiser_matrix));
-		ret = histb_vdec_begin_mpeg2_picture(
-			ctx, decoded, src->vb2_buf.timestamp, &sequence, &picture);
-		if (ret)
-			goto finish_request;
-		ret = histb_vdec_set_decoded_buffer_sizes(ctx, decoded);
-		if (ret)
-			goto finish_request;
-		if (!histb_vdec_dma_buffers_valid(ctx)) {
-			ret = -EINVAL;
-			goto finish_request;
-		}
-		ret = histb_vdec_copy_raw_bitstream(ctx, src, payload, &src_dma);
-		if (ret)
-			goto finish_request;
-		mpeg2_slices = kcalloc(HISTB_VDEC_MPEG2_MAX_SLICES,
-				       sizeof(*mpeg2_slices), GFP_KERNEL);
-		if (!mpeg2_slices) {
-			ret = -ENOMEM;
-			goto finish_request;
-		}
-		total_mbs = ctx->mpeg2_picture_width_mbs *
-			ctx->mpeg2_picture_height_mbs;
-		ret = histb_vdec_parse_mpeg1_slices(
-			ctx->bitstream.cpu, payload,
-			DIV_ROUND_UP(sequence.horizontal_size, 16), total_mbs,
-			mpeg2_slices, &num_slices);
-		if (ret)
-			goto finish_request;
-		ret = histb_vdec_prepare_mpeg1_messages(ctx, decoded, &sequence,
-							&picture, &quantisation,
-							mpeg1_picture, mpeg2_slices,
-							num_slices, payload);
-		if (ret)
-			goto finish_request;
-		ctx->mpeg2_picture_valid = true;
-		kfree(mpeg2_slices);
-		mpeg2_slices = NULL;
-		ctx->total_mbs = total_mbs;
-		switch (mpeg1_picture->picture_coding_type) {
-		case V4L2_MPEG1_PIC_CODING_TYPE_P:
-			ctx->frame_flags = V4L2_H264_DECODE_PARAM_FLAG_PFRAME;
-			break;
-		case V4L2_MPEG1_PIC_CODING_TYPE_B:
-			ctx->frame_flags = V4L2_H264_DECODE_PARAM_FLAG_BFRAME;
-			break;
-		default:
-			ctx->frame_flags = 0;
-			break;
-		}
-		ctx->hevc = false;
-		ctx->hevc_main10 = false;
-		ctx->hevc_scaling_list = false;
-		ctx->hevc_slices = 0;
-		ctx->mpeg2 = true;
-		ctx->mpeg2_slices = num_slices;
-		ctx->vp8 = false;
-		ctx->cabac = false;
-		ctx->mbaff = false;
-		histb_vdec_complete_request(ctx, request);
-		goto start_hardware;
-	}
 	if (ctx->src.pix.pixelformat == V4L2_PIX_FMT_MPEG2_SLICE) {
 		const struct v4l2_ctrl_mpeg2_sequence *mpeg2_sequence;
 		const struct v4l2_ctrl_mpeg2_picture *mpeg2_picture;
@@ -13644,8 +13371,7 @@ static size_t histb_vdec_buffer_size(struct histb_vdec_ctx *ctx,
 	     id == HISTB_VDEC_BUF_MPEG4_SED_TOP) &&
 	    ctx->src.pix.pixelformat != V4L2_PIX_FMT_MPEG4)
 		return 0;
-	if ((ctx->src.pix.pixelformat == V4L2_PIX_FMT_MPEG1_SLICE ||
-	     ctx->src.pix.pixelformat == V4L2_PIX_FMT_MPEG2_SLICE) &&
+	if (ctx->src.pix.pixelformat == V4L2_PIX_FMT_MPEG2_SLICE &&
 	    id == HISTB_VDEC_BUF_MSG)
 		return HISTB_VDEC_MPEG2_MSG_SIZE;
 	if (ctx->src.pix.pixelformat == V4L2_PIX_FMT_AVS_SLICE &&
@@ -14084,7 +13810,6 @@ static void histb_vdec_buf_queue(struct vb2_buffer *vb)
 		decoded->avs.valid = false;
 		/* Stateless reference formats clear this only for a new target. */
 		if (ctx->src.pix.pixelformat != V4L2_PIX_FMT_H264_SLICE &&
-		    ctx->src.pix.pixelformat != V4L2_PIX_FMT_MPEG1_SLICE &&
 		    ctx->src.pix.pixelformat != V4L2_PIX_FMT_MPEG2_SLICE &&
 		    ctx->src.pix.pixelformat != V4L2_PIX_FMT_VP8_FRAME &&
 		    ctx->src.pix.pixelformat != V4L2_PIX_FMT_VP9_FRAME)
@@ -14130,8 +13855,7 @@ static int histb_vdec_start_streaming(struct vb2_queue *vq,
 		histb_vdec_reset_apc(ctx);
 	}
 	if (V4L2_TYPE_IS_OUTPUT(vq->type) &&
-	    (ctx->src.pix.pixelformat == V4L2_PIX_FMT_MPEG1_SLICE ||
-	     ctx->src.pix.pixelformat == V4L2_PIX_FMT_MPEG2_SLICE))
+	    ctx->src.pix.pixelformat == V4L2_PIX_FMT_MPEG2_SLICE)
 		histb_vdec_reset_apc(ctx);
 	if (V4L2_TYPE_IS_OUTPUT(vq->type))
 		ret = histb_vdec_alloc_buffers(ctx);
@@ -14180,8 +13904,7 @@ static void histb_vdec_stop_streaming(struct vb2_queue *vq)
 		histb_vdec_reset_h264_field_pair(ctx);
 		histb_vdec_reset_apc(ctx);
 	}
-	if (ctx->src.pix.pixelformat == V4L2_PIX_FMT_MPEG1_SLICE ||
-	    ctx->src.pix.pixelformat == V4L2_PIX_FMT_MPEG2_SLICE)
+	if (ctx->src.pix.pixelformat == V4L2_PIX_FMT_MPEG2_SLICE)
 		histb_vdec_reset_apc(ctx);
 	if (ctx->src.pix.pixelformat == V4L2_PIX_FMT_MPEG4) {
 		if (preserve_mpeg4) {
@@ -14325,11 +14048,9 @@ static int histb_vdec_enum_fmt(struct file *file, void *priv,
 	 * select it, which is the only reliable way to keep it out of a
 	 * deployment.
 	 *
-	 *   MPEG-1 (V4L2_PIX_FMT_MPEG1_SLICE)
-	 *       The engine accepts a picture message that is correct field by
-	 *       field - the geometry, the Mpeg1Flag at word 0 bit 25, the
-	 *       QSCALE_TYPE and INTRA_VLC flags, the zigzag table - and
-	 *       returns DC-only blocks.  See MPEG1-MESSAGE-IS-CORRECT.md.
+	 *   MPEG-1
+	 *       The unfinished VDH path and its private slice ABI were removed;
+	 *       MPEG-1 is not supported by this driver.
 	 *
 	 *   RealVideo 8 and 9 (V4L2_PIX_FMT_RV30, V4L2_PIX_FMT_RV40)
 	 *       The hardware has the HALs (vdm_hal_real8.S, vdm_hal_real9.S)
@@ -14377,8 +14098,7 @@ static int histb_vdec_enum_framesizes(struct file *file, void *priv,
 		max_width = HISTB_VDEC_H264_MAX_WIDTH;
 		max_height = HISTB_VDEC_H264_MAX_HEIGHT;
 		step = 16;
-	} else if (fsize->pixel_format == V4L2_PIX_FMT_MPEG1_SLICE ||
-		   fsize->pixel_format == V4L2_PIX_FMT_MPEG2_SLICE) {
+	} else if (fsize->pixel_format == V4L2_PIX_FMT_MPEG2_SLICE) {
 		max_width = HISTB_VDEC_MPEG2_MAX_WIDTH;
 		max_height = HISTB_VDEC_MPEG2_MAX_HEIGHT;
 	} else if (fsize->pixel_format == V4L2_PIX_FMT_AVS_SLICE) {
@@ -14430,8 +14150,7 @@ static void histb_vdec_try_output_format(struct v4l2_pix_format *pix)
 		max_width = HISTB_VDEC_HEVC_MAX_WIDTH;
 		max_height = HISTB_VDEC_HEVC_MAX_HEIGHT;
 		alignment = 0;
-	} else if (pixelformat == V4L2_PIX_FMT_MPEG1_SLICE ||
-		   pixelformat == V4L2_PIX_FMT_MPEG2_SLICE) {
+	} else if (pixelformat == V4L2_PIX_FMT_MPEG2_SLICE) {
 		max_width = HISTB_VDEC_MPEG2_MAX_WIDTH;
 		max_height = HISTB_VDEC_MPEG2_MAX_HEIGHT;
 	} else if (pixelformat == V4L2_PIX_FMT_AVS_SLICE) {
@@ -14922,9 +14641,6 @@ static const struct v4l2_ctrl_config histb_vdec_ctrls[] = {
 	{ .id = V4L2_CID_STATELESS_MPEG2_SEQUENCE },
 	{ .id = V4L2_CID_STATELESS_MPEG2_PICTURE },
 	{ .id = V4L2_CID_STATELESS_MPEG2_QUANTISATION },
-	{ .id = V4L2_CID_STATELESS_MPEG1_SEQUENCE },
-	{ .id = V4L2_CID_STATELESS_MPEG1_PICTURE },
-	{ .id = V4L2_CID_STATELESS_MPEG1_QUANTISATION },
 	{ .id = V4L2_CID_STATELESS_H264_DECODE_PARAMS },
 	{ .id = V4L2_CID_STATELESS_H264_SPS },
 	{ .id = V4L2_CID_STATELESS_H264_PPS },
@@ -15122,10 +14838,6 @@ static int histb_vdec_request_validate(struct media_request *request)
 		V4L2_CID_STATELESS_MPEG2_SEQUENCE,
 		V4L2_CID_STATELESS_MPEG2_PICTURE,
 	};
-	static const u32 mpeg1_controls[] = {
-		V4L2_CID_STATELESS_MPEG1_SEQUENCE,
-		V4L2_CID_STATELESS_MPEG1_PICTURE,
-	};
 	static const u32 vp8_controls[] = {
 		V4L2_CID_STATELESS_VP8_FRAME,
 	};
@@ -15173,10 +14885,6 @@ static int histb_vdec_request_validate(struct media_request *request)
 	if (!ctx)
 		return -ENOENT;
 	switch (ctx->src.pix.pixelformat) {
-	case V4L2_PIX_FMT_MPEG1_SLICE:
-		required = mpeg1_controls;
-		required_count = ARRAY_SIZE(mpeg1_controls);
-		break;
 	case V4L2_PIX_FMT_MPEG2_SLICE:
 		required = mpeg2_controls;
 		required_count = ARRAY_SIZE(mpeg2_controls);

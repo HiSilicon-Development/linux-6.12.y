@@ -101,26 +101,12 @@ static const u8 mpeg2_intra_quant_matrix[64] = {
 	46, 46, 56, 56, 58, 69, 69, 83
 };
 
-/* Default MPEG-1 intra quantisation coefficients, in bitstream order. */
-static const u8 mpeg1_intra_quant_matrix[64] = {
-	8,  16, 16, 19, 16, 19, 22, 22,
-	22, 22, 22, 22, 26, 24, 26, 27,
-	27, 27, 26, 26, 26, 26, 27, 27,
-	27, 29, 29, 29, 34, 34, 34, 29,
-	29, 29, 27, 27, 29, 29, 32, 32,
-	34, 34, 37, 38, 37, 35, 35, 34,
-	35, 38, 38, 40, 40, 40, 48, 48,
-	46, 46, 56, 56, 58, 69, 69, 83
-};
-
 static void std_init_compound(const struct v4l2_ctrl *ctrl, u32 idx,
 			      union v4l2_ctrl_ptr ptr)
 {
 	struct v4l2_ctrl_mpeg2_sequence *p_mpeg2_sequence;
 	struct v4l2_ctrl_mpeg2_picture *p_mpeg2_picture;
 	struct v4l2_ctrl_mpeg2_quantisation *p_mpeg2_quant;
-	struct v4l2_ctrl_mpeg1_picture *p_mpeg1_picture;
-	struct v4l2_ctrl_mpeg1_quantisation *p_mpeg1_quant;
 	struct v4l2_ctrl_vp8_frame *p_vp8_frame;
 	struct v4l2_ctrl_vp9_frame *p_vp9_frame;
 	struct v4l2_ctrl_fwht_params *p_fwht_params;
@@ -160,21 +146,6 @@ static void std_init_compound(const struct v4l2_ctrl *ctrl, u32 idx,
 		 */
 		memset(p_mpeg2_quant->non_intra_quantiser_matrix, 16,
 		       sizeof(p_mpeg2_quant->non_intra_quantiser_matrix));
-		break;
-	case V4L2_CTRL_TYPE_MPEG1_PICTURE:
-		p_mpeg1_picture = p;
-		p_mpeg1_picture->picture_coding_type =
-			V4L2_MPEG1_PIC_CODING_TYPE_I;
-		p_mpeg1_picture->f_code[0] = 1;
-		p_mpeg1_picture->f_code[1] = 1;
-		break;
-	case V4L2_CTRL_TYPE_MPEG1_QUANTISATION:
-		p_mpeg1_quant = p;
-		memcpy(p_mpeg1_quant->intra_quantiser_matrix,
-		       mpeg1_intra_quant_matrix,
-		       ARRAY_SIZE(mpeg1_intra_quant_matrix));
-		memset(p_mpeg1_quant->non_intra_quantiser_matrix, 16,
-		       sizeof(p_mpeg1_quant->non_intra_quantiser_matrix));
 		break;
 	case V4L2_CTRL_TYPE_VP8_FRAME:
 		p_vp8_frame = p;
@@ -359,15 +330,6 @@ void v4l2_ctrl_type_op_log(const struct v4l2_ctrl *ctrl)
 		break;
 	case V4L2_CTRL_TYPE_MPEG2_QUANTISATION:
 		pr_cont("MPEG2_QUANTISATION");
-		break;
-	case V4L2_CTRL_TYPE_MPEG1_SEQUENCE:
-		pr_cont("MPEG1_SEQUENCE");
-		break;
-	case V4L2_CTRL_TYPE_MPEG1_PICTURE:
-		pr_cont("MPEG1_PICTURE");
-		break;
-	case V4L2_CTRL_TYPE_MPEG1_QUANTISATION:
-		pr_cont("MPEG1_QUANTISATION");
 		break;
 	case V4L2_CTRL_TYPE_MPEG2_SEQUENCE:
 		pr_cont("MPEG2_SEQUENCE");
@@ -873,7 +835,6 @@ static int std_validate_compound(const struct v4l2_ctrl *ctrl, u32 idx,
 {
 	struct v4l2_ctrl_mpeg2_sequence *p_mpeg2_sequence;
 	struct v4l2_ctrl_mpeg2_picture *p_mpeg2_picture;
-	struct v4l2_ctrl_mpeg1_picture *p_mpeg1_picture;
 	struct v4l2_ctrl_vp8_frame *p_vp8_frame;
 	struct v4l2_ctrl_fwht_params *p_fwht_params;
 	struct v4l2_ctrl_h264_sps *p_h264_sps;
@@ -942,29 +903,6 @@ static int std_validate_compound(const struct v4l2_ctrl *ctrl, u32 idx,
 		break;
 
 	case V4L2_CTRL_TYPE_MPEG2_QUANTISATION:
-		break;
-
-	case V4L2_CTRL_TYPE_MPEG1_SEQUENCE:
-		break;
-
-	case V4L2_CTRL_TYPE_MPEG1_PICTURE:
-		p_mpeg1_picture = p;
-		if (p_mpeg1_picture->picture_coding_type <
-				V4L2_MPEG1_PIC_CODING_TYPE_I ||
-		    p_mpeg1_picture->picture_coding_type >
-				V4L2_MPEG1_PIC_CODING_TYPE_B ||
-		    p_mpeg1_picture->flags &
-				~(V4L2_MPEG1_PIC_FLAG_FULL_PEL_FORWARD |
-				  V4L2_MPEG1_PIC_FLAG_FULL_PEL_BACKWARD) ||
-		    !p_mpeg1_picture->f_code[0] ||
-		    p_mpeg1_picture->f_code[0] > 7 ||
-		    !p_mpeg1_picture->f_code[1] ||
-		    p_mpeg1_picture->f_code[1] > 7)
-			return -EINVAL;
-		zero_reserved(*p_mpeg1_picture);
-		break;
-
-	case V4L2_CTRL_TYPE_MPEG1_QUANTISATION:
 		break;
 
 	case V4L2_CTRL_TYPE_FWHT_PARAMS:
@@ -2032,15 +1970,6 @@ static struct v4l2_ctrl *v4l2_ctrl_new(struct v4l2_ctrl_handler *hdl,
 		break;
 	case V4L2_CTRL_TYPE_MPEG2_QUANTISATION:
 		elem_size = sizeof(struct v4l2_ctrl_mpeg2_quantisation);
-		break;
-	case V4L2_CTRL_TYPE_MPEG1_SEQUENCE:
-		elem_size = sizeof(struct v4l2_ctrl_mpeg1_sequence);
-		break;
-	case V4L2_CTRL_TYPE_MPEG1_PICTURE:
-		elem_size = sizeof(struct v4l2_ctrl_mpeg1_picture);
-		break;
-	case V4L2_CTRL_TYPE_MPEG1_QUANTISATION:
-		elem_size = sizeof(struct v4l2_ctrl_mpeg1_quantisation);
 		break;
 	case V4L2_CTRL_TYPE_FWHT_PARAMS:
 		elem_size = sizeof(struct v4l2_ctrl_fwht_params);
