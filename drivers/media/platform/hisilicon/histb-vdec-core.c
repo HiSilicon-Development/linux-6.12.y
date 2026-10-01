@@ -15632,6 +15632,11 @@ static bool histb_vdec_pool_unreachable(struct device *dev)
 	return unreachable;
 }
 
+static void histb_vdec_release_pool(void *data)
+{
+	of_reserved_mem_device_release(data);
+}
+
 static int histb_vdec_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -15679,6 +15684,11 @@ static int histb_vdec_probe(struct platform_device *pdev)
 		if (ret && ret != -ENODEV)
 			return dev_err_probe(dev, ret,
 					     "failed to get the decoder memory pool\n");
+		if (!ret) {
+			ret = devm_add_action_or_reset(dev, histb_vdec_release_pool, dev);
+			if (ret)
+				return ret;
+		}
 	}
 	vdec->regs = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(vdec->regs))
@@ -15777,7 +15787,6 @@ static void histb_vdec_remove(struct platform_device *pdev)
 	pm_runtime_disable(vdec->dev);
 	if (!pm_runtime_status_suspended(vdec->dev))
 		histb_vdec_runtime_suspend(vdec->dev);
-	of_reserved_mem_device_release(vdec->dev);
 }
 
 static const struct of_device_id histb_vdec_of_match[] = {
