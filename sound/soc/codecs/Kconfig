@@ -1197,6 +1197,15 @@ config SND_SOC_HDA
 	  legacy solution - including the dynamic resource allocation
 	  based on actual codec capabilities.
 
+config SND_SOC_HI3798CV200_TIANLAI
+	tristate "HiSilicon Hi3798CV200 Tianlai DAC"
+	depends on ARCH_HISI || COMPILE_TEST
+	help
+	  Enable the internal Tianlai stereo DAC found in the Hi3798CV200.
+	  The driver is an ASoC codec and uses the common clock, reset and GPIO
+	  frameworks. Select this option for boards that route AIAO playback
+	  through the integrated analog audio output.
+
 config SND_SOC_ICS43432
 	tristate "ICS43423 and compatible i2s microphones"
 
