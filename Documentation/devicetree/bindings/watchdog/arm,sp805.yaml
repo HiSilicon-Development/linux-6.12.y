@@ -15,6 +15,7 @@ description: |+
   when the next interrupt would be triggered, the reset signal is asserted.
 
 allOf:
+  - $ref: /schemas/arm/primecell.yaml#
   - $ref: /schemas/watchdog/watchdog.yaml#
 
 # Need a custom select here or 'arm,primecell' will match on lots of nodes
@@ -28,9 +29,14 @@ select:
 
 properties:
   compatible:
-    items:
-      - const: arm,sp805
-      - const: arm,primecell
+    oneOf:
+      - items:
+          - const: arm,sp805
+          - const: arm,primecell
+      - items:
+          - const: hisilicon,hi3798cv200-sp805
+          - const: arm,sp805
+          - const: arm,primecell
 
   interrupts:
     maxItems: 1

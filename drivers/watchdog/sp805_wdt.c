@@ -23,6 +23,7 @@
 #include <linux/math64.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
+#include <linux/of.h>
 #include <linux/pm.h>
 #include <linux/property.h>
 #include <linux/reset.h>
@@ -35,6 +36,8 @@
 #define DEFAULT_TIMEOUT		60
 
 #define MODULE_NAME		"sp805-wdt"
+
+#define HI3798CV200_RESTART_LOAD	0x00000100
 
 /* watchdog register offsets and masks */
 #define WDTLOAD			0x000
@@ -62,8 +65,8 @@
  * @clk: (optional) clock structure of wdt
  * @rate: (optional) clock rate when provided via properties
  * @adev: amba device structure of wdt
- * @status: current status of wdt
  * @load_val: load value to be set for current timeout
+ * @restart_load: load value used by the restart handler
  */
 struct sp805_wdt {
 	struct watchdog_device		wdd;
@@ -73,6 +76,7 @@ struct sp805_wdt {
 	u64				rate;
 	struct amba_device		*adev;
 	unsigned int			load_val;
+	u32				restart_load;
 };
 
 static bool nowayout = WATCHDOG_NOWAYOUT;
@@ -141,7 +145,7 @@ wdt_restart(struct watchdog_device *wdd, unsigned long mode, void *cmd)
 
 	writel_relaxed(UNLOCK, wdt->base + WDTLOCK);
 	writel_relaxed(0, wdt->base + WDTCONTROL);
-	writel_relaxed(0, wdt->base + WDTLOAD);
+	writel_relaxed(wdt->restart_load, wdt->base + WDTLOAD);
 	writel_relaxed(INT_ENABLE | RESET_ENABLE, wdt->base + WDTCONTROL);
 
 	/* Flush posted writes. */
@@ -242,6 +246,11 @@ sp805_wdt_probe(struct amba_device *adev, const struct amba_id *id)
 		ret = -ENOMEM;
 		goto err;
 	}
+
+	/* Hi3798CV200 does not restart when WDTLOAD is zero. */
+	if (of_device_is_compatible(adev->dev.of_node,
+				    "hisilicon,hi3798cv200-sp805"))
+		wdt->restart_load = HI3798CV200_RESTART_LOAD;
 
 	wdt->base = devm_ioremap_resource(&adev->dev, &adev->res);
 	if (IS_ERR(wdt->base))
