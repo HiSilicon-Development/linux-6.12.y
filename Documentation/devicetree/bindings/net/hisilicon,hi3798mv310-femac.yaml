@@ -1,0 +1,133 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/net/hisilicon,hi3798mv310-femac.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: HiSilicon Hi3798MV310 Fast Ethernet MAC and internal PHY
+
+maintainers:
+  - Dongpo Li <lidongpo@hisilicon.com>
+
+description: |
+  The Hi3798MV310 switch-fabric Ethernet controller provides a port-0 FIFO
+  datapath, an MDIO controller at offset 0x1100, and global registers at
+  offset 0x1300. The internal Fast Ethernet PHY uses MII. Its LDO and MDIO
+  address latch are in the peripheral-control syscon, while its clock and
+  reset are provided by the CRG. Power, reset and analog trimming must finish
+  before the integrated MDIO bus probes the PHY.
+
+  The PHY address comes from the PHY node's reg property and is programmed
+  into the address latch before reset. A PHY identity must be read from
+  hardware, not supplied as an ethernet-phy-id compatible. No compatible
+  fallback to another SoC or separate MDIO platform device is required.
+
+  If firmware actually supplies the legacy /chiptrim/chiptrim0 handoff,
+  the driver decodes its LD amplitude bits 15:11, LDO amplitude bits 10:8,
+  and resistor trim bits 5:0. A supplied zero word uses the vendor's
+  documented 0x0e/0x03/0x16 defaults. Absent handoff data instead uses the
+  hardware ATE auto-trim completion protocol; board DTS files must not
+  invent trim values.
+
+allOf:
+  - $ref: ethernet-controller.yaml#
+
+properties:
+  compatible:
+    const: hisilicon,hi3798mv310-femac
+
+  reg:
+    maxItems: 1
+
+  interrupts:
+    maxItems: 1
+
+  clocks:
+    items:
+      - description: MAC clocks, CRG 0xd0 bits 1:0 with bit 2 cleared
+      - description: Internal PHY clock, CRG 0x388 bit 0
+
+  clock-names:
+    items:
+      - const: mac
+      - const: phy
+
+  resets:
+    items:
+      - description: MAC reset, CRG 0xd0 bit 3
+      - description: Internal PHY reset, CRG 0x388 bit 4
+
+  reset-names:
+    items:
+      - const: mac
+      - const: phy
+
+  hisilicon,peri-syscon:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: |
+      Peripheral-control syscon containing the PHY address latch at 0x118
+      (bits 4:0), and internal PHY LDO control at 0x844 (set bits 4 and 6,
+      clear bits 5 and 7).
+
+  phy-mode:
+    const: mii
+
+  phy-handle: true
+
+  fixed-link: false
+
+  mdio:
+    $ref: mdio.yaml#
+    unevaluatedProperties: false
+    description: Integrated MDIO bus, with the internal PHY as a child
+    patternProperties:
+      '^ethernet-phy@[0-9a-f]+$':
+        type: object
+        $ref: ethernet-phy.yaml#
+        unevaluatedProperties: false
+        properties:
+          compatible:
+            const: ethernet-phy-ieee802.3-c22
+
+required:
+  - compatible
+  - reg
+  - interrupts
+  - clocks
+  - clock-names
+  - resets
+  - reset-names
+  - hisilicon,peri-syscon
+  - phy-mode
+  - phy-handle
+  - mdio
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/clock/hi3798mv310-clock.h>
+    #include <dt-bindings/interrupt-controller/arm-gic.h>
+
+    ethernet@f9c30000 {
+        compatible = "hisilicon,hi3798mv310-femac";
+        reg = <0xf9c30000 0x4000>;
+        interrupts = <GIC_SPI 72 IRQ_TYPE_LEVEL_HIGH>;
+        clocks = <&crg HI3798MV310_ETH_MAC>, <&crg HI3798MV310_ETH_PHY>;
+        clock-names = "mac", "phy";
+        resets = <&crg 0xd0 3>, <&crg 0x388 4>;
+        reset-names = "mac", "phy";
+        hisilicon,peri-syscon = <&peri_ctrl>;
+        phy-mode = "mii";
+        phy-handle = <&internal_phy>;
+
+        mdio {
+            #address-cells = <1>;
+            #size-cells = <0>;
+
+            internal_phy: ethernet-phy@2 {
+                reg = <2>;
+            };
+        };
+    };
+...
