@@ -243,10 +243,12 @@ static void mci_send_cmd(struct dw_mci_slot *slot, u32 cmd, u32 arg)
 
 	if (readl_poll_timeout_atomic(host->regs + SDMMC_CMD, cmd_status,
 				      !(cmd_status & SDMMC_CMD_START),
-				      1, 500 * USEC_PER_MSEC))
+				      1, 500 * USEC_PER_MSEC)) {
+		mmc_debugfs_err_stats_inc(slot->mmc, MMC_ERR_CTRL_TIMEOUT);
 		dev_err(&slot->mmc->class_dev,
 			"Timeout sending command (cmd %#x arg %#x status %#x)\n",
 			cmd, arg, cmd_status);
+	}
 }
 
 static u32 dw_mci_prepare_command(struct mmc_host *mmc, struct mmc_command *cmd)
@@ -1742,6 +1744,19 @@ static int dw_mci_prepare_hs400_tuning(struct mmc_host *mmc,
 	return 0;
 }
 
+static int dw_mci_execute_hs400_tuning(struct mmc_host *mmc,
+					struct mmc_card *card)
+{
+	struct dw_mci_slot *slot = mmc_priv(mmc);
+	struct dw_mci *host = slot->host;
+	const struct dw_mci_drv_data *drv_data = host->drv_data;
+
+	if (drv_data && drv_data->execute_hs400_tuning)
+		return drv_data->execute_hs400_tuning(host, card);
+
+	return 0;
+}
+
 static bool dw_mci_reset(struct dw_mci *host)
 {
 	u32 flags = SDMMC_CTRL_RESET | SDMMC_CTRL_FIFO_RESET;
@@ -1823,6 +1838,7 @@ static const struct mmc_host_ops dw_mci_ops = {
 	.card_busy		= dw_mci_card_busy,
 	.start_signal_voltage_switch = dw_mci_switch_voltage,
 	.prepare_hs400_tuning	= dw_mci_prepare_hs400_tuning,
+	.execute_hs400_tuning	= dw_mci_execute_hs400_tuning,
 };
 
 #ifdef CONFIG_FAULT_INJECTION
@@ -1927,6 +1943,7 @@ static void dw_mci_request_end(struct dw_mci *host, struct mmc_request *mrq)
 
 static int dw_mci_command_complete(struct dw_mci *host, struct mmc_command *cmd)
 {
+	struct mmc_host *mmc = host->slot ? host->slot->mmc : NULL;
 	u32 status = host->cmd_status;
 
 	host->cmd_status = 0;
@@ -1946,20 +1963,26 @@ static int dw_mci_command_complete(struct dw_mci *host, struct mmc_command *cmd)
 		}
 	}
 
-	if (status & SDMMC_INT_RTO)
+	if (status & SDMMC_INT_RTO) {
 		cmd->error = -ETIMEDOUT;
-	else if ((cmd->flags & MMC_RSP_CRC) && (status & SDMMC_INT_RCRC))
+		if (mmc && !mmc_doing_tune(mmc))
+			mmc_debugfs_err_stats_inc(mmc, MMC_ERR_CMD_TIMEOUT);
+	} else if ((cmd->flags & MMC_RSP_CRC) && (status & SDMMC_INT_RCRC)) {
 		cmd->error = -EILSEQ;
-	else if (status & SDMMC_INT_RESP_ERR)
+		if (mmc && !mmc_doing_tune(mmc))
+			mmc_debugfs_err_stats_inc(mmc, MMC_ERR_CMD_CRC);
+	} else if (status & SDMMC_INT_RESP_ERR) {
 		cmd->error = -EIO;
-	else
+	} else {
 		cmd->error = 0;
+	}
 
 	return cmd->error;
 }
 
 static int dw_mci_data_complete(struct dw_mci *host, struct mmc_data *data)
 {
+	struct mmc_host *mmc = host->slot ? host->slot->mmc : NULL;
 	u32 status = host->data_status;
 
 	if (status & DW_MCI_DATA_ERROR_FLAGS) {
@@ -1987,6 +2010,16 @@ static int dw_mci_data_complete(struct dw_mci *host, struct mmc_data *data)
 		}
 
 		dev_dbg(host->dev, "data error, status 0x%08x\n", status);
+		if (mmc && !mmc_doing_tune(mmc)) {
+			if (data->error == -ETIMEDOUT)
+				mmc_debugfs_err_stats_inc(mmc,
+							  MMC_ERR_DAT_TIMEOUT);
+			else if (data->error == -EILSEQ)
+				mmc_debugfs_err_stats_inc(mmc, MMC_ERR_DAT_CRC);
+			dev_err_ratelimited(host->dev,
+					    "data transfer error status=0x%08x err=%d\n",
+					    status, data->error);
+		}
 
 		/*
 		 * After an error, there may be data lingering
@@ -3429,9 +3462,13 @@ int dw_mci_probe(struct dw_mci *host)
 	}
 
 	if (host->pdata->rstc) {
-		reset_control_assert(host->pdata->rstc);
+		ret = reset_control_assert(host->pdata->rstc);
+		if (ret && drv_data && drv_data->strict_reset)
+			goto err_clk_ciu;
 		usleep_range(10, 50);
-		reset_control_deassert(host->pdata->rstc);
+		ret = reset_control_deassert(host->pdata->rstc);
+		if (ret && drv_data && drv_data->strict_reset)
+			goto err_clk_ciu;
 	}
 
 	if (drv_data && drv_data->init) {

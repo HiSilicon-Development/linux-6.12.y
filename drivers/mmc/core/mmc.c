@@ -1319,8 +1319,11 @@ int mmc_hs400_to_hs200(struct mmc_card *card)
 	mmc_set_bus_speed(card);
 
 	/* Prepare tuning for HS400 mode. */
-	if (host->ops->prepare_hs400_tuning)
-		host->ops->prepare_hs400_tuning(host, &host->ios);
+	if (host->ops->prepare_hs400_tuning) {
+		err = host->ops->prepare_hs400_tuning(host, &host->ios);
+		if (err)
+			goto out_err;
+	}
 
 	return 0;
 
@@ -1581,8 +1584,13 @@ static int mmc_hs200_tuning(struct mmc_card *card)
 	 */
 	if (card->mmc_avail_type & EXT_CSD_CARD_TYPE_HS400 &&
 	    host->ios.bus_width == MMC_BUS_WIDTH_8)
-		if (host->ops->prepare_hs400_tuning)
-			host->ops->prepare_hs400_tuning(host, &host->ios);
+		if (host->ops->prepare_hs400_tuning) {
+			int err;
+
+			err = host->ops->prepare_hs400_tuning(host, &host->ios);
+			if (err)
+				return err;
+		}
 
 	return mmc_execute_tuning(card);
 }
