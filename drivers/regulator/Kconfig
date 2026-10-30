@@ -25,6 +25,26 @@ menuconfig REGULATOR
 
 if REGULATOR
 
+config REGULATOR_HI3798MV310
+	bool "Hi3798MV310 shared CPU/GPU/Core PWM supply"
+	depends on ARCH_HISI_HISTB && OF
+	select PM_OPP
+	help
+	  Arbitrate the shared CPU/GPU/Core PWM supply using the highest
+	  consumer vote and the voltage floor for the current CPU rate.
+	  Calibrated CPU operating points use OTP and HPM data with cold
+	  margins. Missing calibration, unknown rates and the 1.6 GHz CPU
+	  point retain the conservative 1.25 V ceiling. GPU operating points
+	  also use 1.25 V because GPU voltage characterization is unavailable.
+
+config REGULATOR_HI3798MV310_SD_IO
+	tristate "Hi3798MV310 SD 3.3 V I/O supply"
+	depends on ARCH_HISI_HISTB && OF
+	select MFD_SYSCON
+	help
+	  Control the SD0 I/O supply through PERI_SD_LDO. This driver
+	  supports 3.3 V signalling; it does not enable UHS voltage switching.
+
 config REGULATOR_DEBUG
 	bool "Regulator debug support"
 	help
@@ -430,6 +450,17 @@ config REGULATOR_GPIO
 	  It is capable of supporting current and voltage regulators
 	  and the platform has to provide a mapping of GPIO-states
 	  to target volts/amps.
+
+config REGULATOR_HI3798CV200_PWM
+	tristate "HiSilicon Hi3798CV200 CPU/GPU regulators"
+	depends on SOC_HI3798CV200 || COMPILE_TEST
+	depends on OF
+	help
+	  Enable the voltage regulator driven by the dedicated PWM register
+	  found on HiSilicon Hi3798CV200 set-top-box SoCs. These supplies power
+	  the Cortex-A53 CPU cluster and integrated Mali-T720 GPU. The driver
+	  exposes them through the regulator framework so generic OPP, CPUFreq,
+	  and Panfrost drivers can coordinate voltage changes.
 
 config REGULATOR_HI6421
 	tristate "HiSilicon Hi6421 PMIC voltage regulator support"
