@@ -98,6 +98,7 @@
 
 struct dvb_usb_device;
 struct dvb_usb_adapter;
+struct usb_data_stream;
 
 /**
  * struct dvb_usb_driver_info - structure for carrying all needed data from the
@@ -167,6 +168,10 @@ struct usb_data_stream_properties {
  * @pid_filter_count: pid count of adapter pid-filter
  * @pid_filter_ctrl: called to enable/disable pid-filter
  * @pid_filter: called to set/unset pid for filtering
+ * @stream_complete: optional device-specific framing callback, overriding
+ *  the generic TS-type callback. Runs in URB completion context and must not
+ *  sleep or retain the buffer after returning. URBs are killed before the
+ *  adapter and driver-private storage are released.
  * @stream: adapter usb stream configuration
  */
 struct dvb_usb_adapter_properties {
@@ -179,6 +184,8 @@ struct dvb_usb_adapter_properties {
 	u8 pid_filter_count;
 	int (*pid_filter_ctrl) (struct dvb_usb_adapter *, int);
 	int (*pid_filter) (struct dvb_usb_adapter *, int, u16, int);
+	void (*stream_complete)(struct usb_data_stream *stream, u8 *buffer,
+				size_t length);
 
 	struct usb_data_stream_properties stream;
 };
@@ -220,6 +227,9 @@ struct dvb_usb_adapter_properties {
  * @get_stream_config: called to resolve input and output stream configuration
  *  of the adapter just before streaming is started. input stream is transport
  *  stream from the demodulator and output stream is usb stream to host.
+ *  Also called before active-feed resume. A failing callback must undo its
+ *  own hardware changes; after success, streaming_ctrl(0) rolls back a later
+ *  stream-start failure.
  */
 struct dvb_usb_device_properties {
 #define MAX_NO_OF_ADAPTER_PER_DEVICE 2

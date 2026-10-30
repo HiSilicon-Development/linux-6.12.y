@@ -219,6 +219,27 @@ static void dvb_usb_data_complete_raw(struct usb_data_stream *stream, u8 *buf,
 	dvb_dmx_swfilter_raw(&adap->demux, buf, len);
 }
 
+static void dvb_usb_set_stream_complete(struct dvb_usb_adapter *adap)
+{
+	if (adap->props->stream_complete) {
+		adap->stream.complete = adap->props->stream_complete;
+		return;
+	}
+
+	switch (adap->ts_type) {
+	case DVB_USB_FE_TS_TYPE_204:
+		adap->stream.complete = dvb_usb_data_complete_204;
+		break;
+	case DVB_USB_FE_TS_TYPE_RAW:
+		adap->stream.complete = dvb_usb_data_complete_raw;
+		break;
+	case DVB_USB_FE_TS_TYPE_188:
+	default:
+		adap->stream.complete = dvb_usb_data_complete;
+		break;
+	}
+}
+
 static int dvb_usbv2_adapter_stream_init(struct dvb_usb_adapter *adap)
 {
 	dev_dbg(&adap_to_d(adap)->udev->dev, "%s: adap=%d\n", __func__,
@@ -226,7 +247,8 @@ static int dvb_usbv2_adapter_stream_init(struct dvb_usb_adapter *adap)
 
 	adap->stream.udev = adap_to_d(adap)->udev;
 	adap->stream.user_priv = adap;
-	adap->stream.complete = dvb_usb_data_complete;
+	adap->stream.complete = adap->props->stream_complete ?:
+				 dvb_usb_data_complete;
 
 	return usb_urb_initv2(&adap->stream, &adap->props->stream);
 }
@@ -243,6 +265,9 @@ static int dvb_usb_start_feed(struct dvb_demux_feed *dvbdmxfeed)
 {
 	struct dvb_usb_adapter *adap = dvbdmxfeed->demux->priv;
 	struct dvb_usb_device *d = adap_to_d(adap);
+	bool pid_filter_enabled = false;
+	bool stream_attempted = false;
+	bool urbs_submitted = false;
 	int ret = 0;
 	struct usb_data_stream_properties stream_props;
 	dev_dbg(&d->udev->dev,
@@ -270,46 +295,51 @@ static int dvb_usb_start_feed(struct dvb_demux_feed *dvbdmxfeed)
 				sizeof(struct usb_data_stream_properties));
 		ret = d->props->get_stream_config(adap->fe[adap->active_fe],
 				&adap->ts_type, &stream_props);
-		if (ret)
+		if (ret) {
 			dev_err(&d->udev->dev,
 					"%s: get_stream_config() failed=%d\n",
 					KBUILD_MODNAME, ret);
+			goto err_feed_start;
+		}
+		/* Configuration may already have enabled the device TS path. */
+		stream_attempted = !!d->props->streaming_ctrl;
 	} else {
 		stream_props = adap->props->stream;
 	}
 
-	switch (adap->ts_type) {
-	case DVB_USB_FE_TS_TYPE_204:
-		adap->stream.complete = dvb_usb_data_complete_204;
-		break;
-	case DVB_USB_FE_TS_TYPE_RAW:
-		adap->stream.complete = dvb_usb_data_complete_raw;
-		break;
-	case DVB_USB_FE_TS_TYPE_188:
-	default:
-		adap->stream.complete = dvb_usb_data_complete;
-		break;
-	}
+	dvb_usb_set_stream_complete(adap);
 
 	/* submit USB streaming packets */
-	usb_urb_submitv2(&adap->stream, &stream_props);
+	ret = usb_urb_submitv2(&adap->stream, &stream_props);
+	if (ret) {
+		dev_err(&d->udev->dev, "%s: USB stream submit failed=%d\n",
+			KBUILD_MODNAME, ret);
+		goto err_feed_start;
+	}
+	urbs_submitted = true;
 
 	/* enable HW PID filter */
 	if (adap->pid_filtering && adap->props->pid_filter_ctrl) {
+		pid_filter_enabled = true;
 		ret = adap->props->pid_filter_ctrl(adap, 1);
-		if (ret)
+		if (ret) {
 			dev_err(&d->udev->dev,
 					"%s: pid_filter_ctrl() failed=%d\n",
 					KBUILD_MODNAME, ret);
+			goto err_feed_start;
+		}
 	}
 
 	/* ask device to start streaming */
 	if (d->props->streaming_ctrl) {
+		stream_attempted = true;
 		ret = d->props->streaming_ctrl(adap->fe[adap->active_fe], 1);
-		if (ret)
+		if (ret) {
 			dev_err(&d->udev->dev,
 					"%s: streaming_ctrl() failed=%d\n",
 					KBUILD_MODNAME, ret);
+			goto err_feed_start;
+		}
 	}
 skip_feed_start:
 
@@ -317,13 +347,32 @@ skip_feed_start:
 	if (adap->pid_filtering && adap->props->pid_filter) {
 		ret = adap->props->pid_filter(adap, dvbdmxfeed->index,
 				dvbdmxfeed->pid, 1);
-		if (ret)
+		if (ret) {
 			dev_err(&d->udev->dev, "%s: pid_filter() failed=%d\n",
 					KBUILD_MODNAME, ret);
+			/* A failed write may already have installed this PID. */
+			adap->props->pid_filter(adap, dvbdmxfeed->index,
+					dvbdmxfeed->pid, 0);
+			goto err_feed_start;
+		}
 	}
 
-	if (ret)
-		dev_dbg(&d->udev->dev, "%s: failed=%d\n", __func__, ret);
+	return 0;
+
+err_feed_start:
+	adap->feed_count--;
+	if (adap->feed_count)
+		goto err;
+
+	if (stream_attempted)
+		d->props->streaming_ctrl(adap->fe[adap->active_fe], 0);
+	if (pid_filter_enabled)
+		adap->props->pid_filter_ctrl(adap, 0);
+	if (urbs_submitted)
+		usb_urb_killv2(&adap->stream);
+	clear_and_wake_up_bit(ADAP_STREAMING, &adap->state_bits);
+err:
+	dev_dbg(&d->udev->dev, "%s: failed=%d\n", __func__, ret);
 	return ret;
 }
 
@@ -339,6 +388,8 @@ static int dvb_usb_stop_feed(struct dvb_demux_feed *dvbdmxfeed)
 			dvbdmxfeed->pid, dvbdmxfeed->index);
 
 	if (adap->active_fe == -1)
+		return -EINVAL;
+	if (!adap->feed_count)
 		return -EINVAL;
 
 	/* remove PID from device HW PID filter */
@@ -540,8 +591,14 @@ static int dvb_usbv2_device_power_ctrl(struct dvb_usb_device *d, int onoff)
 		dev_dbg(&d->udev->dev, "%s: power=%d\n", __func__, onoff);
 		if (d->props->power_ctrl) {
 			ret = d->props->power_ctrl(d, onoff);
-			if (ret < 0)
+			if (ret < 0) {
+				/* Keep the software refcount at the pre-call state. */
+				if (onoff)
+					d->powered--;
+				else
+					d->powered++;
 				goto err;
+			}
 		}
 	}
 
@@ -852,7 +909,9 @@ static int dvb_usbv2_init(struct dvb_usb_device *d)
 	int ret;
 	dev_dbg(&d->udev->dev, "%s:\n", __func__);
 
-	dvb_usbv2_device_power_ctrl(d, 1);
+	ret = dvb_usbv2_device_power_ctrl(d, 1);
+	if (ret < 0)
+		goto err;
 
 	if (d->props->read_config) {
 		ret = d->props->read_config(d);
@@ -1063,8 +1122,9 @@ EXPORT_SYMBOL(dvb_usbv2_suspend);
 
 static int dvb_usbv2_resume_common(struct dvb_usb_device *d)
 {
-	int ret = 0, i, active_fe;
+	int ret = 0, err, i, active_fe;
 	struct dvb_frontend *fe;
+	struct usb_data_stream_properties stream_props;
 	dev_dbg(&d->udev->dev, "%s:\n", __func__);
 
 	for (i = 0; i < MAX_NO_OF_ADAPTER_PER_DEVICE; i++) {
@@ -1072,14 +1132,41 @@ static int dvb_usbv2_resume_common(struct dvb_usb_device *d)
 		if (d->adapter[i].dvb_adap.priv && active_fe != -1) {
 			fe = d->adapter[i].fe[active_fe];
 
-			ret = dvb_frontend_resume(fe);
+			err = dvb_frontend_resume(fe);
+			if (err)
+				goto resume_failed;
 
-			/* resume usb streaming */
-			usb_urb_submitv2(&d->adapter[i].stream, NULL);
+			/* An open frontend does not imply an active TS feed. */
+			if (!d->adapter[i].feed_count)
+				goto resume_done;
 
+			stream_props = d->adapter[i].props->stream;
+			if (d->props->get_stream_config) {
+				err = d->props->get_stream_config(fe,
+					&d->adapter[i].ts_type, &stream_props);
+				if (err)
+					goto resume_failed;
+			}
+			dvb_usb_set_stream_complete(&d->adapter[i]);
+
+			err = usb_urb_submitv2(&d->adapter[i].stream, &stream_props);
+			if (err)
+				goto resume_failed;
+
+			if (d->props->streaming_ctrl) {
+				err = d->props->streaming_ctrl(fe, 1);
+				if (err)
+					goto resume_failed;
+			}
+			goto resume_done;
+
+resume_failed:
 			if (d->props->streaming_ctrl)
-				d->props->streaming_ctrl(fe, 1);
-
+				d->props->streaming_ctrl(fe, 0);
+			usb_urb_killv2(&d->adapter[i].stream);
+			if (!ret)
+				ret = err;
+resume_done:
 			d->adapter[i].suspend_resume_active = false;
 		}
 	}
@@ -1107,12 +1194,19 @@ int dvb_usbv2_reset_resume(struct usb_interface *intf)
 	int ret;
 	dev_dbg(&d->udev->dev, "%s:\n", __func__);
 
-	dvb_usbv2_device_power_ctrl(d, 1);
+	ret = dvb_usbv2_device_power_ctrl(d, 1);
+	if (ret)
+		goto power_off;
 
-	if (d->props->init)
-		d->props->init(d);
+	if (d->props->init) {
+		ret = d->props->init(d);
+		if (ret)
+			goto power_off;
+	}
 
 	ret = dvb_usbv2_resume_common(d);
+
+power_off:
 
 	dvb_usbv2_device_power_ctrl(d, 0);
 
