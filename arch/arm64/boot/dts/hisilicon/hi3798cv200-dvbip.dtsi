@@ -1,0 +1,470 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Device Tree Source for HiSilicon Hi3798CV200 DVB-IP common platform.
+ */
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/pinctrl/hisi.h>
+#include <dt-bindings/thermal/thermal.h>
+#include "hi3798cv200.dtsi"
+
+/* value, enable bits, disable bits, mask */
+#define PINCTRL_PULLDOWN(value, enable, disable, mask) \
+	(value << 13) (enable << 13) (disable << 13) (mask << 13)
+#define PINCTRL_PULLUP(value, enable, disable, mask) \
+	(value << 12) (enable << 12) (disable << 12) (mask << 12)
+#define PINCTRL_SLEW_RATE(value, mask)	  (value << 8) (mask << 8)
+#define PINCTRL_DRV_STRENGTH(value, mask) (value << 4) (mask << 4)
+
+/ {
+	/delete-node/ psci;
+	aliases {
+		mmc0 = &emmc;
+		serial0 = &uart0;
+		serial2 = &uart2;
+	};
+
+	memory@0 {
+		device_type = "memory";
+		reg = <0x0 0x0 0x0 0x80000000>;
+	};
+
+
+	hdmi-connector {
+		compatible = "hdmi-connector";
+		type = "a";
+
+		port {
+			hdmi_connector_in: endpoint {
+				remote-endpoint = <&hdmi_out>;
+			};
+		};
+	};
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		smp_firmware: smp-firmware@11000000 {
+			reg = <0x0 0x11000000 0x0 0x00010000>;
+			no-map;
+		};
+
+		linux_cma: linux,cma {
+			compatible = "shared-dma-pool";
+			reusable;
+			/*
+			 * Shared 192 MiB display/eMMC DMA pool in the SoC's low
+			 * 1 GiB aperture. Decoder capture uses a separate CMA area
+			 * so UHD frame queues cannot exhaust this pool.
+			 */
+			size = <0x0 0x0c000000>;
+			alignment = <0x0 0x00800000>;
+			alloc-ranges = <0x0 0x30000000 0x0 0x10000000>;
+			linux,cma-default;
+		};
+
+		capture_cma: decoder-capture@12000000 {
+			compatible = "shared-dma-pool";
+			reg = <0x0 0x12000000 0x0 0x0a000000>;
+			reusable;
+		};
+
+		/*
+		 * Decoder reconstruction/message pool: non-reusable memory
+		 * below the SoC's 1 GiB DMA limit. Keep it separate from the
+		 * capture CMA area and shared display/eMMC allocations.
+		 */
+		vdec_pool: vdec-pool@20000000 {
+			compatible = "shared-dma-pool";
+			/* 240 MiB for reconstruction surfaces and decoder messages. */
+			reg = <0x0 0x20000000 0x0 0x0f000000>;
+			/* Avoid linear-map aliases for the dedicated DMA pool. */
+			no-map;
+		};
+		/*
+		 * Dedicated H.264 encoder DMA pool.  Keep V4L2 M2M capture
+		 * buffers out of the shared display/eMMC CMA area: a 4K decoder
+		 * plus a 1080i DEI/VENC session can leave free CMA pages without
+		 * leaving a sufficiently large contiguous encoder buffer.
+		 */
+		venc_pool: venc-pool@3c000000 {
+			compatible = "shared-dma-pool";
+			reg = <0x0 0x3c000000 0x0 0x04000000>;
+			no-map;
+		};
+	};
+
+	/* Shared CV200 policy: IP1002 HPM targets, with the BSP OPP7 extension. */
+	hi3798cv200_cpu_opp_table: opp-table-cpu {
+		compatible = "operating-points-v2";
+		opp-shared;
+
+		opp-400000000 {
+			opp-hz = /bits/ 64 <400000000>;
+			opp-microvolt = <1000000 840000 1000000>;
+			clock-latency-ns = <110000000>;
+		};
+		opp-600000000 {
+			opp-hz = /bits/ 64 <600000000>;
+			opp-microvolt = <1000000 840000 1000000>;
+			clock-latency-ns = <110000000>;
+		};
+		opp-800000000 {
+			opp-hz = /bits/ 64 <800000000>;
+			/* Shared policy retains the BSP floor, not a board-specific undervolt. */
+			opp-microvolt = <1000000 840000 1000000>;
+			clock-latency-ns = <110000000>;
+		};
+		opp-1200000000 {
+			opp-hz = /bits/ 64 <1200000000>;
+			opp-microvolt = <1050000 900000 1050000>;
+			clock-latency-ns = <110000000>;
+		};
+		opp-1600000000 {
+			opp-hz = /bits/ 64 <1600000000>;
+			opp-microvolt = <1150000 1020000 1150000>;
+			clock-latency-ns = <110000000>;
+		};
+	};
+
+	/*
+	 * The CV200 BSP exposes the Mali-T720 at six discrete clock points.
+	 * The default voltage is the conservative SS bin; the driver selects
+	 * FF, TT, or SS properties from SYSCTRL SVB bits before registering OPPs.
+	 * OPP transitions raise voltage before frequency and lower it afterward.
+	 */
+	hi3798cv200_gpu_opp_table: opp-table-gpu {
+		compatible = "operating-points-v2";
+
+		opp-200000000 {
+			opp-hz = /bits/ 64 <200000000>;
+			opp-microvolt = <900000>;
+			opp-microvolt-ff = <850000>;
+			opp-microvolt-tt = <880000>;
+			opp-microvolt-ss = <900000>;
+		};
+
+		opp-300000000 {
+			opp-hz = /bits/ 64 <300000000>;
+			opp-microvolt = <900000>;
+			opp-microvolt-ff = <850000>;
+			opp-microvolt-tt = <880000>;
+			opp-microvolt-ss = <900000>;
+		};
+
+		opp-400000000 {
+			opp-hz = /bits/ 64 <400000000>;
+			opp-microvolt = <900000>;
+			opp-microvolt-ff = <850000>;
+			opp-microvolt-tt = <880000>;
+			opp-microvolt-ss = <900000>;
+		};
+
+		opp-500000000 {
+			opp-hz = /bits/ 64 <500000000>;
+			opp-microvolt = <900000>;
+			opp-microvolt-ff = <850000>;
+			opp-microvolt-tt = <880000>;
+			opp-microvolt-ss = <900000>;
+		};
+
+		opp-600000000 {
+			opp-hz = /bits/ 64 <600000000>;
+			opp-microvolt = <930000>;
+			opp-microvolt-ff = <880000>;
+			opp-microvolt-tt = <920000>;
+			opp-microvolt-ss = <930000>;
+		};
+
+		opp-675000000 {
+			opp-hz = /bits/ 64 <675000000>;
+			opp-microvolt = <1000000>;
+			opp-microvolt-ff = <920000>;
+			opp-microvolt-tt = <980000>;
+			opp-microvolt-ss = <1000000>;
+		};
+	};
+
+	dvbip_sound: sound {
+		compatible = "simple-audio-card";
+		simple-audio-card,name = "DVBIP-CV200";
+		simple-audio-card,format = "i2s";
+		simple-audio-card,bitclock-master = <&sound_cpu>;
+		simple-audio-card,frame-master = <&sound_cpu>;
+		simple-audio-card,widgets = "Line", "Line Out";
+		simple-audio-card,routing =
+			"Line Out", "LOUT",
+			"Line Out", "ROUT";
+
+		sound_cpu: simple-audio-card,cpu {
+			sound-dai = <&aiao>;
+		};
+
+		simple-audio-card,codec {
+			sound-dai = <&tianlai>;
+		};
+	};
+
+	thermal-zones {
+		soc-thermal {
+			polling-delay = <1000>;
+			polling-delay-passive = <100>;
+			sustainable-power = <2500>;
+			thermal-sensors = <&tsensor 0>;
+
+			trips {
+				soc_passive: soc-passive {
+					temperature = <95000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+
+				gpu_target: gpu-target {
+					temperature = <105000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+
+				soc_critical: soc-critical {
+					temperature = <120000>;
+					hysteresis = <5000>;
+					type = "critical";
+				};
+
+				cv200_cpu_passive: cpu-passive {
+					temperature = <80000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+			};
+
+			dvbip_cooling_maps: cooling-maps {
+				map-cpu {
+					trip = <&cv200_cpu_passive>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT
+							       THERMAL_NO_LIMIT>;
+				};
+				map-gpu {
+					trip = <&gpu_target>;
+					cooling-device = <&gpu THERMAL_NO_LIMIT
+							       THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+	};
+};
+
+&{/cpus/cpu@0} {
+	/delete-property/ enable-method;
+	#cooling-cells = <2>;
+	cpu-supply = <&vdd_cpu>;
+	operating-points-v2 = <&hi3798cv200_cpu_opp_table>;
+};
+
+&{/cpus/cpu@1} {
+	enable-method = "spin-table";
+	cpu-release-addr = <0x0 0x1100f000>;
+	cpu-supply = <&vdd_cpu>;
+	operating-points-v2 = <&hi3798cv200_cpu_opp_table>;
+};
+
+&{/cpus/cpu@2} {
+	enable-method = "spin-table";
+	cpu-release-addr = <0x0 0x1100f000>;
+	cpu-supply = <&vdd_cpu>;
+	operating-points-v2 = <&hi3798cv200_cpu_opp_table>;
+};
+
+&{/cpus/cpu@3} {
+	enable-method = "spin-table";
+	cpu-release-addr = <0x0 0x1100f000>;
+	cpu-supply = <&vdd_cpu>;
+	operating-points-v2 = <&hi3798cv200_cpu_opp_table>;
+};
+
+&uart0 {
+	status = "okay";
+};
+
+&uart2 {
+	status = "okay";
+};
+
+&sci0 {
+	hisilicon,vcc-active-low;
+	pinctrl-names = "default";
+	pinctrl-0 = <&sci0_pins>;
+	status = "okay";
+};
+
+&pmx0 {
+	sci0_pins: sci0-pins {
+		pinctrl-single,pins = <
+			0x054 MUX_M1 /* SIM0_DET */
+			0x058 MUX_M1 /* SIM0_DATA */
+			0x05c MUX_M1 /* SIM0_RST */
+			0x060 MUX_M1 /* SIM0_CLK */
+			0x064 MUX_M1 /* SIM0_PWREN */
+		>;
+	};
+
+};
+
+&demux {
+	assigned-clocks = <&crg HISTB_TSI_SHARED_CLK>;
+	assigned-clock-parents = <&crg HISTB_TSI2_CLK>;
+	status = "okay";
+
+	dvbip_demux_input0: input@0 {
+		reg = <0>;
+		hisilicon,ts-mode = "serial-nosync";
+		hisilicon,clock-inverted;
+		hisilicon,serial-data-line = <0>;
+	};
+
+	dvbip_demux_input1: input@1 {
+		reg = <1>;
+		hisilicon,ts-mode = "serial-nosync";
+		hisilicon,clock-inverted;
+		hisilicon,serial-data-line = <0>;
+	};
+
+	dvbip_demux_input2: input@2 {
+		reg = <2>;
+		hisilicon,ts-mode = "serial-nosync";
+		hisilicon,clock-inverted;
+		hisilicon,serial-data-line = <0>;
+	};
+
+	dvbip_demux_input3: input@3 {
+		reg = <3>;
+		hisilicon,ts-mode = "serial-nosync";
+		hisilicon,clock-inverted;
+		hisilicon,serial-data-line = <0>;
+	};
+};
+
+&gmac1 {
+	#address-cells = <1>;
+	#size-cells = <0>;
+	phy-handle = <&dvbip_phy3>;
+	status = "okay";
+
+	dvbip_phy3: ethernet-phy@3 {
+		reg = <3>;
+	};
+};
+
+&gpu {
+	operating-points-v2 = <&hi3798cv200_gpu_opp_table>;
+	status = "okay";
+};
+
+&hdmi {
+	status = "okay";
+	/* Poll the R002 TX status to avoid a stuck CV200 HPD interrupt. */
+	hisilicon,hpd-poll;
+};
+
+&hdmi_out {
+	remote-endpoint = <&hdmi_connector_in>;
+};
+
+&rng {
+	status = "okay";
+};
+
+&system_timer {
+	/* ARM64 uses the architected timer; the vendor SPI events lose ticks. */
+	status = "disabled";
+};
+
+&soc {
+	cpu-avs@8a23078 {
+		compatible = "hisilicon,hi3798cv200-avs";
+		reg = <0x8a23078 0x10>, <0x8a23368 0x4>;
+		reg-names = "hpm", "control";
+		hisilicon,hpm-targets = <400000000 0xc9 0>,
+				 <600000000 0xc9 0>,
+				 <800000000 0xe5 1>,
+				 <1200000000 0x110 1>,
+				 <1600000000 0x16a 1>;
+	};
+};
+
+&vdd_cpu {
+	status = "okay";
+};
+
+&vdd_gpu {
+	status = "okay";
+};
+
+&gpio0 { status = "okay"; };
+&gpio1 { status = "okay"; };
+&gpio2 { status = "okay"; };
+&gpio3 { status = "okay"; };
+&gpio4 { status = "okay"; };
+&gpio5 { status = "okay"; };
+&gpio6 { status = "okay"; };
+&gpio7 { status = "okay"; };
+&gpio8 { status = "okay"; };
+&gpio9 { status = "okay"; };
+&gpio10 { status = "okay"; };
+&gpio11 { status = "okay"; };
+&gpio12 { status = "okay"; };
+
+&aiao {
+	status = "okay";
+};
+
+&tianlai {
+	status = "okay";
+};
+
+&tsensor {
+	status = "okay";
+};
+
+&jpge {
+	status = "okay";
+};
+
+&jpgd {
+	status = "okay";
+};
+
+&vdec {
+	memory-region = <&vdec_pool>, <&capture_cma>;
+	memory-region-names = "reconstruction", "capture";
+	status = "okay";
+};
+
+&vpss {
+	status = "okay";
+};
+
+&venc {
+	memory-region = <&venc_pool>;
+	status = "okay";
+};
+
+&vdp {
+	clocks = <&crg HISTB_VO_BUS_CLK>,
+		 <&crg HISTB_VO_HD_CLK>,
+		 <&crg HISTB_VDP_CFG_CLK>,
+		 <&crg HISTB_VDP_HD_CLK>,
+		 <&crg HISTB_VDP_V0_CLK>,
+		 <&crg HISTB_VDP_G0_CLK>,
+		 <&crg HISTB_VO_BP_CLK>;
+	clock-names = "bus", "hd", "config", "core", "video",
+		      "graphics", "bp";
+	status = "okay";
+};
+
+&ehci { status = "okay"; };
+&ohci { status = "okay"; };
+&xhci0 { status = "okay"; };
+&xhci1 { status = "okay"; };
