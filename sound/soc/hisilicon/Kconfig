@@ -4,3 +4,12 @@ config SND_I2S_HI6210_I2S
 	select SND_SOC_GENERIC_DMAENGINE_PCM
 	help
 	  Hisilicon I2S
+
+config SND_SOC_HI3798CV200_AIAO
+	tristate "HiSilicon Hi3798CV200 AIAO controller"
+	depends on ARCH_HISI || COMPILE_TEST
+	help
+	  Say Y or M to enable the standard ASoC playback interface for the
+	  Hi3798CV200 AIAO controller. The driver uses the controller's native
+	  circular DMA buffer and exposes no vendor private userspace ABI. It
+	  connects to codecs through the standard ASoC DAI and PCM interfaces.
