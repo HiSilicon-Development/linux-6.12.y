@@ -145,9 +145,14 @@ int lima_devfreq_init(struct lima_device *ldev)
 	opp = devfreq_recommended_opp(dev, &cur_freq, 0);
 	if (IS_ERR(opp))
 		return PTR_ERR(opp);
+	dev_pm_opp_put(opp);
+
+	/* Seed the current OPP before governor polling can begin. */
+	ret = dev_pm_opp_set_rate(dev, cur_freq);
+	if (ret)
+		return dev_err_probe(dev, ret, "failed to set initial GPU OPP\n");
 
 	lima_devfreq_profile.initial_freq = cur_freq;
-	dev_pm_opp_put(opp);
 
 	/*
 	 * Setup default thresholds for the simple_ondemand governor.

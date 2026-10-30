@@ -122,15 +122,15 @@ int lima_sched_task_init(struct lima_sched_task *task,
 	if (!task->bos)
 		return -ENOMEM;
 
-	for (i = 0; i < num_bos; i++)
-		drm_gem_object_get(&bos[i]->base.base);
-
 	err = drm_sched_job_init(&task->base, &context->base, 1, vm,
 				 drm_client_id);
 	if (err) {
 		kfree(task->bos);
 		return err;
 	}
+
+	for (i = 0; i < num_bos; i++)
+		drm_gem_object_get(&bos[i]->base.base);
 
 	drm_sched_job_arm(&task->base);
 
@@ -223,6 +223,8 @@ static struct dma_fence *lima_sched_run_job(struct drm_sched_job *job)
 		return NULL;
 	}
 
+	/* A reset can resubmit this task with a new hardware fence. */
+	dma_fence_put(task->fence);
 	task->fence = &fence->base;
 
 	/* for caller usage of the fence, otherwise irq handler
@@ -552,6 +554,7 @@ void lima_sched_pipe_task_done(struct lima_sched_pipe *pipe)
 			drm_sched_fault(&pipe->base);
 	} else {
 		pipe->task_fini(pipe);
+		pipe->current_task = NULL;
 		dma_fence_signal(task->fence);
 
 		lima_pm_idle(ldev);

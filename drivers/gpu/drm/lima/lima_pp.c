@@ -59,46 +59,65 @@ static irqreturn_t lima_pp_irq_handler(int irq, void *data)
 
 static irqreturn_t lima_pp_bcast_irq_handler(int irq, void *data)
 {
-	int i;
-	irqreturn_t ret = IRQ_NONE;
 	struct lima_ip *pp_bcast = data;
 	struct lima_device *dev = pp_bcast->dev;
 	struct lima_sched_pipe *pipe = dev->pipe + lima_pipe_pp;
-	struct drm_lima_m450_pp_frame *frame;
+	u32 status[LIMA_SCHED_PIPE_MAX_PROCESSOR];
+	u32 state[LIMA_SCHED_PIPE_MAX_PROCESSOR];
+	bool active = false, error = false;
+	irqreturn_t ret = IRQ_NONE;
+	int i;
 
-	/* for shared irq case */
-	if (!pipe->current_task)
+	if (!atomic_read(&pipe->task))
 		return IRQ_NONE;
 
-	frame = pipe->current_task->frame;
-
-	for (i = 0; i < frame->num_pp; i++) {
+	/* A shared GP/MMU IRQ does not imply that an idle PP has finished. */
+	for (i = 0; i < pipe->num_processor; i++) {
 		struct lima_ip *ip = pipe->processor[i];
-		u32 status, state;
 
-		if (pipe->done & (1 << i))
+		if (pipe->done & BIT(i))
 			continue;
 
-		/* status read first in case int state change in the middle
-		 * which may miss the interrupt handling
-		 */
-		status = pp_read(LIMA_PP_STATUS);
-		state = pp_read(LIMA_PP_INT_STATUS);
-
-		if (state) {
-			lima_pp_handle_irq(ip, state);
+		/* Read status first so a finishing PP cannot lose its interrupt. */
+		status[i] = pp_read(LIMA_PP_STATUS);
+		state[i] = pp_read(LIMA_PP_INT_STATUS);
+		active |= status[i] & LIMA_PP_STATUS_RENDERING_ACTIVE;
+		error |= state[i] & LIMA_PP_IRQ_MASK_ERROR;
+		if (state[i])
 			ret = IRQ_HANDLED;
-		} else {
-			if (status & LIMA_PP_STATUS_RENDERING_ACTIVE)
-				continue;
-		}
-
-		pipe->done |= (1 << i);
-		if (atomic_dec_and_test(&pipe->task))
-			lima_sched_pipe_task_done(pipe);
 	}
 
-	return ret;
+	if (ret == IRQ_NONE)
+		return IRQ_NONE;
+
+	/*
+	 * A shared GP/MMU IRQ can arrive between PP completions. Clearing an
+	 * early EOF would prevent the remaining PP from raising the aggregate
+	 * interrupt, so leave completion latched until all participating PPs idle.
+	 */
+	if (active && !error)
+		return IRQ_HANDLED;
+
+	for (i = 0; i < pipe->num_processor; i++) {
+		struct lima_ip *ip = pipe->processor[i];
+
+		if (pipe->done & BIT(i))
+			continue;
+
+		if (state[i])
+			lima_pp_handle_irq(ip, state[i]);
+		else if (status[i] & LIMA_PP_STATUS_RENDERING_ACTIVE)
+			continue;
+
+		pipe->done |= BIT(i);
+		if (atomic_dec_and_test(&pipe->task)) {
+			/* Completion can free the task and start the next job. */
+			lima_sched_pipe_task_done(pipe);
+			return IRQ_HANDLED;
+		}
+	}
+
+	return IRQ_HANDLED;
 }
 
 static void lima_pp_soft_reset_async(struct lima_ip *ip)
@@ -271,12 +290,15 @@ int lima_pp_init(struct lima_ip *ip)
 	if (err)
 		return err;
 
-	err = devm_request_irq(dev->dev, ip->irq, lima_pp_irq_handler,
-			       IRQF_SHARED, lima_ip_name(ip), ip);
-	if (err) {
-		dev_err(dev->dev, "%s fail to request irq\n",
-			lima_ip_name(ip));
-		return err;
+	/* Mali450 completion belongs to the aggregate PP IRQ, not both paths. */
+	if (dev->id == lima_gpu_mali400) {
+		err = devm_request_irq(dev->dev, ip->irq, lima_pp_irq_handler,
+				       IRQF_SHARED, lima_ip_name(ip), ip);
+		if (err) {
+			dev_err(dev->dev, "%s fail to request irq\n",
+				lima_ip_name(ip));
+			return err;
+		}
 	}
 
 	dev->pp_version = pp_read(LIMA_PP_VERSION);
@@ -288,7 +310,8 @@ void lima_pp_fini(struct lima_ip *ip)
 {
 	struct lima_device *dev = ip->dev;
 
-	devm_free_irq(dev->dev, ip->irq, ip);
+	if (dev->id == lima_gpu_mali400)
+		devm_free_irq(dev->dev, ip->irq, ip);
 }
 
 int lima_pp_bcast_resume(struct lima_ip *ip)
@@ -359,7 +382,7 @@ static void lima_pp_task_run(struct lima_sched_pipe *pipe,
 		struct lima_ip *ip = pipe->bcast_processor;
 		int i;
 
-		pipe->done = 0;
+		pipe->done = ~GENMASK(frame->num_pp - 1, 0);
 		atomic_set(&pipe->task, frame->num_pp);
 
 		if (frame->use_dlbu) {
