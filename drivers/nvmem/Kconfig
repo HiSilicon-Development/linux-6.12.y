@@ -28,6 +28,15 @@ source "drivers/nvmem/layouts/Kconfig"
 
 # Devices
 
+config NVMEM_HI3798MV310_OTP
+	tristate "Hi3798MV310 read-only thermal and CPU calibration OTP"
+	depends on ARCH_HISI_HISTB || COMPILE_TEST
+	depends on OF && HAS_IOMEM
+	help
+	  Read the temperature calibration word and whitelisted CPU voltage
+	  calibration bytes from the OTPv200 controller. Other OTP contents,
+	  including device identifiers and key material, are not exposed.
+
 config NVMEM_APPLE_EFUSES
 	tristate "Apple eFuse support"
 	depends on ARCH_APPLE || COMPILE_TEST
