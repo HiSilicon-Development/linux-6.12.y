@@ -43,6 +43,7 @@ obj-$(CONFIG_RC_MAP) += \
 			rc-dvbsky.o \
 			rc-dvico-mce.o \
 			rc-dvico-portable.o \
+			rc-ec6110t.o \
 			rc-em-terratec.o \
 			rc-encore-enltv2.o \
 			rc-encore-enltv-fm53.o \
@@ -54,6 +55,7 @@ obj-$(CONFIG_RC_MAP) += \
 			rc-fusionhdtv-mce.o \
 			rc-gadmei-rm008z.o \
 			rc-geekbox.o \
+			rc-gehua.o \
 			rc-genius-tvgo-a11mce.o \
 			rc-gotview7135.o \
 			rc-hauppauge.o \
