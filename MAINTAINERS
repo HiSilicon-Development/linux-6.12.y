@@ -3699,6 +3699,11 @@ L:	linux-media@vger.kernel.org
 S:	Orphan
 F:	drivers/media/dvb-frontends/avl6381*
 
+AVAILINK AVL6381 USB RECEIVER DRIVER
+L:	linux-media@vger.kernel.org
+S:	Orphan
+F:	drivers/media/usb/dvb-usb-v2/avl6381-usb.c
+
 AVIA HX711 ANALOG DIGITAL CONVERTER IIO DRIVER
 M:	Andreas Klinger <ak@it-klinger.de>
 L:	linux-iio@vger.kernel.org
