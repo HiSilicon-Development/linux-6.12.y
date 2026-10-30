@@ -12,6 +12,7 @@
 #include <linux/iopoll.h>
 #include <linux/io-pgtable.h>
 #include <linux/iommu.h>
+#include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/shmem_fs.h>
@@ -613,6 +614,27 @@ static void panfrost_drm_mm_color_adjust(const struct drm_mm_node *node,
 	}
 }
 
+static void panfrost_cv200_exec_bank_adjust(const struct drm_mm_node *node,
+					 unsigned long color,
+					 u64 *start, u64 *end)
+{
+	/*
+	 * CV200 T720 fragment/blend writeout faults when executable BOs are
+	 * split across 16 MiB PC segments. Keep all code in one segment per
+	 * context; textures/descriptors must not consume its VA. Leave one
+	 * page at either edge to avoid executable boundary hazards.
+	 */
+	const u64 exec_start = (SZ_4G - SZ_16M) >> PAGE_SHIFT;
+	const u64 exec_end = (SZ_4G - PAGE_SIZE) >> PAGE_SHIFT;
+
+	if (color & PANFROST_BO_NOEXEC) {
+		*end = min(*end, exec_start);
+	} else {
+		*start = max(*start, exec_start + 1);
+		*end = min(*end, exec_end);
+	}
+}
+
 struct panfrost_mmu *panfrost_mmu_ctx_create(struct panfrost_device *pfdev)
 {
 	struct panfrost_mmu *mmu;
@@ -626,7 +648,11 @@ struct panfrost_mmu *panfrost_mmu_ctx_create(struct panfrost_device *pfdev)
 
 	/* 4G enough for now. can be 48-bit */
 	drm_mm_init(&mmu->mm, SZ_32M >> PAGE_SHIFT, (SZ_4G - SZ_32M) >> PAGE_SHIFT);
-	mmu->mm.color_adjust = panfrost_drm_mm_color_adjust;
+	mmu->single_exec_segment =
+		of_device_is_compatible(pfdev->dev->of_node,
+				    "hisilicon,hi3798cv200-mali");
+	mmu->mm.color_adjust = mmu->single_exec_segment ?
+		panfrost_cv200_exec_bank_adjust : panfrost_drm_mm_color_adjust;
 
 	INIT_LIST_HEAD(&mmu->list);
 	mmu->as = -1;

@@ -132,12 +132,12 @@ int panfrost_gem_open(struct drm_gem_object *obj, struct drm_file *file_priv)
 
 	/*
 	 * Executable buffers cannot cross a 16MB boundary as the program
-	 * counter is 24-bits. We assume executable buffers will be less than
-	 * 16MB and aligning executable buffers to their size will avoid
-	 * crossing a 16MB boundary.
+	 * counter is 24-bits. CV200 reserves a single execution segment for
+	 * all code, so page alignment is sufficient there; size alignment
+	 * would needlessly fragment that bounded VA region.
 	 */
 	if (!bo->noexec)
-		align = size >> PAGE_SHIFT;
+		align = priv->mmu->single_exec_segment ? 1 : size >> PAGE_SHIFT;
 	else
 		align = size >= SZ_2M ? SZ_2M >> PAGE_SHIFT : 0;
 

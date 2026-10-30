@@ -4,12 +4,14 @@
 /* Copyright 2019 Collabora ltd. */
 #include <linux/bitfield.h>
 #include <linux/bitmap.h>
+#include <linux/clk.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/platform_device.h>
+#include <linux/pm_opp.h>
 #include <linux/pm_runtime.h>
 
 #include "panfrost_device.h"
@@ -57,7 +59,7 @@ static irqreturn_t panfrost_gpu_irq_handler(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
-int panfrost_gpu_soft_reset(struct panfrost_device *pfdev)
+static int panfrost_gpu_reset(struct panfrost_device *pfdev)
 {
 	int ret;
 	u32 val;
@@ -99,6 +101,113 @@ int panfrost_gpu_soft_reset(struct panfrost_device *pfdev)
 		atomic_set(&pfdev->cycle_counter.use_count, 0);
 
 	return 0;
+}
+
+static int panfrost_gpu_reset_set_rate(struct panfrost_device *pfdev,
+				     unsigned long rate)
+{
+	unsigned long actual_rate;
+	int ret;
+
+	/* Clock-only: keep the voltage required by the saved, higher OPP. */
+	ret = clk_set_rate(pfdev->clock, rate);
+	actual_rate = clk_get_rate(pfdev->clock);
+	pfdev->pfdevfreq.current_frequency = actual_rate;
+	if (!ret && actual_rate != rate)
+		ret = -EIO;
+	if (ret)
+		dev_err(pfdev->dev,
+			"GPU reset clock transition to %lu Hz failed (%d), actual %lu Hz\n",
+			rate, ret, actual_rate);
+
+	return ret;
+}
+
+static void panfrost_gpu_reset_sync_opp(struct panfrost_device *pfdev)
+{
+	unsigned long rate = pfdev->pfdevfreq.current_frequency;
+	struct dev_pm_opp *opp;
+	long rounded_rate;
+	int ret;
+
+	/* Reconcile OPP's cached rate only after the restore attempt failed. */
+	if (!rate) {
+		ret = -EIO;
+		goto out;
+	}
+
+	opp = dev_pm_opp_find_freq_exact(pfdev->dev, rate, true);
+	if (IS_ERR(opp)) {
+		ret = PTR_ERR(opp);
+		goto out;
+	}
+	dev_pm_opp_put(opp);
+
+	/* A faulted clock must not silently round an otherwise exact OPP. */
+	rounded_rate = clk_round_rate(pfdev->clock, rate);
+	if (rounded_rate != rate) {
+		ret = rounded_rate < 0 ? rounded_rate : -EIO;
+		goto out;
+	}
+
+	ret = dev_pm_opp_set_rate(pfdev->dev, rate);
+
+out:
+	pfdev->pfdevfreq.current_frequency = clk_get_rate(pfdev->clock);
+	if (!ret && pfdev->pfdevfreq.current_frequency != rate)
+		ret = -EIO;
+	if (ret)
+		dev_err(pfdev->dev,
+			"GPU reset failed to reconcile OPP at %lu Hz (%d), actual %lu Hz\n",
+			rate, ret, pfdev->pfdevfreq.current_frequency);
+}
+
+int panfrost_gpu_soft_reset(struct panfrost_device *pfdev)
+{
+	struct devfreq *devfreq = pfdev->pfdevfreq.devfreq;
+	unsigned long saved_rate;
+	int ret, restore_ret;
+
+	if (!(pfdev->comp->pm_features & BIT(GPU_PM_RESET_LOW_FREQ)))
+		return panfrost_gpu_reset(pfdev);
+
+	/*
+	 * Serialize against the target callback, including its voltage changes.
+	 * Probe may not have devfreq yet; runtime resume resets before resuming
+	 * devfreq, and timeout recovery has already stopped the schedulers.
+	 * Do not suspend/resume devfreq while holding its target lock.
+	 */
+	if (devfreq)
+		mutex_lock(&devfreq->lock);
+
+	saved_rate = clk_get_rate(pfdev->clock);
+	if (saved_rate <= 400000000) {
+		ret = panfrost_gpu_reset(pfdev);
+		goto out_unlock;
+	}
+
+	ret = panfrost_gpu_reset_set_rate(pfdev, 200000000);
+	if (!ret)
+		ret = panfrost_gpu_reset(pfdev);
+
+	/* A failed clock transition can still have changed the hardware rate. */
+	restore_ret = panfrost_gpu_reset_set_rate(pfdev, saved_rate);
+	if (restore_ret) {
+		if (devfreq) {
+			panfrost_gpu_reset_sync_opp(pfdev);
+			devfreq->previous_freq = pfdev->pfdevfreq.current_frequency;
+			devfreq->last_status.current_frequency =
+				pfdev->pfdevfreq.current_frequency;
+		}
+		if (!ret)
+			ret = restore_ret;
+	}
+
+out_unlock:
+	if (devfreq)
+		mutex_unlock(&devfreq->lock);
+
+	return ret;
 }
 
 void panfrost_gpu_amlogic_quirk(struct panfrost_device *pfdev)
@@ -449,6 +558,9 @@ void panfrost_gpu_power_off(struct panfrost_device *pfdev)
 					 val, !val, 1, 2000);
 	if (ret)
 		dev_err(pfdev->dev, "tiler power transition timeout");
+
+	if (pfdev->comp->pm_features & BIT(GPU_PM_KEEP_L2_ON))
+		return;
 
 	gpu_write(pfdev, L2_PWROFF_LO, pfdev->features.l2_present);
 	ret = readl_poll_timeout(pfdev->iomem + L2_PWRTRANS_LO,

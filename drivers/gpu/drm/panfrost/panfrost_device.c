@@ -215,6 +215,12 @@ int panfrost_device_init(struct panfrost_device *pfdev)
 		return err;
 	}
 
+	if (pfdev->comp->vendor_init) {
+		err = pfdev->comp->vendor_init(pfdev);
+		if (err)
+			goto out_clk;
+	}
+
 	err = panfrost_devfreq_init(pfdev);
 	if (err) {
 		if (err != -EPROBE_DEFER)
@@ -394,20 +400,30 @@ bool panfrost_exception_needs_reset(const struct panfrost_device *pfdev,
 	return false;
 }
 
-void panfrost_device_reset(struct panfrost_device *pfdev)
+int panfrost_device_reset(struct panfrost_device *pfdev)
 {
-	panfrost_gpu_soft_reset(pfdev);
+	int ret;
+
+	ret = panfrost_gpu_soft_reset(pfdev);
+	if (ret)
+		return ret;
 
 	panfrost_gpu_power_on(pfdev);
 	panfrost_mmu_reset(pfdev);
 	panfrost_job_enable_interrupts(pfdev);
+
+	return 0;
 }
 
 static int panfrost_device_runtime_resume(struct device *dev)
 {
 	struct panfrost_device *pfdev = dev_get_drvdata(dev);
+	int ret;
 
-	panfrost_device_reset(pfdev);
+	ret = panfrost_device_reset(pfdev);
+	if (ret)
+		return ret;
+
 	panfrost_devfreq_resume(pfdev);
 
 	return 0;

@@ -194,7 +194,7 @@ panfrost_enqueue_job(struct panfrost_device *pfdev, int slot,
 	return 1;
 }
 
-static void panfrost_job_hw_submit(struct panfrost_job *job, int js)
+static int panfrost_job_hw_submit(struct panfrost_job *job, int js)
 {
 	struct panfrost_device *pfdev = job->pfdev;
 	unsigned int subslot;
@@ -202,14 +202,23 @@ static void panfrost_job_hw_submit(struct panfrost_job *job, int js)
 	u64 jc_head = job->jc;
 	int ret;
 
+	ret = atomic_read(&pfdev->reset.error);
+	if (ret)
+		return ret;
+
 	panfrost_devfreq_record_busy(&pfdev->pfdevfreq);
 
 	ret = pm_runtime_get_sync(pfdev->dev);
-	if (ret < 0)
-		return;
+	if (ret < 0) {
+		pm_runtime_put_noidle(pfdev->dev);
+		panfrost_devfreq_record_idle(&pfdev->pfdevfreq);
+		return ret;
+	}
 
 	if (WARN_ON(job_read(pfdev, JS_COMMAND_NEXT(js)))) {
-		return;
+		pm_runtime_put_noidle(pfdev->dev);
+		panfrost_devfreq_record_idle(&pfdev->pfdevfreq);
+		return -EBUSY;
 	}
 
 	cfg = panfrost_mmu_as_get(pfdev, job->mmu);
@@ -242,7 +251,8 @@ static void panfrost_job_hw_submit(struct panfrost_job *job, int js)
 	spin_lock(&pfdev->js->job_lock);
 	subslot = panfrost_enqueue_job(pfdev, js, job);
 	/* Don't queue the job if a reset is in progress */
-	if (!atomic_read(&pfdev->reset.pending)) {
+	if (!atomic_read(&pfdev->reset.pending) &&
+	    !atomic_read(&pfdev->reset.error)) {
 		if (pfdev->profile_mode) {
 			panfrost_cycle_counter_get(pfdev);
 			job->is_profiled = true;
@@ -256,6 +266,8 @@ static void panfrost_job_hw_submit(struct panfrost_job *job, int js)
 			job, js, subslot, jc_head, cfg & 0xf);
 	}
 	spin_unlock(&pfdev->js->job_lock);
+
+	return 0;
 }
 
 static int panfrost_acquire_object_fences(struct drm_gem_object **bos,
@@ -376,7 +388,8 @@ static struct dma_fence *panfrost_job_run(struct drm_sched_job *sched_job)
 	struct panfrost_job *job = to_panfrost_job(sched_job);
 	struct panfrost_device *pfdev = job->pfdev;
 	int slot = panfrost_job_get_slot(job);
-	struct dma_fence *fence = NULL;
+	struct dma_fence *fence, *old_fence;
+	int ret;
 
 	if (unlikely(job->base.s_fence->finished.error))
 		return NULL;
@@ -391,12 +404,23 @@ static struct dma_fence *panfrost_job_run(struct drm_sched_job *sched_job)
 	if (IS_ERR(fence))
 		return fence;
 
-	if (job->done_fence)
-		dma_fence_put(job->done_fence);
+	/*
+	 * Publish the IRQ-visible fence before starting the job. The threaded
+	 * IRQ handler can run as soon as panfrost_job_hw_submit() starts it.
+	 */
+	old_fence = job->done_fence;
 	job->done_fence = dma_fence_get(fence);
 
-	panfrost_job_hw_submit(job, slot);
+	ret = panfrost_job_hw_submit(job, slot);
+	if (ret) {
+		/* No hardware job was started; restore the previous fence. */
+		dma_fence_put(job->done_fence);
+		job->done_fence = old_fence;
+		dma_fence_put(fence);
+		return ERR_PTR(ret);
+	}
 
+	dma_fence_put(old_fence);
 	return fence;
 }
 
@@ -703,36 +727,36 @@ panfrost_reset(struct panfrost_device *pfdev,
 	spin_unlock(&pfdev->js->job_lock);
 
 	/* Proceed with reset now. */
-	panfrost_device_reset(pfdev);
+	ret = panfrost_device_reset(pfdev);
+	if (ret)
+		dev_err(pfdev->dev, "GPU reset failed: %d\n", ret);
 
-	/* panfrost_device_reset() unmasks job interrupts, but we want to
-	 * keep them masked a bit longer.
-	 */
-	job_write(pfdev, JOB_INT_MASK, 0);
-
-	/* GPU has been reset, we can clear the reset pending bit. */
+	/* Keep submissions from touching hardware until a reset succeeds. */
+	atomic_set(&pfdev->reset.error, ret);
 	atomic_set(&pfdev->reset.pending, 0);
 
-	/* Now resubmit jobs that were previously queued but didn't have a
-	 * chance to finish.
-	 * FIXME: We temporarily get out of the DMA fence signalling section
-	 * while resubmitting jobs because the job submission logic will
-	 * allocate memory with the GFP_KERNEL flag which can trigger memory
-	 * reclaim and exposes a lock ordering issue.
+	/* Resubmit jobs that were previously queued. Failed resets make
+	 * panfrost_job_run() return the reset error without touching hardware.
+	 * Successful resets follow the normal resubmission path.
+	 *
+	 * We temporarily get out of the DMA fence signalling section because the
+	 * job submission logic can allocate with GFP_KERNEL.
 	 */
 	dma_fence_end_signalling(cookie);
 	for (i = 0; i < NUM_JOB_SLOTS; i++)
 		drm_sched_resubmit_jobs(&pfdev->js->queue[i].sched);
 	cookie = dma_fence_begin_signalling();
 
-	/* Restart the schedulers */
+	/* Restart the schedulers. */
 	for (i = 0; i < NUM_JOB_SLOTS; i++)
 		drm_sched_start(&pfdev->js->queue[i].sched);
 
-	/* Re-enable job interrupts now that everything has been restarted. */
-	job_write(pfdev, JOB_INT_MASK,
-		  GENMASK(16 + NUM_JOB_SLOTS - 1, 16) |
-		  GENMASK(NUM_JOB_SLOTS - 1, 0));
+	if (!ret) {
+		/* Re-enable job interrupts after successful recovery. */
+		job_write(pfdev, JOB_INT_MASK,
+			  GENMASK(16 + NUM_JOB_SLOTS - 1, 16) |
+			  GENMASK(NUM_JOB_SLOTS - 1, 0));
+	}
 
 	dma_fence_end_signalling(cookie);
 }
@@ -853,6 +877,7 @@ int panfrost_job_init(struct panfrost_device *pfdev)
 		return -ENOMEM;
 
 	INIT_WORK(&pfdev->reset.work, panfrost_reset_work);
+	atomic_set(&pfdev->reset.error, 0);
 	spin_lock_init(&js->job_lock);
 
 	js->irq = platform_get_irq_byname(to_platform_device(pfdev->dev), "job");

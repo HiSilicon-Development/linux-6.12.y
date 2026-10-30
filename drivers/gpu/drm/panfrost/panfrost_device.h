@@ -36,10 +36,14 @@ enum panfrost_drv_comp_bits {
  * enum panfrost_gpu_pm - Supported kernel power management features
  * @GPU_PM_CLK_DIS:  Allow disabling clocks during system suspend
  * @GPU_PM_VREG_OFF: Allow turning off regulators during system suspend
+ * @GPU_PM_KEEP_L2_ON: Keep the platform L2 cache powered during runtime idle
+ * @GPU_PM_RESET_LOW_FREQ: Reset above 400 MHz at 200 MHz, preserving voltage
  */
 enum panfrost_gpu_pm {
 	GPU_PM_CLK_DIS,
 	GPU_PM_VREG_OFF,
+	GPU_PM_KEEP_L2_ON,
+	GPU_PM_RESET_LOW_FREQ,
 };
 
 struct panfrost_features {
@@ -92,6 +96,8 @@ struct panfrost_compatible {
 
 	/* Vendor implementation quirks callback */
 	void (*vendor_quirk)(struct panfrost_device *pfdev);
+	/* Platform setup before the OPP table and GPU registers are initialized. */
+	int (*vendor_init)(struct panfrost_device *pfdev);
 
 	/* Allowed PM features */
 	u8 pm_features;
@@ -138,6 +144,7 @@ struct panfrost_device {
 		struct workqueue_struct *wq;
 		struct work_struct work;
 		atomic_t pending;
+		atomic_t error;
 	} reset;
 
 	struct mutex shrinker_lock;
@@ -159,6 +166,7 @@ struct panfrost_mmu {
 	struct io_pgtable_ops *pgtbl_ops;
 	struct drm_mm mm;
 	spinlock_t mm_lock;
+	bool single_exec_segment;
 	int as;
 	atomic_t as_count;
 	struct list_head list;
@@ -207,7 +215,8 @@ int panfrost_unstable_ioctl_check(void);
 
 int panfrost_device_init(struct panfrost_device *pfdev);
 void panfrost_device_fini(struct panfrost_device *pfdev);
-void panfrost_device_reset(struct panfrost_device *pfdev);
+int panfrost_device_reset(struct panfrost_device *pfdev);
+int panfrost_hi3798cv200_init(struct panfrost_device *pfdev);
 
 extern const struct dev_pm_ops panfrost_pm_ops;
 

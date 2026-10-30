@@ -7,6 +7,7 @@ panfrost-y := \
 	panfrost_gem.o \
 	panfrost_gem_shrinker.o \
 	panfrost_gpu.o \
+	panfrost_hi3798cv200.o \
 	panfrost_job.o \
 	panfrost_mmu.o \
 	panfrost_perfcnt.o \
