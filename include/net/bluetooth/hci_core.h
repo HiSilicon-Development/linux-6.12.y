@@ -1934,7 +1934,9 @@ void hci_conn_del_sysfs(struct hci_conn *conn);
 /* ----- Extended LMP capabilities ----- */
 #define lmp_cpb_central_capable(dev) ((dev)->features[2][0] & LMP_CPB_CENTRAL)
 #define lmp_cpb_peripheral_capable(dev) ((dev)->features[2][0] & LMP_CPB_PERIPHERAL)
-#define lmp_sync_train_capable(dev) ((dev)->features[2][0] & LMP_SYNC_TRAIN)
+#define lmp_sync_train_capable(dev) \
+	(((dev)->features[2][0] & LMP_SYNC_TRAIN) && \
+	 !test_bit(HCI_QUIRK_BROKEN_SYNC_TRAIN, &(dev)->quirks))
 #define lmp_sync_scan_capable(dev)  ((dev)->features[2][0] & LMP_SYNC_SCAN)
 #define lmp_sc_capable(dev)         ((dev)->features[2][1] & LMP_SC)
 #define lmp_ping_capable(dev)       ((dev)->features[2][1] & LMP_PING)

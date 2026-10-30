@@ -376,6 +376,14 @@ enum {
 	 * This quirk must be set before hci_register_dev is called.
 	 */
 	HCI_QUIRK_BROKEN_READ_PAGE_SCAN_TYPE,
+
+	/* Some firmware advertises Synchronization Train in both its LMP
+	 * features and Supported Commands, but rejects Read Synchronization
+	 * Train Parameters as an unknown command. This quirk marks that
+	 * capability unusable without discarding other page 2 features.
+	 * Set it during the vendor setup callback, before reading features.
+	 */
+	HCI_QUIRK_BROKEN_SYNC_TRAIN,
 };
 
 /* HCI device flags */

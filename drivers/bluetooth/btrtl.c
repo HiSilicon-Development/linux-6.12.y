@@ -266,6 +266,14 @@ static const struct id_table ic_id_table[] = {
 	  .cfg_name = "rtl_bt/rtl8822cu_config",
 	  .hw_info  = "rtl8822cu" },
 
+	/* 8822BS with UART interface */
+	{ IC_INFO(RTL_ROM_LMP_8822B, 0xb, 0x7, HCI_UART),
+	  .config_needed = true,
+	  .has_rom_version = true,
+	  .fw_name  = "rtl_bt/rtl8822bs_fw",
+	  .cfg_name = "rtl_bt/rtl8822bs_config",
+	  .hw_info  = "rtl8822bs" },
+
 	/* 8822B */
 	{ IC_INFO(RTL_ROM_LMP_8822B, 0xb, 0x7, HCI_USB),
 	  .config_needed = true,
@@ -1299,6 +1307,8 @@ EXPORT_SYMBOL_GPL(btrtl_download_firmware);
 
 void btrtl_set_quirks(struct hci_dev *hdev, struct btrtl_device_info *btrtl_dev)
 {
+	struct btrealtek_data *realtek = hci_get_priv(hdev);
+
 	/* Enable controller to do both LE scan and BR/EDR inquiry
 	 * simultaneously.
 	 */
@@ -1340,6 +1350,16 @@ void btrtl_set_quirks(struct hci_dev *hdev, struct btrtl_device_info *btrtl_dev)
 
 	if (!btrtl_dev->ic_info)
 		return;
+
+	/* These RTL8822BS UART patches advertise Synchronization Train in both
+	 * feature page 2 and Supported Commands, but reject opcode 0x0c77.
+	 * Keep all other extended feature bits intact.
+	 */
+	if (btrtl_dev->project_id == CHIP_ID_8822B &&
+	    hdev->bus == HCI_UART && btrtl_dev->rom_version == 2 &&
+	    (realtek->rtl_dump.fw_version == 0xaa7b2e0e ||
+	     realtek->rtl_dump.fw_version == 0xaa990c85))
+		set_bit(HCI_QUIRK_BROKEN_SYNC_TRAIN, &hdev->quirks);
 
 	switch (btrtl_dev->ic_info->lmp_subver) {
 	case RTL_ROM_LMP_8703B:
@@ -1546,6 +1566,8 @@ MODULE_FIRMWARE("rtl_bt/rtl8821cs_fw.bin");
 MODULE_FIRMWARE("rtl_bt/rtl8821cs_config.bin");
 MODULE_FIRMWARE("rtl_bt/rtl8822b_fw.bin");
 MODULE_FIRMWARE("rtl_bt/rtl8822b_config.bin");
+MODULE_FIRMWARE("rtl_bt/rtl8822bs_fw.bin");
+MODULE_FIRMWARE("rtl_bt/rtl8822bs_config.bin");
 MODULE_FIRMWARE("rtl_bt/rtl8822cs_fw.bin");
 MODULE_FIRMWARE("rtl_bt/rtl8822cs_config.bin");
 MODULE_FIRMWARE("rtl_bt/rtl8822cu_fw.bin");
