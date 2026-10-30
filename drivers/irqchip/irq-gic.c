@@ -84,6 +84,7 @@ struct gic_chip_data {
 #endif
 	struct irq_domain *domain;
 	unsigned int gic_irqs;
+	bool secure_view;
 };
 
 #ifdef CONFIG_BL_SWITCHER
@@ -442,6 +443,7 @@ static void gic_cpu_if_up(struct gic_chip_data *gic)
 	void __iomem *cpu_base = gic_data_cpu_base(gic);
 	u32 bypass = 0;
 	u32 mode = 0;
+	u32 enable = GICC_ENABLE;
 	int i;
 
 	if (gic == &gic_data[0] && static_branch_likely(&supports_deactivate_key))
@@ -457,7 +459,10 @@ static void gic_cpu_if_up(struct gic_chip_data *gic)
 	bypass = readl(cpu_base + GIC_CPU_CTRL);
 	bypass &= GICC_DIS_BYPASS_MASK;
 
-	writel_relaxed(bypass | mode | GICC_ENABLE, cpu_base + GIC_CPU_CTRL);
+	/* MV310 can expose the Secure MMIO view to a Non-secure kernel. */
+	if (gic->secure_view)
+		enable |= GIC_CPU_CTRL_EnableGrp1 | GIC_CPU_CTRL_AckCtl;
+	writel_relaxed(bypass | mode | enable, cpu_base + GIC_CPU_CTRL);
 }
 
 
@@ -481,7 +486,8 @@ static void gic_dist_init(struct gic_chip_data *gic)
 
 	gic_dist_config(base, gic_irqs, GICD_INT_DEF_PRI);
 
-	writel_relaxed(GICD_ENABLE, base + GIC_DIST_CTRL);
+	writel_relaxed(GICD_ENABLE | (gic->secure_view ? BIT(1) : 0),
+		       base + GIC_DIST_CTRL);
 }
 
 static int gic_cpu_init(struct gic_chip_data *gic)
@@ -535,6 +541,8 @@ int gic_cpu_if_down(unsigned int gic_nr)
 	cpu_base = gic_data_cpu_base(&gic_data[gic_nr]);
 	val = readl(cpu_base + GIC_CPU_CTRL);
 	val &= ~GICC_ENABLE;
+	if (gic_data[gic_nr].secure_view)
+		val &= ~GIC_CPU_CTRL_EnableGrp1;
 	writel_relaxed(val, cpu_base + GIC_CPU_CTRL);
 
 	return 0;
@@ -629,7 +637,8 @@ void gic_dist_restore(struct gic_chip_data *gic)
 			dist_base + GIC_DIST_ACTIVE_SET + i * 4);
 	}
 
-	writel_relaxed(GICD_ENABLE, dist_base + GIC_DIST_CTRL);
+	writel_relaxed(GICD_ENABLE | (gic->secure_view ? BIT(1) : 0),
+		       dist_base + GIC_DIST_CTRL);
 }
 
 void gic_cpu_save(struct gic_chip_data *gic)
@@ -817,14 +826,20 @@ static int gic_set_affinity(struct irq_data *d, const struct cpumask *mask_val,
 	return IRQ_SET_MASK_OK_DONE;
 }
 
+
 static void gic_ipi_send_mask(struct irq_data *d, const struct cpumask *mask)
 {
 	int cpu;
 	unsigned long flags, map = 0;
+	u32 sgi = d->hwirq;
+
+	/* Secure SGIR writes must select the handoff's Group 1 SGIs. */
+	if (gic_data[0].secure_view)
+		sgi |= BIT(15);
 
 	if (unlikely(nr_cpu_ids == 1)) {
 		/* Only one CPU? let's do a self-IPI... */
-		writel_relaxed(2 << 24 | d->hwirq,
+		writel_relaxed(2 << 24 | sgi,
 			       gic_data_dist_base(&gic_data[0]) + GIC_DIST_SOFTINT);
 		return;
 	}
@@ -842,8 +857,8 @@ static void gic_ipi_send_mask(struct irq_data *d, const struct cpumask *mask)
 	dmb(ishst);
 
 	/* this always happens on GIC0 */
-	writel_relaxed(map << 16 | d->hwirq, gic_data_dist_base(&gic_data[0]) + GIC_DIST_SOFTINT);
-
+	writel_relaxed(map << 16 | sgi,
+		       gic_data_dist_base(&gic_data[0]) + GIC_DIST_SOFTINT);
 	gic_unlock_irqrestore(flags);
 }
 
@@ -921,8 +936,11 @@ void gic_send_sgi(unsigned int cpu_id, unsigned int irq)
 {
 	BUG_ON(cpu_id >= NR_GIC_CPU_IF);
 	cpu_id = 1 << cpu_id;
+	if (gic_data[0].secure_view)
+		irq |= BIT(15);
 	/* this always happens on GIC0 */
-	writel_relaxed((cpu_id << 16) | irq, gic_data_dist_base(&gic_data[0]) + GIC_DIST_SOFTINT);
+	writel_relaxed((cpu_id << 16) | irq,
+		       gic_data_dist_base(&gic_data[0]) + GIC_DIST_SOFTINT);
 }
 
 /*
@@ -1377,7 +1395,34 @@ static bool gic_enable_rmw_access(void *data)
 	return false;
 }
 
+static bool gic_enable_mv310_secure_view(void *data)
+{
+	struct gic_chip_data *gic = data;
+	void __iomem *base = gic->raw_dist_base;
+
+	/*
+	 * IGROUPR is RAZ to Non-secure accesses when SecurityExtn is set.
+	 * The RAM handoff assigns Group 1; readable group bits identify the
+	 * Secure register view observed on MV310. Keep that assignment and
+	 * enable both groups, with AckCtl for the driver's common IAR/EOIR.
+	 * EOImode bit 9 then controls Secure accesses, matching the existing
+	 * split EOI/Deactivate sequence. Normal Non-secure mappings are left
+	 * untouched. This is not permission to reassign firmware-owned IRQs.
+	 */
+	if (!(readl_relaxed(base + GIC_DIST_CTR) & BIT(10)) ||
+	    !readl_relaxed(base + GIC_DIST_IGROUP))
+		return false;
+
+	gic->secure_view = true;
+	return true;
+}
+
 static const struct gic_quirk gic_quirks[] = {
+	{
+		.desc		= "Hi3798MV310 Secure register view",
+		.compatible	= "hisilicon,hi3798mv310-gic",
+		.init		= gic_enable_mv310_secure_view,
+	},
 	{
 		.desc		= "broken byte access",
 		.compatible	= "arm,pl390",
@@ -1467,6 +1512,7 @@ int __init
 gic_of_init(struct device_node *node, struct device_node *parent)
 {
 	struct gic_chip_data *gic;
+	bool combined_eoi;
 	int irq, ret;
 
 	if (WARN_ON(!node))
@@ -1481,12 +1527,17 @@ gic_of_init(struct device_node *node, struct device_node *parent)
 	if (ret)
 		return ret;
 
-	/*
-	 * Disable split EOI/Deactivate if either HYP is not available
-	 * or the CPU interface is too small.
-	 */
-	if (gic_cnt == 0 && !gic_check_eoimode(node, &gic->raw_cpu_base))
+	combined_eoi = of_device_is_compatible(node,
+					       "hisilicon,hi3798cv200-gic");
+	if (gic_cnt == 0 && combined_eoi) {
+		/* The vendor firmware and Linux 4.4 both use GICC EOImode 0. */
 		static_branch_disable(&supports_deactivate_key);
+		pr_info("GIC: Hi3798CV200 using combined EOI mode\n");
+	} else if (gic_cnt == 0 &&
+		   !gic_check_eoimode(node, &gic->raw_cpu_base)) {
+		/* HYP is unavailable or the CPU interface is too small. */
+		static_branch_disable(&supports_deactivate_key);
+	}
 
 	ret = __gic_init_bases(gic, &node->fwnode);
 	if (ret) {

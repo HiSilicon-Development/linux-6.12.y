@@ -17,6 +17,11 @@ description: |+
   Primary GIC is attached directly to the CPU and typically has PPIs and SGIs.
   Secondary GICs are cascaded into the upward interrupt controller and do not
   have PPIs or SGIs.
+  Hi3798MV310 can expose the Secure GIC register view to a Non-secure CPU.
+  Software must distinguish this from a normal Non-secure mapping before
+  programming the interrupt-group enable and acknowledge controls. This
+  does not change the interrupt groups assigned by firmware.
+
 
 allOf:
   - $ref: /schemas/interrupt-controller.yaml#
@@ -24,6 +29,12 @@ allOf:
 properties:
   compatible:
     oneOf:
+      - items:
+          - enum:
+              - hisilicon,hi3798cv200-gic
+              - hisilicon,hi3798mv310-gic
+          - const: arm,gic-400
+
       - items:
           - enum:
               - arm,arm11mp-gic
