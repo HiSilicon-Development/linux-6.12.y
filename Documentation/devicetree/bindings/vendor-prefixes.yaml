@@ -406,6 +406,8 @@ patternProperties:
     description: DaSheng, Inc.
   "^dserve,.*":
     description: dServe Technology B.V.
+  "^dvbip,.*":
+    description: DVB-IP community project
   "^dynaimage,.*":
     description: Dyna-Image
   "^ea,.*":
