@@ -212,6 +212,12 @@ config DAVICOM_PHY
 	help
 	  Currently supports dm9161e and dm9131
 
+config HISILICON_FESTA_PHY
+	tristate "HiSilicon FESTA internal PHYs"
+	help
+	  Supports the FESTA v330 and S28V112 internal Fast Ethernet PHYs,
+	  including their revision-matched vendor microcode patches.
+
 config ICPLUS_PHY
 	tristate "ICPlus PHYs"
 	help
