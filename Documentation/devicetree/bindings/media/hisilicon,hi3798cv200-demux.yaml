@@ -1,0 +1,203 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/media/hisilicon,hi3798cv200-demux.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: HiSilicon Hi3798CV200 transport stream demultiplexer
+
+maintainers:
+  - linux-media@vger.kernel.org
+
+description:
+  The Hi3798CV200 demultiplexer receives up to six external MPEG transport
+  streams and transfers packet data to memory through descriptor queues. Each
+  enabled input is exposed as an independent Linux DVB adapter.
+
+properties:
+  compatible:
+    const: hisilicon,hi3798cv200-demux
+
+  reg:
+    maxItems: 1
+
+  interrupts:
+    maxItems: 1
+
+  clocks:
+    items:
+      - description: Demultiplexer bus clock
+      - description: Demultiplexer core clock
+      - description: Demultiplexer 27 MHz reference clock
+      - description: Transport stream input 0 clock
+      - description: Transport stream input 1 clock
+      - description: Transport stream input 2 clock
+      - description: Transport stream input 3 clock
+      - description: Transport stream input 4 clock
+      - description: Transport stream input 5 clock
+      - description: Shared clock selector for transport stream inputs 0 to 3
+
+  clock-names:
+    items:
+      - const: bus
+      - const: core
+      - const: ref
+      - const: tsi0
+      - const: tsi1
+      - const: tsi2
+      - const: tsi3
+      - const: tsi4
+      - const: tsi5
+      - const: tsi-shared
+
+  assigned-clocks:
+    maxItems: 1
+
+  assigned-clock-parents:
+    maxItems: 1
+
+  resets:
+    maxItems: 1
+
+  reset-names:
+    const: demux
+
+  "#address-cells":
+    const: 1
+
+  "#size-cells":
+    const: 0
+
+patternProperties:
+  "^input@[0-5]$":
+    type: object
+    additionalProperties: false
+
+    properties:
+      reg:
+        minimum: 0
+        maximum: 5
+
+      hisilicon,ts-mode:
+        description: Physical transport stream signalling mode
+        enum:
+          - parallel-valid
+          - parallel-nosync-188
+          - parallel-nosync-204
+          - parallel-nosync-auto
+          - serial-sync
+          - serial-nosync
+          - serial-nosync-novalid
+
+      hisilicon,clock-inverted:
+        description: Sample transport stream data on the opposite clock edge
+        type: boolean
+
+      hisilicon,serial-data-line:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        description:
+          Physical data line used in serial mode. Line 0 is the hardware
+          default for HiSilicon DVB frontends.
+        enum: [0, 7]
+        default: 0
+
+      hisilicon,cv200-legacy-ts-tuning:
+        description: >-
+          Use the CV200 serial transport setup: FIFO rate/mode fields and the
+          dummy-sync pulse around stream start/stop. This is a board-level
+          compatibility option and must only be set when the board uses this
+          CV200 TSI sequence.
+        type: boolean
+
+      hisilicon,hardware-pid-filtering:
+        description: >-
+          Use the hardware SELECT_PID record path and route only explicitly
+          requested PID channels into the record output queue.
+          Selected packets retain their original scrambling state for Linux
+          DVB user-space descramblers until a live PID is bound through the CA
+          interface. The record path then follows the hardware descrambler for
+          that input.
+          Without this property the driver records the complete multiplex and
+          uses the Linux DVB software demultiplexer. Wildcard feeds still
+          select complete-multiplex recording. This is board integration
+          policy, not a generic CV200 capability declaration.
+        type: boolean
+
+      port:
+        $ref: /schemas/graph.yaml#/$defs/port-base
+        unevaluatedProperties: false
+        description: MPEG transport stream input
+
+        properties:
+          endpoint:
+            $ref: /schemas/graph.yaml#/$defs/endpoint-base
+            unevaluatedProperties: false
+
+            properties:
+              remote-endpoint: true
+
+            required:
+              - remote-endpoint
+
+        required:
+          - endpoint
+
+    required:
+      - reg
+      - hisilicon,ts-mode
+
+required:
+  - compatible
+  - reg
+  - interrupts
+  - clocks
+  - clock-names
+  - resets
+  - reset-names
+  - "#address-cells"
+  - "#size-cells"
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/clock/histb-clock.h>
+    #include <dt-bindings/interrupt-controller/arm-gic.h>
+
+    demux@f9c00000 {
+        compatible = "hisilicon,hi3798cv200-demux";
+        reg = <0xf9c00000 0x10000>;
+        interrupts = <GIC_SPI 82 IRQ_TYPE_LEVEL_HIGH>;
+        clocks = <&crg HISTB_DMX_BUS_CLK>,
+                 <&crg HISTB_DMX_CLK>,
+                 <&crg HISTB_DMX_27M_CLK>,
+                 <&crg HISTB_TSI0_CLK>,
+                 <&crg HISTB_TSI1_CLK>,
+                 <&crg HISTB_TSI2_CLK>,
+                 <&crg HISTB_TSI3_CLK>,
+                 <&crg HISTB_TSI4_CLK>,
+                 <&crg HISTB_TSI5_CLK>,
+                 <&crg HISTB_TSI_SHARED_CLK>;
+        clock-names = "bus", "core", "ref", "tsi0", "tsi1", "tsi2",
+                      "tsi3", "tsi4", "tsi5", "tsi-shared";
+        assigned-clocks = <&crg HISTB_TSI_SHARED_CLK>;
+        assigned-clock-parents = <&crg HISTB_TSI2_CLK>;
+        resets = <&crg 0xfc 24>;
+        reset-names = "demux";
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        input@0 {
+            reg = <0>;
+            hisilicon,ts-mode = "serial-nosync";
+            hisilicon,clock-inverted;
+            hisilicon,serial-data-line = <0>;
+
+            port {
+                demux_input0: endpoint {
+                    remote-endpoint = <&mxl214_output0>;
+                };
+            };
+        };
+    };
+...
