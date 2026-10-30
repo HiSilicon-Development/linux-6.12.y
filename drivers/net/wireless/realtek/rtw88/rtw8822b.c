@@ -41,6 +41,7 @@ static void rtw8822bs_efuse_parsing(struct rtw_efuse *efuse,
 static int rtw8822b_read_efuse(struct rtw_dev *rtwdev, u8 *log_map)
 {
 	struct rtw_efuse *efuse = &rtwdev->efuse;
+	struct rtw_hal *hal = &rtwdev->hal;
 	struct rtw8822b_efuse *map;
 	int i;
 
@@ -61,6 +62,15 @@ static int rtw8822b_read_efuse(struct rtw_dev *rtwdev, u8 *log_map)
 	efuse->regd = map->rf_board_option & 0x7;
 	efuse->thermal_meter[RF_PATH_A] = map->thermal_meter;
 	efuse->thermal_meter_k = map->thermal_meter;
+
+	if (efuse->rfe_option == 12) {
+		/* QFN iFEM: no external PA/LNA in either band. */
+		hal->pkg_type = 1;
+		efuse->pa_type_2g = 0;
+		efuse->pa_type_5g = 0;
+		efuse->lna_type_2g = 0;
+		efuse->lna_type_5g = 0;
+	}
 
 	for (i = 0; i < 4; i++)
 		efuse->txpwr_idx_table[i] = map->txpwr_idx_table[i];
@@ -381,6 +391,13 @@ static const struct cca_ccut cca_ifem_ccut_ext = {
 	{0x87765541, 0x86666341, 0x87765561, 0x86666361}, /*Reg838*/
 };
 
+/* PHYDM v5.2.21.3 cca_ifem_ccut_rfetype, selected explicitly for RFE 12. */
+static const struct cca_ccut cca_ifem_ccut_rfe12 = {
+	{0x75da8010, 0x75da8010, 0x75da8010, 0x75da8010}, /*Reg82C*/
+	{0x79a0eaaa, 0x97a0eaac, 0x79a0eaaa, 0x79a0eaaa}, /*Reg830*/
+	{0x87765561, 0x86666361, 0x87765561, 0x86666361}, /*Reg838*/
+};
+
 static void rtw8822b_get_cca_val(const struct cca_ccut *cca_ccut, u8 col,
 				 u32 *reg82c, u32 *reg830, u32 *reg838)
 {
@@ -416,6 +433,13 @@ static const struct rtw8822b_rfe_info rtw8822b_rfe_info[] = {
 	[2] = I2GE5G_CCUT(efem),
 	[3] = IFEM_EXT_CCUT(ifem),
 	[5] = IFEM_EXT_CCUT(ifem),
+	[12] = {
+		.cca_ccut_2g = &cca_ifem_ccut_rfe12,
+		.cca_ccut_5g = &cca_ifem_ccut_rfe12,
+		.fem = RTW_RFE_IFEM,
+		.ifem_ext = true,
+		.rtw_set_channel_rfe = rtw8822b_set_channel_rfe_ifem,
+	},
 };
 
 static void rtw8822b_set_channel_cca(struct rtw_dev *rtwdev, u8 channel, u8 bw,
@@ -1504,7 +1528,16 @@ static void rtw8822b_phy_pwrtrack(struct rtw_dev *rtwdev)
 	struct rtw_swing_table swing_table;
 	u8 thermal_value, path;
 
-	rtw_phy_config_swing_table(rtwdev, &swing_table);
+	if (rtwdev->efuse.rfe_option == 12 &&
+	    IS_CH_5G_BAND(rtwdev->hal.current_channel)) {
+		/* Vendor type12 has distinct 5 GHz thermal compensation. */
+		for (path = RF_PATH_A; path <= RF_PATH_B; path++) {
+			swing_table.n[path] = rtw8822b_pwrtrk_type12_5g_n;
+			swing_table.p[path] = rtw8822b_pwrtrk_type12_5g_p;
+		}
+	} else {
+		rtw_phy_config_swing_table(rtwdev, &swing_table);
+	}
 
 	if (rtwdev->efuse.thermal_meter[RF_PATH_A] == 0xff)
 		return;
@@ -2120,6 +2153,8 @@ static const struct rtw_rfe_def rtw8822b_rfe_defs[] = {
 	[2] = RTW_DEF_RFE(8822b, 2, 2),
 	[3] = RTW_DEF_RFE(8822b, 3, 0),
 	[5] = RTW_DEF_RFE(8822b, 5, 5),
+	/* Vendor type12 power limits match type0; power-by-rate does not. */
+	[12] = RTW_DEF_RFE(8822b, 12, 0),
 };
 
 static const struct rtw_hw_reg rtw8822b_dig[] = {
@@ -2624,4 +2659,4 @@ MODULE_FIRMWARE("rtw88/rtw8822b_fw.bin");
 
 MODULE_AUTHOR("Realtek Corporation");
 MODULE_DESCRIPTION("Realtek 802.11ac wireless 8822b driver");
-MODULE_LICENSE("Dual BSD/GPL");
+MODULE_LICENSE("GPL");
