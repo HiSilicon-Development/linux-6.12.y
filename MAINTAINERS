@@ -10013,6 +10013,11 @@ L:	linux-parisc@vger.kernel.org
 S:	Maintained
 F:	sound/parisc/harmony.*
 
+HDIC HD2312 USB RECEIVER DRIVER
+L:	linux-media@vger.kernel.org
+S:	Orphan
+F:	drivers/media/usb/dvb-usb-v2/hd2312.[ch]
+
 HDPVR USB VIDEO ENCODER DRIVER
 M:	Hans Verkuil <hverkuil@xs4all.nl>
 L:	linux-media@vger.kernel.org
