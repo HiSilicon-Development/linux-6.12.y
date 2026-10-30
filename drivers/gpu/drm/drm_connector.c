@@ -2759,6 +2759,79 @@ int drm_connector_attach_colorspace_property(struct drm_connector *connector)
 EXPORT_SYMBOL(drm_connector_attach_colorspace_property);
 
 /**
+ * DOC: Color format
+ *
+ * The connector "color format" property allows userspace to request a
+ * specific output format. The advertised formats describe source hardware
+ * capability; the atomic check still rejects combinations unsupported by the
+ * sink, display mode, color depth or link bandwidth.
+ *
+ * "AUTO" lets the protocol helper choose. The remaining values request RGB,
+ * YUV 4:4:4, YUV 4:2:2 or YUV 4:2:0 respectively. Userspace must check the
+ * result of an atomic commit when requesting an explicit format.
+ */
+
+/**
+ * drm_connector_attach_color_format_property - attach color format property
+ * @connector: connector to attach the property to
+ * @supported_formats: bitmask of &enum hdmi_colorspace values
+ *
+ * Returns: 0 on success, negative errno on failure.
+ */
+int drm_connector_attach_color_format_property(struct drm_connector *connector,
+					       unsigned long supported_formats)
+{
+	static const struct {
+		enum hdmi_colorspace hdmi_format;
+		enum drm_connector_color_format connector_format;
+	} format_map[] = {
+		{ HDMI_COLORSPACE_RGB, DRM_CONNECTOR_COLOR_FORMAT_RGB444 },
+		{ HDMI_COLORSPACE_YUV444, DRM_CONNECTOR_COLOR_FORMAT_YCBCR444 },
+		{ HDMI_COLORSPACE_YUV422, DRM_CONNECTOR_COLOR_FORMAT_YCBCR422 },
+		{ HDMI_COLORSPACE_YUV420, DRM_CONNECTOR_COLOR_FORMAT_YCBCR420 },
+	};
+	struct drm_prop_enum_list enum_list[DRM_CONNECTOR_COLOR_FORMAT_COUNT];
+	struct drm_device *dev = connector->dev;
+	unsigned int count = 1;
+	unsigned int i;
+
+	if (connector->color_format_property)
+		return 0;
+
+	if (!supported_formats || supported_formats & ~GENMASK(HDMI_COLORSPACE_YUV420, 0))
+		return -EINVAL;
+
+	enum_list[0].type = DRM_CONNECTOR_COLOR_FORMAT_AUTO;
+	enum_list[0].name = "AUTO";
+
+	for (i = 0; i < ARRAY_SIZE(format_map); i++) {
+		enum hdmi_colorspace fmt = format_map[i].hdmi_format;
+
+		if (!(supported_formats & BIT(fmt)))
+			continue;
+
+		enum_list[count].type = format_map[i].connector_format;
+		enum_list[count].name =
+			drm_hdmi_connector_get_output_format_name(fmt);
+		count++;
+	}
+
+	connector->color_format_property =
+		drm_property_create_enum(dev, DRM_MODE_PROP_ENUM, "color format",
+					 enum_list, count);
+	if (!connector->color_format_property)
+		return -ENOMEM;
+
+	drm_object_attach_property(&connector->base,
+				   connector->color_format_property,
+				   DRM_CONNECTOR_COLOR_FORMAT_AUTO);
+	connector->state->color_format = DRM_CONNECTOR_COLOR_FORMAT_AUTO;
+
+	return 0;
+}
+EXPORT_SYMBOL(drm_connector_attach_color_format_property);
+
+/**
  * drm_connector_atomic_hdr_metadata_equal - checks if the hdr metadata changed
  * @old_state: old connector state to compare
  * @new_state: new connector state to compare
