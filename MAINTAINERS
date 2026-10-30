@@ -13333,6 +13333,11 @@ F:	Documentation/hwmon/lm90.rst
 F:	drivers/hwmon/lm90.c
 F:	include/dt-bindings/thermal/lm90.h
 
+LME2510 DTMB MEDIA DRIVER
+L:	linux-media@vger.kernel.org
+S:	Orphan
+F:	drivers/media/usb/dvb-usb-v2/lme2510-dtmb.c
+
 LME2510 MEDIA DRIVER
 M:	Malcolm Priestley <tvboxspy@gmail.com>
 L:	linux-media@vger.kernel.org
