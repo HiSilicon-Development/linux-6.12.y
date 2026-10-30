@@ -40,6 +40,20 @@
 
 #define TTY_BUFFER_PAGE	(((PAGE_SIZE - sizeof(struct tty_buffer)) / 2) & ~TTYB_ALIGN_MASK)
 
+static bool tty_buffer_queue_work(struct tty_port *port)
+{
+	struct tty_bufhead *buf = &port->buf;
+	unsigned long flags;
+	bool queued = false;
+
+	spin_lock_irqsave(&buf->workqueue_lock, flags);
+	if (buf->workqueue)
+		queued = queue_work(buf->workqueue, &buf->work);
+	spin_unlock_irqrestore(&buf->workqueue_lock, flags);
+
+	return queued;
+}
+
 /**
  * tty_buffer_lock_exclusive	-	gain exclusive access to buffer
  * @port: tty port owning the flip buffer
@@ -76,7 +90,7 @@ void tty_buffer_unlock_exclusive(struct tty_port *port)
 	mutex_unlock(&buf->lock);
 
 	if (restart)
-		queue_work(system_unbound_wq, &buf->work);
+		tty_buffer_queue_work(port);
 }
 EXPORT_SYMBOL_GPL(tty_buffer_unlock_exclusive);
 
@@ -531,7 +545,7 @@ void tty_flip_buffer_push(struct tty_port *port)
 	struct tty_bufhead *buf = &port->buf;
 
 	tty_flip_buffer_commit(buf->tail);
-	queue_work(system_unbound_wq, &buf->work);
+	tty_buffer_queue_work(port);
 }
 EXPORT_SYMBOL(tty_flip_buffer_push);
 
@@ -561,7 +575,7 @@ int tty_insert_flip_string_and_push_buffer(struct tty_port *port,
 		tty_flip_buffer_commit(buf->tail);
 	spin_unlock_irqrestore(&port->lock, flags);
 
-	queue_work(system_unbound_wq, &buf->work);
+	tty_buffer_queue_work(port);
 
 	return size;
 }
@@ -585,8 +599,49 @@ void tty_buffer_init(struct tty_port *port)
 	atomic_set(&buf->mem_used, 0);
 	atomic_set(&buf->priority, 0);
 	INIT_WORK(&buf->work, flush_to_ldisc);
+	buf->workqueue = system_unbound_wq;
+	spin_lock_init(&buf->workqueue_lock);
 	buf->mem_limit = TTYB_DEFAULT_MEM_LIMIT;
 }
+
+/**
+ * tty_buffer_set_workqueue - select a workqueue for flip-buffer delivery
+ * @port: tty port to update
+ * @workqueue: target workqueue, or %NULL to restore system_unbound_wq
+ *
+ * The caller must serialize queue changes and prevent new flip-buffer producers
+ * while this function runs. Call from sleepable context, not the delivery work.
+ * Queue selection is also serialized against line-discipline restart requests.
+ * Pending work is synchronously cancelled before the queue is changed, and
+ * committed data is scheduled again on the new queue. Restore the default
+ * queue with producers stopped before destroying a private workqueue.
+ */
+void tty_buffer_set_workqueue(struct tty_port *port,
+			      struct workqueue_struct *workqueue)
+{
+	struct tty_bufhead *buf = &port->buf;
+	unsigned long flags;
+	bool restart;
+
+	if (!workqueue)
+		workqueue = system_unbound_wq;
+
+	/* Prevent an ldisc restart from requeueing work on the old queue. */
+	spin_lock_irqsave(&buf->workqueue_lock, flags);
+	buf->workqueue = NULL;
+	spin_unlock_irqrestore(&buf->workqueue_lock, flags);
+	tty_buffer_cancel_work(port);
+	spin_lock_irqsave(&buf->workqueue_lock, flags);
+	buf->workqueue = workqueue;
+	spin_unlock_irqrestore(&buf->workqueue_lock, flags);
+
+	mutex_lock(&buf->lock);
+	restart = buf->head->commit != buf->head->read || buf->head->next;
+	mutex_unlock(&buf->lock);
+	if (restart)
+		tty_buffer_queue_work(port);
+}
+EXPORT_SYMBOL_GPL(tty_buffer_set_workqueue);
 
 /**
  * tty_buffer_set_limit		-	change the tty buffer memory limit
@@ -614,7 +669,7 @@ void tty_buffer_set_lock_subclass(struct tty_port *port)
 
 bool tty_buffer_restart_work(struct tty_port *port)
 {
-	return queue_work(system_unbound_wq, &port->buf.work);
+	return tty_buffer_queue_work(port);
 }
 
 bool tty_buffer_cancel_work(struct tty_port *port)

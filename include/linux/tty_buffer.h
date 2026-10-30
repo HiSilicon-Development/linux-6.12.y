@@ -5,6 +5,7 @@
 #include <linux/atomic.h>
 #include <linux/llist.h>
 #include <linux/mutex.h>
+#include <linux/spinlock.h>
 #include <linux/workqueue.h>
 
 struct tty_buffer {
@@ -35,6 +36,8 @@ static inline u8 *flag_buf_ptr(struct tty_buffer *b, unsigned int ofs)
 struct tty_bufhead {
 	struct tty_buffer *head;	/* Queue head */
 	struct work_struct work;
+	struct workqueue_struct *workqueue;
+	spinlock_t workqueue_lock;
 	struct mutex	   lock;
 	atomic_t	   priority;
 	struct tty_buffer sentinel;
