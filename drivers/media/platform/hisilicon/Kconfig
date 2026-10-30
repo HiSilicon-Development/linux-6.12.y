@@ -1,0 +1,139 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+comment "HiSilicon media platform drivers"
+
+config VIDEO_HISTB_MEDIA_SMMU
+	tristate
+	depends on HAS_DMA
+	depends on OF
+	help
+	  Shared CV200 media-SMMU page-table lifecycle used by the HiVXE
+	  clients. This is an internal kernel component, not the legacy MMZ ABI.
+
+config DVB_HISTB_DMX
+	tristate "HiSilicon HiSTB transport stream demultiplexer"
+	depends on DVB_PLATFORM_DRIVERS
+	depends on DVB_CORE && I2C && OF && HAS_DMA
+	depends on ARCH_HISI || COMPILE_TEST
+	select DVB_MXL214 if MEDIA_SUBDRV_AUTOSELECT && GPIOLIB
+	help
+	  Support the transport stream input and descriptor DMA engine found in
+	  HiSilicon HiSTB SoCs. The hardware DMA engine supplies complete MPEG
+	  transport streams to the Linux DVB software demultiplexer.
+
+	  To compile this driver as a module, choose M here. The module will be
+	  called histb-dmx.
+
+config VIDEO_HISTB_JPGE
+	tristate "HiSilicon HiSTB JPEG encoder"
+	depends on V4L_MEM2MEM_DRIVERS
+	depends on ARCH_HISI || COMPILE_TEST
+	depends on HAS_DMA && OF
+	select V4L2_JPEG_HELPER
+	select V4L2_MEM2MEM_DEV
+	select VIDEOBUF2_DMA_CONTIG
+	help
+	  Support the stand-alone baseline JPEG encoder found in HiSilicon
+	  Hi3798CV200 SoCs. The driver exposes a standard V4L2 memory-to-memory
+	  encoder with semi-planar 4:2:0, 4:2:2 and 4:4:4 input, packed 4:2:2
+	  input and JPEG output.
+
+	  To compile this driver as a module, choose M here. The module will be
+	  called histb-jpge.
+
+config VIDEO_HISTB_JPGD
+	tristate "HiSilicon HiSTB JPEG decoder"
+	depends on V4L_MEM2MEM_DRIVERS
+	depends on ARCH_HISI || COMPILE_TEST
+	depends on HAS_DMA && OF
+	select V4L2_JPEG_HELPER
+	select V4L2_MEM2MEM_DEV
+	select VIDEOBUF2_DMA_CONTIG
+	help
+	  Support the stand-alone baseline JPEG decoder found in HiSilicon
+	  Hi3798CV200 and Hi3798MV310 SoCs. The driver exposes a V4L2
+	  decoder with JPEG input and raw YUV output.
+
+	  To compile this driver as a module, choose M here. The module will be
+	  called histb-jpgd.
+
+config VIDEO_HISTB_PNG
+	tristate "HiSilicon Hi3798MV310 PNG decoder"
+	depends on V4L_MEM2MEM_DRIVERS
+	depends on ARCH_HISI || COMPILE_TEST
+	depends on HAS_DMA && OF
+	select CRC32
+	select V4L2_MEM2MEM_DEV
+	select VIDEOBUF2_DMA_CONTIG
+	help
+	  Support the PNG hardware decoder found in Hi3798MV310. Each OUTPUT
+	  buffer contains one complete PNG file with fourcc 'PNG '; CAPTURE
+	  provides RGBA32 pixels with a 16-byte-aligned stride. Both queue
+	  dimensions must match the PNG IHDR before buffers are allocated.
+	  Supports noninterlaced 8-bit grayscale, RGB, grayscale-alpha and RGBA.
+	  Indexed, sub-8-bit, 16-bit, interlaced and animated PNGs are rejected.
+
+	  To compile this driver as a module, choose M here. The module will be
+	  called histb-png.
+
+config VIDEO_HISTB_VDEC
+	tristate "HiSilicon HiSTB video decoders"
+	depends on V4L_MEM2MEM_DRIVERS
+	depends on ARCH_HISI || COMPILE_TEST
+	depends on HAS_DMA && OF && OF_RESERVED_MEM && CMA
+	select V4L2_MEM2MEM_DEV
+	select V4L2_VP9
+	select VIDEOBUF2_DMA_CONTIG
+	select VIDEO_HISTB_MEDIA_SMMU
+	select VIDEOBUF2_VMALLOC
+	select VIDEO_HISTB_VPSS
+	help
+	  Support the CV200 V4R3 and MV310 V5R6 VDH video decoders through
+	  stateless V4L2 requests for H.264, HEVC, MPEG-2 and AVS/AVS+, plus
+	  stateful MPEG-4 Part 2 and VC-1. CV200 also supports VP8 and VP9.
+	  MV310 adds stateful AVS2 and MPEG-1 I/P/B, and two-view MVC through
+	  H264_SLICE requests from a matching userspace implementation.
+	  MPEG-1 full-pel currently has known chroma reconstruction errors.
+	  Capture output is linear video; profiles and coding tools remain
+	  limited by the implemented controls and bitstream validation.
+	  RealVideo is not exposed.
+
+	  To compile this driver as a module, choose M here. The module will be
+	  called histb-vdec.
+
+config VIDEO_HISTB_VENC
+	tristate "HiSilicon HiSTB H.264 and HEVC encoders"
+	depends on V4L_MEM2MEM_DRIVERS
+	depends on ARCH_HISI || COMPILE_TEST
+	depends on HAS_DMA && OF
+	select V4L2_MEM2MEM_DEV
+	select VIDEOBUF2_DMA_CONTIG
+	select VIDEO_HISTB_MEDIA_SMMU
+	help
+	  Support the first-generation CV200 VEDU H.264 encoder and the
+	  MV310 V500 H.264/HEVC encoder through V4L2 memory-to-memory queues.
+	  Both support H.264 Baseline/Main/High, I/P frames, QP, bitrate,
+	  frame-rate and GOP controls. MV310 additionally supports HEVC Main
+	  with NV12M/NV21M input, single-slice frames and physical DMA32.
+	  MV310 does not expose ROI, OSD, intra-refresh or multislice controls.
+	  Main10 encoding, B frames and AVS encoding are not supported.
+
+	  To compile this driver as a module, choose M here. The module will be
+	  called histb-venc.
+
+config VIDEO_HISTB_VPSS
+	tristate "HiSilicon HiSTB video post-processing engines"
+	depends on V4L_MEM2MEM_DRIVERS
+	depends on ARCH_HISI || COMPILE_TEST
+	depends on HAS_DMA && OF
+	select VIDEO_HISTB_MEDIA_SMMU
+	select V4L2_MEM2MEM_DEV
+	select VIDEOBUF2_DMA_CONTIG
+	help
+	  Support the native CV200 and MV310 VPSS engines for converting
+	  decoder tile surfaces into linear frames. Media drivers use the
+	  internal conversion API. The separately registered memory-to-memory
+	  node has its own format and processing limits.
+
+	  To compile this driver as a module, choose M here. The module will be
+	  called histb-vpss.
