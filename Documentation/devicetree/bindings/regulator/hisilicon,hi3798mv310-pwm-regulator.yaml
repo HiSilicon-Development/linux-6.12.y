@@ -1,0 +1,77 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/regulator/hisilicon,hi3798mv310-pwm-regulator.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: HiSilicon Hi3798MV310 shared CPU GPU Core PWM supply
+
+maintainers:
+  - HiSilicon <linux@hisilicon.com>
+
+description: |
+  The PWM output is shared by CPU, GPU and core consumers. It supports a
+  nominal 5 mV voltage step; the period/duty ratio determines the output, and
+  boot firmware may use a board-specific period. The cpu and gpu children are
+  voltage requirement votes, not separate physical rails.
+
+  CPU OPP voltages use the board's HPM coefficients in the system controller
+  and the 800 MHz and 1200 MHz OTP trim cells. Conservative 50 mV and 30 mV
+  cold-temperature margins are always included. If calibration data is
+  unavailable or invalid, CPU OPPs use the 1.25 V ceiling. The 1.6 GHz OPP
+  also stays at that ceiling because the BSP has no separate characterized
+  curve for it.
+  The driver initially holds the shared output at 1.25 V. CPU OPP calibration
+  and the GPU's current OPP voltage vote are applied before CPUFreq policy
+  startup and devfreq governor polling, respectively. The output is then the
+  maximum of the CPU vote, GPU vote, and voltage floor for the current CPU
+  clock.
+
+properties:
+  compatible:
+    const: hisilicon,hi3798mv310-pwm-regulator
+  reg:
+    maxItems: 1
+  clocks:
+    maxItems: 1
+  clock-names:
+    const: cpu
+  hisilicon,sysctrl:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: System controller containing the MV310 HPM voltage coefficients.
+
+  nvmem-cells:
+    minItems: 2
+    maxItems: 2
+    description: 800 MHz and 1200 MHz CPU voltage OTP trim cells.
+
+  nvmem-cell-names:
+    items:
+      - const: cpu-800m
+      - const: cpu-1200m
+
+  regulators:
+    type: object
+    properties:
+      cpu:
+        $ref: regulator.yaml#
+        unevaluatedProperties: false
+      gpu:
+        $ref: regulator.yaml#
+        unevaluatedProperties: false
+    required:
+      - cpu
+      - gpu
+    additionalProperties: false
+
+required:
+  - compatible
+  - reg
+  - clocks
+  - clock-names
+  - regulators
+  - hisilicon,sysctrl
+  - nvmem-cells
+  - nvmem-cell-names
+
+additionalProperties: false
