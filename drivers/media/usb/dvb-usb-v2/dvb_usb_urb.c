@@ -45,10 +45,18 @@ static int dvb_usb_v2_generic_io(struct dvb_usb_device *d,
 		ret = usb_bulk_msg(d->udev, usb_rcvbulkpipe(d->udev,
 				d->props->generic_bulk_ctrl_endpoint_response),
 				rbuf, rlen, &actual_length, 2000);
-		if (ret)
+		if (ret) {
 			dev_err(&d->udev->dev,
 					"%s: 2nd usb_bulk_msg() failed=%d\n",
 					KBUILD_MODNAME, ret);
+			return ret;
+		}
+		if (actual_length != rlen) {
+			dev_err(&d->udev->dev,
+				"%s: usb_bulk_msg() read length=%d, actual=%d\n",
+				KBUILD_MODNAME, rlen, actual_length);
+			return -EIO;
+		}
 
 		dev_dbg(&d->udev->dev, "%s: <<< %*ph\n", __func__,
 				actual_length, rbuf);
