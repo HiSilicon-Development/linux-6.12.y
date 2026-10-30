@@ -671,6 +671,18 @@ config SERIAL_SH_SCI_DMA
 	depends on SERIAL_SH_SCI && DMA_ENGINE
 	default ARCH_RENESAS
 
+config SERIAL_HI3798CV200_SCI
+	tristate "HiSilicon Hi3798CV200 smart card interface"
+	depends on ARCH_HIX5HD2 || ARCH_HISI || COMPILE_TEST
+	select SERIAL_CORE
+	help
+	  This driver supports the ISO/IEC 7816 smart card interface found in
+	  the HiSilicon Hi3798CV200. The controller is exposed as ttySCI and
+	  uses the serial core TIOCSISO7816 and TIOCGISO7816 interfaces.
+
+	  To compile this driver as a module, choose M here. The module is
+	  called hi3798cv200-sci.
+
 config SERIAL_HS_LPC32XX
 	tristate "LPC32XX high speed serial port support"
 	depends on ARCH_LPC32XX || COMPILE_TEST

@@ -1,0 +1,95 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/serial/hisilicon,hi3798cv200-sci.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: HiSilicon Hi3798CV200 smart card interface
+
+maintainers:
+  - linux-serial@vger.kernel.org
+
+description:
+  The Hi3798CV200 smart card interface is an ISO/IEC 7816 controller with
+  hardware-managed card power, clock, reset, presence detection and byte
+  FIFOs. It is exposed through the Linux serial core ISO7816 interface.
+
+allOf:
+  - $ref: serial.yaml#
+
+properties:
+  compatible:
+    const: hisilicon,hi3798cv200-sci
+
+  reg:
+    maxItems: 1
+
+  interrupts:
+    maxItems: 1
+
+  clocks:
+    maxItems: 1
+
+  clock-names:
+    const: sci
+
+  resets:
+    maxItems: 1
+
+  reset-names:
+    const: sci
+
+  hisilicon,vcc-active-low:
+    description: The controller VCC-enable output is active low
+    type: boolean
+
+  hisilicon,card-detect-active-high:
+    description: The controller card-detect input reports presence as high
+    type: boolean
+
+  hisilicon,clock-open-drain:
+    description:
+      Drive the smart card clock output in open-drain mode. When absent, the
+      output uses CMOS mode.
+    type: boolean
+
+  hisilicon,reset-open-drain:
+    description:
+      Drive the smart card reset output in open-drain mode. When absent, the
+      output uses CMOS mode.
+    type: boolean
+
+  hisilicon,vcc-enable-open-drain:
+    description:
+      Drive the card VCC-enable output in open-drain mode. When absent, the
+      output uses CMOS mode.
+    type: boolean
+
+required:
+  - compatible
+  - reg
+  - interrupts
+  - clocks
+  - clock-names
+  - resets
+  - reset-names
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/clock/histb-clock.h>
+    #include <dt-bindings/interrupt-controller/arm-gic.h>
+
+    serial@f8b18000 {
+        compatible = "hisilicon,hi3798cv200-sci";
+        reg = <0xf8b18000 0x1000>;
+        interrupts = <GIC_SPI 36 IRQ_TYPE_LEVEL_HIGH>;
+        clocks = <&crg HISTB_SCI_CLK>;
+        clock-names = "sci";
+        resets = <&crg 0x74 1>;
+        reset-names = "sci";
+        hisilicon,vcc-active-low;
+        hisilicon,card-detect-active-high;
+    };
+...
