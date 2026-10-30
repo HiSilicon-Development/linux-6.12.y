@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+config DRM_HISI_HISTB_HDMI
+	tristate "HiSilicon HiSTB HDMI transmitter"
+	depends on DRM && OF && COMMON_CLK && I2C && RESET_CONTROLLER
+	depends on ARCH_HISI || COMPILE_TEST
+	select DRM_DISPLAY_HELPER
+	select DRM_DISPLAY_HDMI_STATE_HELPER
+	select DRM_KMS_HELPER
+	select MFD_SYSCON
+	select CEC_CORE
+	select CEC_NOTIFIER
+	help
+	  Enable support for the HDMI transmitter integrated in the HiSilicon
+	  Hi3798CV200 and Hi3798MV310. The drivers use the DRM bridge API and
+	  provide physical hot-plug detection and internal DDC EDID reads.
+	  MV310 uses its native hisiv100 controller and external HDMI PHY,
+	  supporting progressive RGB video at 8 bpc without audio or CEC.
+
+	  If M is selected, the modules are histb-hdmi and histb-hdmi-mv310.
