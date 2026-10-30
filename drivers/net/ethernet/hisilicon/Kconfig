@@ -28,6 +28,8 @@ config HISI_FEMAC
 	tristate "Hisilicon Fast Ethernet MAC device support"
 	depends on HAS_IOMEM
 	select PHYLIB
+	select HISILICON_FESTA_PHY
+	select MFD_SYSCON
 	select RESET_CONTROLLER
 	help
 	  This selects the Hisilicon Fast Ethernet MAC device(FEMAC).
@@ -35,6 +37,8 @@ config HISI_FEMAC
 	  ports at 10/100 Mbps in full-duplex or half-duplex mode.
 	  The FEMAC exchanges data with the CPU, and supports
 	  the energy efficient Ethernet (EEE).
+	  Also supports the Hi3798MV310 switch-fabric MAC with its integrated
+	  MDIO controller and internal Fast Ethernet PHY.
 
 config HIP04_ETH
 	tristate "HISILICON P04 Ethernet support"
