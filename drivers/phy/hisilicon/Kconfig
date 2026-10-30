@@ -45,12 +45,22 @@ config PHY_HI3670_PCIE
 
 config PHY_HISTB_COMBPHY
 	tristate "HiSilicon STB SoCs COMBPHY support"
-	depends on (ARCH_HISI && ARM64) || COMPILE_TEST
+	depends on (ARCH_HISI && ARM64) || (SOC_HI3798CV200 && ARM) || COMPILE_TEST
 	select GENERIC_PHY
 	select MFD_SYSCON
 	help
 	  Enable this to support the HISILICON STB SoCs COMBPHY.
 	  If unsure, say N.
+
+config PHY_HI3798MV310_USB2
+	tristate "HiSilicon Hi3798MV310 USB2 PHY support"
+	depends on ARCH_HISI || COMPILE_TEST
+	depends on OF && HAS_IOMEM
+	select GENERIC_PHY
+	select MFD_SYSCON
+	help
+	  Enable the direct-MMIO three-port USB2 PHY on Hi3798MV310.
+	  Its clocks and resets are sequenced together across all ports.
 
 config PHY_HISI_INNO_USB2
 	tristate "HiSilicon INNO USB2 PHY support"
