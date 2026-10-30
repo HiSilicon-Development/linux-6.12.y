@@ -10981,6 +10981,11 @@ IBM ServeRAID RAID DRIVER
 S:	Orphan
 F:	drivers/scsi/ips.*
 
+ICAST DVB-C/DTMB USB RECEIVER DRIVER
+L:	linux-media@vger.kernel.org
+S:	Orphan
+F:	drivers/media/usb/dvb-usb-v2/icast.c
+
 ICH LPC AND GPIO DRIVER
 M:	Peter Tyser <ptyser@xes-inc.com>
 S:	Maintained
