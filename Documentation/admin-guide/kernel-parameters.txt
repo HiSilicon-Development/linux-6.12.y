@@ -709,6 +709,18 @@
 			loops can be debugged more effectively on production
 			systems.
 
+	clocksource.arm_arch_timer.snapshot=
+			[ARM64,EARLY]
+			Format: <bool>
+			Create the root-readable /proc/arch_timer_snapshot for
+			diagnosing architected timer interrupt delivery. Requires
+			CONFIG_PROC_FS and a physical timer selected by the driver;
+			virtual-only configurations are rejected to avoid trapped
+			physical register accesses. Disabled by default.
+			Each read pins the current CPU and briefly masks local IRQs
+			while reading the physical/virtual timer registers, counters
+			and prior DAIF. Does not program timers or acknowledge IRQs.
+
 	clocksource.verify_n_cpus= [KNL]
 			Limit the number of CPUs checked for clocksources
 			marked with CLOCK_SOURCE_VERIFY_PERCPU that

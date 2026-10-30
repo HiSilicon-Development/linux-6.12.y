@@ -10231,6 +10231,17 @@ L:	linux-media@vger.kernel.org
 S:	Orphan
 F:	drivers/media/platform/hisilicon/histb-media-smmu.[ch]
 
+HISILICON HISTB VIDEO DECODER DRIVER
+L:	linux-media@vger.kernel.org
+S:	Orphan
+F:	Documentation/ABI/testing/sysfs-driver-histb-vdec
+F:	Documentation/devicetree/bindings/media/hisilicon,hi3798cv200-vdec.yaml
+F:	drivers/media/platform/hisilicon/histb-vdec*
+F:	firmware/hisilicon/bsp/Hi3798CV200/**
+F:	firmware/hisilicon/generate-avsp.py
+F:	firmware/hisilicon/generate-h264-cabac.py
+F:	firmware/hisilicon/generate-hevc-cabac.py
+
 HISILICON HNS3 PMU DRIVER
 M:	Jijie Shao <shaojijie@huawei.com>
 S:	Supported

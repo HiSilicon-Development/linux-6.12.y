@@ -220,6 +220,34 @@ Compressed Formats
 	See the :ref:`associated Codec Control IDs <v4l2-codec-stateless-hevc>`.
 	Buffers associated with this pixel format must contain the appropriate
 	number of macroblocks to decode a full corresponding frame.
+    * .. _V4L2-PIX-FMT-AVS-SLICE:
+
+      - ``V4L2_PIX_FMT_AVS_SLICE``
+      - 'SAVS'
+      - AVS/AVS+ parsed slice data, as extracted from an AVS elementary
+	stream. This format is intended for stateless video decoders using the
+	:ref:`media-request-api`. Exactly one output and one capture buffer must
+	be provided for each decoded picture. Sequence, picture, slice and
+	reference metadata are supplied through
+	``V4L2_CID_STATELESS_AVS_SEQUENCE``,
+	``V4L2_CID_STATELESS_AVS_PICTURE``,
+	``V4L2_CID_STATELESS_AVS_SLICE_PARAMS`` and
+	``V4L2_CID_STATELESS_AVS_DECODE_PARAMS``. Applications must also set
+	``V4L2_CID_STATELESS_AVS_DECODE_MODE`` and
+	``V4L2_CID_STATELESS_AVS_START_CODE`` before decoding. See the
+	:ref:`associated Codec Control IDs <v4l2-codec-stateless-avs>`.
+    * .. _V4L2-PIX-FMT-AVS2:
+
+      - ``V4L2_PIX_FMT_AVS2``
+      - 'AVS2'
+      - AVS2 Annex-B access units. The HiSilicon MV310 stateful decoder
+	expects one complete access unit per output buffer, beginning with a
+	three-byte start code; access units cannot be split across buffers.
+	A picture access unit contains at most one picture header and must
+	contain at least one slice. Sequence headers and supported auxiliary
+	units may precede the picture. A zero-payload output buffer signals
+	end of stream and drains pending pictures. This is a stateful stream
+	format, distinct from the parsed-slice ``V4L2_PIX_FMT_AVS_SLICE``.
     * .. _V4L2-PIX-FMT-FWHT:
 
       - ``V4L2_PIX_FMT_FWHT``

@@ -1,0 +1,14 @@
+What:		/sys/bus/platform/devices/.../histb_vdec_jobs
+Date:		August 2026
+Contact:	linux-media@vger.kernel.org
+Description:
+		Number of completed video decoder hardware jobs since the driver
+		was loaded.
+
+What:		/sys/bus/platform/devices/.../histb_vdec_errors
+Date:		August 2026
+Contact:	linux-media@vger.kernel.org
+Description:
+		Number of video decoder jobs that failed, timed out, or could not
+		be converted to the negotiated capture format since the driver was
+		loaded.
