@@ -1,0 +1,117 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/display/hisilicon/hisilicon,hi3798mv310-hdmi.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: HiSilicon Hi3798MV310 hisiv100 HDMI transmitter
+
+maintainers:
+  - dri-devel@lists.freedesktop.org
+
+description: |
+  The MV310 uses a hisiv100 native-register HDMI controller and a separate
+  HDMI analogue/digital PHY, not the CV200 imagev200 register interface.
+  The driver supports progressive SDR RGB video at 8 bits per component,
+  with a 25 to 594 MHz TMDS character clock. Rates above 340 MHz require
+  HDMI 2.0 SCDC scrambling and the 1:40 clock ratio on a capable sink.
+  Audio, HDCP and CEC are not implemented.
+  HPD is always read from the physical AON status bit; when
+  the optional AON interrupt is absent it is polled at 100 ms intervals.
+  No connected display or EDID is required for bridge registration.
+
+properties:
+  compatible:
+    const: hisilicon,hi3798mv310-hdmi
+
+  reg:
+    items:
+      - description: HDMI controller at 0xf8ce0000, including its AON block
+      - description: External HDMI PHY at 0xf8d30000
+
+  reg-names:
+    items:
+      - const: core
+      - const: phy
+
+  interrupts:
+    maxItems: 1
+    description: HDMI AON HPD interrupt, not the CV200 transmitter interrupt
+
+  interrupt-names:
+    items:
+      - const: aon
+
+  clocks:
+    items:
+      - description: SSC input gate, sourced from the HPLL divided by two
+      - description: SSC bypass gate
+      - description: HDMI controller 24 MHz oscillator gate
+      - description: HDMI controller oversampling gate
+      - description: HDMI controller audio-sample domain gate
+      - description: PHY TMDS gate
+      - description: Pixel clock, including HPLL and VO/HDMI divider programming
+
+  clock-names:
+    items:
+      - const: ssc
+      - const: ssc-bypass
+      - const: osc
+      - const: os
+      - const: as
+      - const: tmds
+      - const: pixel
+
+  resets:
+    items:
+      - description: CRG HDMI controller bus reset
+      - description: CRG HDMI controller reset
+      - description: CRG HDMI SSC reset
+      - description: CRG external HDMI PHY reset
+      - description: CRG PHY TMDS reset
+
+  reset-names:
+    items:
+      - const: bus
+      - const: core
+      - const: ssc
+      - const: phy
+      - const: tmds
+
+  hisilicon,sysctrl:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: |
+      System controller containing HDMI pin routing at offset 0x44
+      (bits 24 to 21) and AON APB/oscillator/CEC gates and resets at
+      offset 0x48 (bits 19 to 24). These fields are managed by the bridge.
+
+  ports:
+    $ref: /schemas/graph.yaml#/properties/ports
+    properties:
+      port@0:
+        $ref: /schemas/graph.yaml#/properties/port
+        description: Native parallel RGB input from the VDP
+      port@1:
+        $ref: /schemas/graph.yaml#/properties/port
+        description: HDMI output to the board connector
+    required:
+      - port@0
+      - port@1
+    unevaluatedProperties: false
+
+dependencies:
+  interrupts: [interrupt-names]
+  interrupt-names: [interrupts]
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - clocks
+  - clock-names
+  - resets
+  - reset-names
+  - hisilicon,sysctrl
+  - ports
+
+additionalProperties: false
