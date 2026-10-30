@@ -1,0 +1,86 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/clock/hisilicon,hi3798mv310-crg.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: HiSilicon Hi3798MV310 Clock and Reset Generator
+
+maintainers:
+  - Wei Xu <xuwei5@hisilicon.com>
+
+description: |
+  Peripheral gates, MMC source-rate selectors and phase taps, CPU APLL tuning,
+  and active-high reset requests on Hi3798MV310. Clock identifiers are defined
+  in dt-bindings/clock/hi3798mv310-clock.h. CPU frequency is capped at 1.2 GHz.
+  The GPU clock supports the BSP's 200/300/400/500/600/675/750/800 MHz mux
+  selections, including PP0/PP1 gates. The calibrated shared supply and OPP
+  consumers own voltage sequencing; this clock provider does not run AVS.
+  The eMMC source selector preserves the existing CRG0xa0 bit19 mode.
+
+  MMC phase clocks describe the eight normal SDR taps (0 through 315 degrees
+  in 45 degree steps), not DDR/HS400 half-cycle phase interpretation.
+  Peripheral gates without a documented parent frequency do not imply a
+  fixed clock rate. USB reference and UTMI gates are separate from resets
+  and do not execute a PHY initialization sequence. The third reference
+  gate (CRG0xbc bit2) and UTMI gate (CRG0xb8 bit7) are used by the EC6110-T
+  760 firmware in addition to the two-port SPC060 configuration.
+
+  The display clock tree uses the 24 MHz oscillator and HPLL, the CRG211
+  top divider and the CRG54 VO divider. Pixel rates are programmable from
+  25 to 594 MHz; this is not a display-controller mode-size guarantee.
+  CRG54 gates are bus bit0, HD bit4 and configuration bit30. CRG211 bit14
+  gates the display core; its bit29 divider reset is released before the
+  VOU consumer enables clocks and releases CRG54 bit29. HDMI uses its
+  native CRG67 SSC, bypass, oscillator, OS, AS and pixel gates, plus the
+  CRG68 TMDS gate. CV200 video-layer gate bits are reserved on MV310.
+
+properties:
+  compatible:
+    items:
+      - const: hisilicon,hi3798mv310-crg
+      - const: syscon
+
+  reg:
+    maxItems: 1
+
+  clocks:
+    maxItems: 1
+
+  clock-names:
+    const: osc
+
+  '#clock-cells':
+    const: 1
+
+  '#reset-cells':
+    const: 2
+    description: |
+      The first cell is the aligned CRG register byte offset. The second
+      cell is a bit index from 0 to 31. Resets assert when the bit is set;
+      there is no active-low flag. Clock and reset RMW operations share
+      the CRG lock. MMC reset requests are at offsets 0xa0, 0x9c and 0x28c,
+      bit4. The MAC reset request is at 0xd0 bit3 and FEPHY at 0x388 bit4.
+      USB controller requests are at 0xb8 and PHY requests at 0xbc.
+
+required:
+  - compatible
+  - reg
+  - clocks
+  - clock-names
+  - '#clock-cells'
+  - '#reset-cells'
+
+additionalProperties: false
+
+examples:
+  - |
+    clock-controller@f8a22000 {
+        compatible = "hisilicon,hi3798mv310-crg", "syscon";
+        reg = <0xf8a22000 0x1000>;
+        clocks = <&osc>;
+        clock-names = "osc";
+        #clock-cells = <1>;
+        #reset-cells = <2>;
+    };
+...
