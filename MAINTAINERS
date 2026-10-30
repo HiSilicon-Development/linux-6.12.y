@@ -10231,6 +10231,12 @@ L:	linux-media@vger.kernel.org
 S:	Orphan
 F:	drivers/media/platform/hisilicon/histb-media-smmu.[ch]
 
+HISILICON HISTB TRANSPORT STREAM DEMULTIPLEXER DRIVER
+L:	linux-media@vger.kernel.org
+S:	Orphan
+F:	Documentation/devicetree/bindings/media/hisilicon,hi3798cv200-demux.yaml
+F:	drivers/media/platform/hisilicon/histb-dmx.c
+
 HISILICON HISTB VIDEO DECODER DRIVER
 L:	linux-media@vger.kernel.org
 S:	Orphan
