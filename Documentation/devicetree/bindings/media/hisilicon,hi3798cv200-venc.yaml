@@ -1,0 +1,116 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/media/hisilicon,hi3798cv200-venc.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: HiSilicon HiSTB video encoders
+
+maintainers:
+  - linux-media@vger.kernel.org
+
+description:
+  Hi3798CV200 uses the first-generation VEDU H.264 encoder and a separate
+  JPGE block. Hi3798MV310 uses V500 for H.264 and HEVC encoding, with a
+  separate SMMU clock and reset. They have different register protocols.
+
+properties:
+  compatible:
+    enum:
+      - hisilicon,hi3798cv200-venc
+      - hisilicon,hi3798mv310-venc
+
+  reg:
+    maxItems: 1
+
+  interrupts:
+    maxItems: 1
+
+  clocks:
+    minItems: 2
+    items:
+      - description: Video encoder core clock
+      - description: Video encoder AXI clock
+      - description: Video encoder SMMU clock
+
+  clock-names:
+    minItems: 2
+    items:
+      - const: core
+      - const: axi
+      - const: smmu
+
+  resets:
+    minItems: 1
+    maxItems: 2
+
+  reset-names:
+    oneOf:
+      - const: venc
+      - items:
+          - const: core
+          - const: smmu
+
+  assigned-clocks:
+    maxItems: 1
+
+  assigned-clock-rates:
+    maxItems: 1
+
+  memory-region:
+    maxItems: 1
+    description: Dedicated DMA pool for encoder bitstream and reconstruction buffers.
+required:
+  - compatible
+  - reg
+  - interrupts
+  - clocks
+  - clock-names
+  - resets
+  - reset-names
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          const: hisilicon,hi3798cv200-venc
+    then:
+      properties:
+        clocks:
+          maxItems: 2
+        clock-names:
+          maxItems: 2
+        resets:
+          maxItems: 1
+        reset-names:
+          const: venc
+    else:
+      properties:
+        clocks:
+          minItems: 3
+        clock-names:
+          minItems: 3
+        resets:
+          minItems: 2
+        reset-names:
+          items:
+            - const: core
+            - const: smmu
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/clock/histb-clock.h>
+    #include <dt-bindings/interrupt-controller/arm-gic.h>
+
+    video-codec@f8c80000 {
+        compatible = "hisilicon,hi3798cv200-venc";
+        reg = <0xf8c80000 0x10000>;
+        interrupts = <GIC_SPI 101 IRQ_TYPE_LEVEL_HIGH>;
+        clocks = <&crg HISTB_VENC_CORE_CLK>,
+                 <&crg HISTB_VENC_AXI_CLK>;
+        clock-names = "core", "axi";
+        resets = <&crg 0x8c 4>;
+        reset-names = "venc";
+    };

@@ -10242,6 +10242,13 @@ F:	firmware/hisilicon/generate-avsp.py
 F:	firmware/hisilicon/generate-h264-cabac.py
 F:	firmware/hisilicon/generate-hevc-cabac.py
 
+HISILICON HISTB VIDEO ENCODER DRIVER
+L:	linux-media@vger.kernel.org
+S:	Orphan
+F:	Documentation/ABI/testing/sysfs-driver-histb-venc
+F:	Documentation/devicetree/bindings/media/hisilicon,hi3798cv200-venc.yaml
+F:	drivers/media/platform/hisilicon/histb-venc-*.[ch]
+
 HISILICON HNS3 PMU DRIVER
 M:	Jijie Shao <shaojijie@huawei.com>
 S:	Supported
