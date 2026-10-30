@@ -18,4 +18,34 @@ config KUNPENG_HCCS
 	  Say M here if you want to include support for querying the
 	  health status and port information of HCCS on Kunpeng SoC.
 
+config SOC_HI3798CV200
+	bool "HiSilicon Hi3798CV200 SoC support"
+	help
+	  Enable SoC-specific integration for the HiSilicon Hi3798CV200.
+	  This gates extensions to shared HiSilicon and ARM peripheral drivers
+	  so builds for other SoCs retain their upstream behavior. Runtime
+	  compatible data still selects each hardware-specific operation.
+
+config HISTB_RTL8211F_LED
+	bool "HiSTB RTL8211F link and activity LED wiring"
+	depends on SOC_HI3798CV200 && OF && PHYLIB=y
+	help
+	  Configure RTL8211F LEDs as link and activity indicators when the
+	  PHY node has realtek,led-link-activity. This requires the exact
+	  RTL8211F PHY ID at MDIO address 3 and does not disable EEE power
+	  saving or change the PHY driver or RGMII delays.
+
+	  The fixup is registered before MDIO probing and reapplied by PHY
+	  hardware initialization. PHY nodes without this property are ignored.
+
+config HI3798MV310_IRQ_PROBE
+	bool "Hi3798MV310 CPU0 timer IRQ bring-up probe"
+	depends on ARCH_HISI_HISTB && ARM64 && OF && PROC_FS && DEBUG_KERNEL
+	help
+	  Build a RAM bring-up diagnostic for the BSP's hisilicon,hisp804
+	  CPU0 timer. Requires a single online CPU. Root can arm one 100ms
+	  hardware event or software-pend only the IRQ owned by this driver
+	  through /proc/ec6110t_irq_probe. Does not replace clockevents or
+	  the clocksource. Leave disabled for normal kernels.
+
 endmenu
