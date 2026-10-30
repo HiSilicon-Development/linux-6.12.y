@@ -181,7 +181,7 @@ struct dmxdev {
 	int capabilities;
 
 	unsigned int may_do_mmap:1;
-	unsigned int exit:1;
+	bool exit;
 #define DMXDEV_CAP_DUPLEX 1
 	struct dmx_frontend *dvr_orig_fe;
 
