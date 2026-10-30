@@ -14,6 +14,9 @@ obj-$(CONFIG_DVB_USB_ANYSEE) += dvb-usb-anysee.o
 dvb-usb-au6610-objs := au6610.o
 obj-$(CONFIG_DVB_USB_AU6610) += dvb-usb-au6610.o
 
+dvb-usb-avl6381-objs := avl6381-usb.o
+obj-$(CONFIG_DVB_USB_AVL6381) += dvb-usb-avl6381.o
+
 dvb-usb-az6007-objs := az6007.o
 obj-$(CONFIG_DVB_USB_AZ6007) += dvb-usb-az6007.o
 
@@ -26,8 +29,20 @@ obj-$(CONFIG_DVB_USB_EC168) += dvb-usb-ec168.o
 dvb-usb-lmedm04-objs := lmedm04.o
 obj-$(CONFIG_DVB_USB_LME2510) += dvb-usb-lmedm04.o
 
+dvb-usb-lme2510-dtmb-objs := lme2510-dtmb.o
+obj-$(CONFIG_DVB_USB_LME2510_DTMB) += dvb-usb-lme2510-dtmb.o
+
 dvb-usb-gl861-objs := gl861.o
 obj-$(CONFIG_DVB_USB_GL861) += dvb-usb-gl861.o
+
+dvb-usb-hd2312-objs := hd2312.o
+obj-$(CONFIG_DVB_USB_HD2312) += dvb-usb-hd2312.o
+
+dvb-usb-icast-objs := icast.o
+obj-$(CONFIG_DVB_USB_ICAST) += dvb-usb-icast.o
+dvb-usb-em28xx-dtmb-objs := em28xx-dtmb-core.o em28xx-dtmb-usb.o em28xx-dtmb-dt5236.o
+obj-$(CONFIG_DVB_USB_EM28XX_DTMB) += dvb-usb-em28xx-dtmb.o
+
 
 dvb-usb-mxl111sf-objs += mxl111sf.o mxl111sf-phy.o mxl111sf-i2c.o
 dvb-usb-mxl111sf-objs += mxl111sf-gpio.o
