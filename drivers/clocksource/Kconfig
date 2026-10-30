@@ -237,6 +237,19 @@ config NSPIRE_TIMER
 	help
 	  Enables support for the Nspire timer.
 
+config HISI_HI3798CV200_TIMER
+	bool "Support for the HiSilicon Hi3798CV200 system timers"
+	depends on ARM || ARM64
+	depends on SOC_HI3798CV200 || COMPILE_TEST
+	depends on GENERIC_SCHED_CLOCK && HAVE_CLK
+	default y if ARCH_HIX5HD2
+	select TIMER_OF
+	help
+	  Enable the free-running clocksource and per-CPU clock event channels
+	  found in the HiSilicon Hi3798CV200 SoC. The driver uses one timer as
+	  the system counter and one interrupt-driven timer for each CPU. This
+	  preserves the original per-CPU timer topology after the boot handoff.
+
 config KEYSTONE_TIMER
 	bool "Keystone timer driver" if COMPILE_TEST
 	depends on ARM || ARM64

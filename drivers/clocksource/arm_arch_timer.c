@@ -28,6 +28,8 @@
 #include <linux/acpi.h>
 #include <linux/arm-smccc.h>
 #include <linux/ptp_kvm.h>
+#include <linux/proc_fs.h>
+#include <linux/seq_file.h>
 
 #include <asm/arch_timer.h>
 #include <asm/virt.h>
@@ -101,6 +103,74 @@ static int __init early_evtstrm_cfg(char *buf)
 	return kstrtobool(buf, &evtstrm_enable);
 }
 early_param("clocksource.arm_arch_timer.evtstrm", early_evtstrm_cfg);
+
+#if defined(CONFIG_ARM64) && defined(CONFIG_PROC_FS)
+static bool snapshot_enabled __initdata;
+
+static int __init early_snapshot_cfg(char *buf)
+{
+	return kstrtobool(buf, &snapshot_enabled);
+}
+early_param("clocksource.arm_arch_timer.snapshot", early_snapshot_cfg);
+
+static int arch_timer_snapshot_show(struct seq_file *m, void *v)
+{
+	u64 pct_before, pct_after, vct, pcval, vcval, daif, el, kctl;
+	u32 pctl, ptval, vctl, vtval, freq;
+	unsigned long flags;
+	int cpu;
+
+	/* Pin the banked registers; do not let the timer handler reprogram CVAL. */
+	cpu = get_cpu();
+	daif = read_sysreg(daif);
+	local_irq_save(flags);
+	isb();
+	el = read_sysreg(CurrentEL);
+	kctl = read_sysreg(cntkctl_el1);
+	freq = read_sysreg(cntfrq_el0);
+	pct_before = read_sysreg(cntpct_el0);
+	pctl = read_sysreg(cntp_ctl_el0);
+	pcval = read_sysreg(cntp_cval_el0);
+	ptval = read_sysreg(cntp_tval_el0);
+	vct = read_sysreg(cntvct_el0);
+	vctl = read_sysreg(cntv_ctl_el0);
+	vcval = read_sysreg(cntv_cval_el0);
+	vtval = read_sysreg(cntv_tval_el0);
+	pct_after = read_sysreg(cntpct_el0);
+	local_irq_restore(flags);
+	put_cpu();
+
+	seq_puts(m, "ARCH_TIMER_SNAPSHOT_BEGIN readonly no-timer-writes\n");
+	seq_printf(m, "CPU=%d CurrentEL=0x%llx DAIF_BEFORE=0x%llx CNTKCTL=0x%llx\n",
+		   cpu, el, daif, kctl);
+	seq_printf(m, "SELECTED_PPI=%s LINUX_IRQ=%d CNTFRQ=%u\n",
+		   arch_timer_ppi_names[arch_timer_uses_ppi],
+		   arch_timer_ppi[arch_timer_uses_ppi], freq);
+	seq_printf(m, "CNTPCT_BEFORE=0x%016llx CNTPCT_AFTER=0x%016llx\n",
+		   pct_before, pct_after);
+	seq_printf(m, "CNTP_CTL=0x%08x CNTP_CVAL=0x%016llx CNTP_TVAL=0x%08x\n",
+		   pctl, pcval, ptval);
+	seq_printf(m, "CNTVCT=0x%016llx CNTV_CTL=0x%08x CNTV_CVAL=0x%016llx CNTV_TVAL=0x%08x\n",
+		   vct, vctl, vcval, vtval);
+	seq_puts(m, "ARCH_TIMER_SNAPSHOT_END\n");
+	return 0;
+}
+
+static int __init arch_timer_snapshot_init(void)
+{
+	if (!snapshot_enabled || !arch_timer_evt)
+		return 0;
+	/* A virtual-only guest need not have access to the physical registers. */
+	if (arch_timer_uses_ppi == ARCH_TIMER_VIRT_PPI) {
+		pr_warn("register snapshot requires physical timer access\n");
+		return -EOPNOTSUPP;
+	}
+
+	return proc_create_single("arch_timer_snapshot", 0400, NULL,
+				  arch_timer_snapshot_show) ? 0 : -ENOMEM;
+}
+late_initcall(arch_timer_snapshot_init);
+#endif
 
 /*
  * Makes an educated guess at a valid counter width based on the Generic Timer
