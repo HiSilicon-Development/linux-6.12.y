@@ -273,7 +273,8 @@ no-dot-config-targets := $(clean-targets) \
 			 cscope gtags TAGS tags help% %docs check% coccicheck \
 			 $(version_h) headers headers_% archheaders archscripts \
 			 %asm-generic kernelversion %src-pkg dt_binding_check \
-			 outputmakefile rustavailable rustfmt rustfmtcheck
+                                 outputmakefile rustavailable rustfmt rustfmtcheck \
+                                 hisilicon-firmware
 no-sync-config-targets := $(no-dot-config-targets) %install modules_sign kernelrelease \
 			  image_name
 single-targets := %.a %.i %.ko %.lds %.ll %.lst %.mod %.o %.rsi %.s %.symtypes %/
@@ -1227,6 +1228,10 @@ include/config/kernel.release: FORCE
 PHONY += scripts
 scripts: scripts_basic scripts_dtc
 	$(Q)$(MAKE) $(build)=$(@)
+
+PHONY += hisilicon-firmware
+hisilicon-firmware:
+	$(Q)$(MAKE) -C $(srctree)/firmware/hisilicon OUT=$(abs_objtree)/firmware/hisilicon PYTHON=$(PYTHON3)
 
 # Things we need to do before we recursively start building the kernel
 # or the modules are listed in "prepare".
