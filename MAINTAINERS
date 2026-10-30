@@ -10243,6 +10243,12 @@ S:	Orphan
 F:	Documentation/devicetree/bindings/media/hisilicon,hi3798cv200-jpge.yaml
 F:	drivers/media/platform/hisilicon/histb-jpge.c
 
+HISILICON HISTB PNG DECODER DRIVER
+L:	linux-media@vger.kernel.org
+S:	Orphan
+F:	Documentation/devicetree/bindings/media/hisilicon,hi3798mv310-png.yaml
+F:	drivers/media/platform/hisilicon/histb-png.c
+
 HISILICON HISTB TRANSPORT STREAM DEMULTIPLEXER DRIVER
 L:	linux-media@vger.kernel.org
 S:	Orphan

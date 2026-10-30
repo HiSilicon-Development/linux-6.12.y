@@ -1,0 +1,55 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/media/hisilicon,hi3798mv310-png.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: HiSilicon Hi3798MV310 PNG decoder
+
+maintainers:
+  - linux-media@vger.kernel.org
+
+description:
+  PNG decoder and integrated SMMU. The core register span is 0x120 bytes;
+  the aperture also includes the SMMU registers at offset 0xf000.
+
+properties:
+  compatible:
+    const: hisilicon,hi3798mv310-png
+
+  reg:
+    maxItems: 1
+
+  interrupts:
+    maxItems: 1
+
+  clocks:
+    items:
+      - description: PNG decoder core clock
+      - description: PNG decoder SMMU clock
+
+  clock-names:
+    items:
+      - const: core
+      - const: smmu
+
+  resets:
+    items:
+      - description: PNG decoder core reset
+      - description: PNG decoder SMMU reset
+
+  reset-names:
+    items:
+      - const: core
+      - const: smmu
+
+required:
+  - compatible
+  - reg
+  - interrupts
+  - clocks
+  - clock-names
+  - resets
+  - reset-names
+
+additionalProperties: false
