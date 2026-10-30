@@ -51,6 +51,17 @@ properties:
     description:
       Enable ALDPS mode, ALDPS mode default is disabled after hardware reset.
 
+  realtek,rgmii-use-strap-delays:
+    type: boolean
+    description: |
+      For RTL8211E with the MAC interface mode set to rgmii, select the
+      RXDLY/TXDLY hardware strap pins instead of forcing software delay
+      selection. Only the software override bit is cleared; the software
+      TX/RX delay selection bits and unrelated register fields are preserved.
+      Without this property, rgmii disables both internal delays as usual.
+      Explicit rgmii-id, rgmii-rxid and rgmii-txid modes retain their normal
+      software-controlled behavior.
+
 unevaluatedProperties: false
 
 allOf:

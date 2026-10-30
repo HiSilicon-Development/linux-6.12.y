@@ -588,11 +588,18 @@ static int rtl8211e_config_init(struct phy_device *phydev)
 {
 	int ret = 0, oldpage;
 	u16 val;
+	u16 delay_mask = RTL8211E_CTRL_DELAY | RTL8211E_TX_DELAY |
+			 RTL8211E_RX_DELAY;
 
-	/* enable TX/RX delay for rgmii-* modes, and disable them for rgmii. */
+	/* Explicit delay modes override straps; plain RGMII can retain them. */
 	switch (phydev->interface) {
 	case PHY_INTERFACE_MODE_RGMII:
-		val = RTL8211E_CTRL_DELAY | 0;
+		val = RTL8211E_CTRL_DELAY;
+		if (of_property_read_bool(phydev->mdio.dev.of_node,
+					  "realtek,rgmii-use-strap-delays")) {
+			delay_mask = RTL8211E_CTRL_DELAY;
+			val = 0;
+		}
 		break;
 	case PHY_INTERFACE_MODE_RGMII_ID:
 		val = RTL8211E_CTRL_DELAY | RTL8211E_TX_DELAY | RTL8211E_RX_DELAY;
@@ -624,9 +631,7 @@ static int rtl8211e_config_init(struct phy_device *phydev)
 	if (ret)
 		goto err_restore_page;
 
-	ret = __phy_modify(phydev, 0x1c, RTL8211E_CTRL_DELAY
-			   | RTL8211E_TX_DELAY | RTL8211E_RX_DELAY,
-			   val);
+	ret = __phy_modify(phydev, 0x1c, delay_mask, val);
 
 err_restore_page:
 	return phy_restore_page(phydev, oldpage, ret);
