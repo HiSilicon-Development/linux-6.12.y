@@ -69,6 +69,15 @@ config ARM_HIGHBANK_CPUIDLE
 	help
 	  Select this to enable cpuidle on Calxeda processors.
 
+config HISTB_WFI_CPUIDLE
+	bool "HiSilicon STB WFI CPU idle driver"
+	depends on ARM64 && ARCH_HISI
+	help
+	  Register the architectural WFI state with the CPU idle framework on
+	  HiSilicon HiSTB SoCs which boot without PSCI. This provides standard
+	  idle accounting and governor integration, but does not power down CPU
+	  cores or the shared cluster.
+
 config ARM_KIRKWOOD_CPUIDLE
 	bool "CPU Idle Driver for Marvell Kirkwood SoCs"
 	depends on (MACH_KIRKWOOD || COMPILE_TEST) && !ARM64
