@@ -10,6 +10,7 @@
  * Hybrid USB devices (analog and DVB).
  */
 #include "dvb_usb_common.h"
+#include <linux/overflow.h>
 
 /* URB stuff for streaming */
 
@@ -20,6 +21,7 @@ static void usb_urb_complete(struct urb *urb)
 {
 	struct usb_data_stream *stream = urb->context;
 	int ptype = usb_pipetype(urb->pipe);
+	int ret;
 	int i;
 	u8 *b;
 
@@ -73,7 +75,11 @@ static void usb_urb_complete(struct urb *urb)
 				KBUILD_MODNAME);
 		return;
 	}
-	usb_submit_urb(urb, GFP_ATOMIC);
+	ret = usb_submit_urb(urb, GFP_ATOMIC);
+	if (ret && ret != -ENODEV && ret != -ENOENT && ret != -ESHUTDOWN)
+		dev_err_ratelimited(&stream->udev->dev,
+				    "%s: URB resubmit failed=%d\n",
+				    KBUILD_MODNAME, ret);
 }
 
 int usb_urb_killv2(struct usb_data_stream *stream)
@@ -135,7 +141,7 @@ static int usb_urb_free_urbs(struct usb_data_stream *stream)
 
 static int usb_urb_alloc_bulk_urbs(struct usb_data_stream *stream)
 {
-	int i, j;
+	int i;
 
 	/* allocate the URBs */
 	for (i = 0; i < stream->props.count; i++) {
@@ -143,8 +149,7 @@ static int usb_urb_alloc_bulk_urbs(struct usb_data_stream *stream)
 		stream->urb_list[i] = usb_alloc_urb(0, GFP_ATOMIC);
 		if (!stream->urb_list[i]) {
 			dev_dbg(&stream->udev->dev, "%s: failed\n", __func__);
-			for (j = 0; j < i; j++)
-				usb_free_urb(stream->urb_list[j]);
+			usb_urb_free_urbs(stream);
 			return -ENOMEM;
 		}
 		usb_fill_bulk_urb(stream->urb_list[i],
@@ -173,8 +178,7 @@ static int usb_urb_alloc_isoc_urbs(struct usb_data_stream *stream)
 				stream->props.u.isoc.framesperurb, GFP_ATOMIC);
 		if (!stream->urb_list[i]) {
 			dev_dbg(&stream->udev->dev, "%s: failed\n", __func__);
-			for (j = 0; j < i; j++)
-				usb_free_urb(stream->urb_list[j]);
+			usb_urb_free_urbs(stream);
 			return -ENOMEM;
 		}
 
@@ -247,6 +251,29 @@ static int usb_alloc_stream_buffers(struct usb_data_stream *stream, int num,
 	return 0;
 }
 
+static int usb_urb_buffer_size(const struct usb_data_stream_properties *props)
+{
+	int size;
+
+	if (!props->count || props->count > MAX_NO_URBS_FOR_DATA_STREAM)
+		return -EINVAL;
+
+	if (props->type == USB_BULK) {
+		if (!props->u.bulk.buffersize ||
+		    props->u.bulk.buffersize > INT_MAX)
+			return -EINVAL;
+		return props->u.bulk.buffersize;
+	}
+
+	if (props->type != USB_ISOC || props->u.isoc.framesize <= 0 ||
+	    props->u.isoc.framesperurb <= 0 ||
+	    check_mul_overflow(props->u.isoc.framesize,
+			       props->u.isoc.framesperurb, &size))
+		return -EINVAL;
+
+	return size;
+}
+
 int usb_urb_reconfig(struct usb_data_stream *stream,
 		struct usb_data_stream_properties *props)
 {
@@ -255,16 +282,10 @@ int usb_urb_reconfig(struct usb_data_stream *stream,
 	if (!props)
 		return 0;
 
-	/* check allocated buffers are large enough for the request */
-	if (props->type == USB_BULK) {
-		buf_size = stream->props.u.bulk.buffersize;
-	} else if (props->type == USB_ISOC) {
-		buf_size = props->u.isoc.framesize * props->u.isoc.framesperurb;
-	} else {
-		dev_err(&stream->udev->dev, "%s: invalid endpoint type=%d\n",
-				KBUILD_MODNAME, props->type);
-		return -EINVAL;
-	}
+	/* Check the requested size, not the previous configuration. */
+	buf_size = usb_urb_buffer_size(props);
+	if (buf_size < 0)
+		return buf_size;
 
 	if (stream->buf_num < props->count || stream->buf_size < buf_size) {
 		dev_err(&stream->udev->dev,
@@ -274,7 +295,8 @@ int usb_urb_reconfig(struct usb_data_stream *stream,
 	}
 
 	/* check if all fields are same */
-	if (stream->props.type == props->type &&
+	if (stream->urbs_initialized == props->count &&
+			stream->props.type == props->type &&
 			stream->props.count == props->count &&
 			stream->props.endpoint == props->endpoint) {
 		if (props->type == USB_BULK &&
@@ -306,10 +328,14 @@ int usb_urb_reconfig(struct usb_data_stream *stream,
 int usb_urb_initv2(struct usb_data_stream *stream,
 		const struct usb_data_stream_properties *props)
 {
-	int ret;
+	int ret, buf_size;
 
 	if (!stream || !props)
 		return -EINVAL;
+
+	buf_size = usb_urb_buffer_size(props);
+	if (buf_size < 0)
+		return buf_size;
 
 	memcpy(&stream->props, props, sizeof(*props));
 
