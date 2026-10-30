@@ -12,6 +12,7 @@
 #include <linux/module.h>
 #include <linux/of_address.h>
 #include <linux/platform_device.h>
+#include <linux/property.h>
 #include <linux/regmap.h>
 
 #include "dw_mmc.h"
@@ -22,8 +23,18 @@
 
 #define ALL_INT_CLR		0x1ffff
 
+#define SDMMC_GPIO_DTO_FIX_ENABLE	BIT(23)
+
 /* DLL ctrl reg */
 #define SAP_DLL_CTRL_DLLMODE	BIT(16)
+
+struct dw_mci_hi3798mv200_ops {
+	void (*set_ios)(struct dw_mci *host, struct mmc_ios *ios);
+};
+
+struct dw_mci_hi3798mv200_variant {
+	const struct dw_mci_hi3798mv200_ops *ops;
+};
 
 struct dw_mci_hi3798mv200_priv {
 	struct clk *sample_clk;
@@ -31,9 +42,11 @@ struct dw_mci_hi3798mv200_priv {
 	struct regmap *crg_reg;
 	u32 sap_dll_offset;
 	struct mmc_clk_phase_map phase_map;
+	const struct dw_mci_hi3798mv200_variant *variant;
 };
 
-static void dw_mci_hi3798mv200_set_ios(struct dw_mci *host, struct mmc_ios *ios)
+static void dw_mci_hi3798mv200_set_ios_common(struct dw_mci *host,
+						struct mmc_ios *ios)
 {
 	struct dw_mci_hi3798mv200_priv *priv = host->priv;
 	struct mmc_clk_phase phase = priv->phase_map.phase[ios->timing];
@@ -74,6 +87,26 @@ static void dw_mci_hi3798mv200_set_ios(struct dw_mci *host, struct mmc_ios *ios)
 	}
 }
 
+static void dw_mci_hi3798mv310_set_ios(struct dw_mci *host, struct mmc_ios *ios)
+{
+	u32 val;
+
+	dw_mci_hi3798mv200_set_ios_common(host, ios);
+
+	/* MV310 needs the data-timeout logic fix on every timing transition. */
+	val = mci_readl(host, GPIO);
+	val |= SDMMC_GPIO_DTO_FIX_ENABLE;
+	mci_writel(host, GPIO, val);
+}
+
+static void dw_mci_hi3798mv200_set_ios(struct dw_mci *host,
+					struct mmc_ios *ios)
+{
+	struct dw_mci_hi3798mv200_priv *priv = host->priv;
+
+	priv->variant->ops->set_ios(host, ios);
+}
+
 static inline int dw_mci_hi3798mv200_enable_tuning(struct dw_mci_slot *slot)
 {
 	struct dw_mci_hi3798mv200_priv *priv = slot->host->priv;
@@ -106,7 +139,9 @@ static int dw_mci_hi3798mv200_execute_tuning_mix_mode(struct dw_mci_slot *slot,
 		return ret;
 
 	for (i = 0; i < ARRAY_SIZE(degrees); i++) {
-		clk_set_phase(priv->sample_clk, degrees[i]);
+		ret = clk_set_phase(priv->sample_clk, degrees[i]);
+		if (ret)
+			goto disable_tuning;
 		mci_writel(host, RINTSTS, ALL_INT_CLR);
 
 		/*
@@ -134,6 +169,16 @@ static int dw_mci_hi3798mv200_execute_tuning_mix_mode(struct dw_mci_slot *slot,
 
 		prev_err = err;
 	}
+	if (found)
+		goto tuning_out;
+	ret = -EINVAL;
+	goto disable_tuning;
+
+disable_tuning:
+	if (dw_mci_hi3798mv200_disable_tuning(slot))
+		dev_err(host->dev, "failed to disable tuning DLL\n");
+	mci_writel(host, RINTSTS, ALL_INT_CLR);
+	return ret;
 
 tuning_out:
 	ret = dw_mci_hi3798mv200_disable_tuning(slot);
@@ -162,11 +207,11 @@ tuning_out:
 		priv->phase_map.phase[MMC_TIMING_MMC_HS200].in_deg = degrees[mid];
 		priv->phase_map.phase[MMC_TIMING_MMC_HS400].in_deg = degrees[mid];
 		priv->phase_map.phase[MMC_TIMING_UHS_SDR104].in_deg = degrees[mid];
-
-		clk_set_phase(priv->sample_clk, degrees[mid]);
+		ret = clk_set_phase(priv->sample_clk, degrees[mid]);
+		if (ret)
+			dev_err(host->dev, "failed to select tuned sample phase: %d\n", ret);
 		dev_dbg(host->dev, "Tuning clk_sample[%d, %d], set[%d]\n",
 			raise_point, fall_point, degrees[mid]);
-		ret = 0;
 	} else {
 		dev_err(host->dev, "No valid clk_sample shift!\n");
 		ret = -EINVAL;
@@ -181,11 +226,15 @@ static int dw_mci_hi3798mv200_init(struct dw_mci *host)
 {
 	struct dw_mci_hi3798mv200_priv *priv;
 	struct device_node *np = host->dev->of_node;
+	const struct dw_mci_hi3798mv200_variant *variant;
 	int ret;
 
 	priv = devm_kzalloc(host->dev, sizeof(*priv), GFP_KERNEL);
 	if (!priv)
 		return -ENOMEM;
+
+	variant = device_get_match_data(host->dev);
+	priv->variant = variant;
 
 	mmc_of_parse_clk_phase(host->dev, &priv->phase_map);
 
@@ -212,6 +261,22 @@ static int dw_mci_hi3798mv200_init(struct dw_mci *host)
 	return 0;
 }
 
+static const struct dw_mci_hi3798mv200_ops hi3798mv200_ops = {
+	.set_ios = dw_mci_hi3798mv200_set_ios_common,
+};
+
+static const struct dw_mci_hi3798mv200_ops hi3798mv310_ops = {
+	.set_ios = dw_mci_hi3798mv310_set_ios,
+};
+
+static const struct dw_mci_hi3798mv200_variant hi3798mv200_variant = {
+	.ops = &hi3798mv200_ops,
+};
+
+static const struct dw_mci_hi3798mv200_variant hi3798mv310_variant = {
+	.ops = &hi3798mv310_ops,
+};
+
 static const struct dw_mci_drv_data hi3798mv200_data = {
 	.common_caps = MMC_CAP_CMD23,
 	.init = dw_mci_hi3798mv200_init,
@@ -220,7 +285,8 @@ static const struct dw_mci_drv_data hi3798mv200_data = {
 };
 
 static const struct of_device_id dw_mci_hi3798mv200_match[] = {
-	{ .compatible = "hisilicon,hi3798mv200-dw-mshc" },
+	{ .compatible = "hisilicon,hi3798mv200-dw-mshc", .data = &hi3798mv200_variant },
+	{ .compatible = "hisilicon,hi3798mv310-dw-mshc", .data = &hi3798mv310_variant },
 	{},
 };
 
@@ -246,5 +312,5 @@ static struct platform_driver dw_mci_hi3798mv200_driver = {
 };
 module_platform_driver(dw_mci_hi3798mv200_driver);
 
-MODULE_DESCRIPTION("HiSilicon Hi3798MV200 Specific DW-MSHC Driver Extension");
+MODULE_DESCRIPTION("HiSilicon Hi3798MV200/MV310 Specific DW-MSHC Driver Extension");
 MODULE_LICENSE("GPL");
