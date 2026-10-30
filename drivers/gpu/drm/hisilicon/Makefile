@@ -4,4 +4,5 @@
 # Please keep this list sorted alphabetically
 
 obj-$(CONFIG_DRM_HISI_HIBMC) += hibmc/
+obj-$(CONFIG_DRM_HISI_HISTB) += histb/
 obj-$(CONFIG_DRM_HISI_KIRIN) += kirin/

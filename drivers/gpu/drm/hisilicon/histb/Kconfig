@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+config DRM_HISI_HISTB
+	tristate "DRM support for HiSilicon HiSTB display controllers"
+	depends on DRM && OF && (ARCH_HISI || COMPILE_TEST)
+	select DRM_BRIDGE_CONNECTOR
+	select DRM_DISPLAY_HELPER
+	select DRM_GEM_DMA_HELPER
+	select DRM_KMS_HELPER
+	help
+	  Choose this option to enable DRM/KMS support for the video display
+	  processor found in the HiSilicon Hi3798CV200 and Hi3798MV310.
+	  The driver exposes the primary graphics path through the atomic KMS
+	  API and connects the display controller to an OF graph bridge.
+	  MV310 accepts progressive RGB565/XRGB8888/ARGB8888 scanout up to
+	  4096x2160 at 60 Hz, subject to a 594 MHz pixel-clock ceiling and the
+	  HDMI bridge, sink and clock plan. Scaling and HDR are not supported.
+
+	  If M is selected, the module will be called histb-vdp.

@@ -4,4 +4,5 @@
 # Please keep this list sorted alphabetically
 
 source "drivers/gpu/drm/hisilicon/hibmc/Kconfig"
+source "drivers/gpu/drm/hisilicon/histb/Kconfig"
 source "drivers/gpu/drm/hisilicon/kirin/Kconfig"

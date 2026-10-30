@@ -7627,6 +7627,13 @@ T:	git https://gitlab.freedesktop.org/drm/misc/kernel.git
 F:	Documentation/devicetree/bindings/display/hisilicon/
 F:	drivers/gpu/drm/hisilicon/
 
+DRM DRIVERS FOR HISILICON HISTB
+L:	dri-devel@lists.freedesktop.org
+S:	Orphan
+F:	Documentation/devicetree/bindings/display/hisilicon/hisilicon,hi3798cv200-*.yaml
+F:	drivers/gpu/drm/bridge/hisilicon/
+F:	drivers/gpu/drm/hisilicon/histb/
+
 DRM DRIVERS FOR LIMA
 M:	Qiang Yu <yuq825@gmail.com>
 L:	dri-devel@lists.freedesktop.org
