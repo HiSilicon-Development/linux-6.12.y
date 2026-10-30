@@ -18,6 +18,9 @@
 
 struct platform_device;
 
+/* Shared lock for CRG read/modify/write transactions. */
+extern spinlock_t hisi_clk_lock;
+
 struct hisi_clock_data {
 	struct clk_onecell_data	clk_data;
 	void __iomem		*base;
