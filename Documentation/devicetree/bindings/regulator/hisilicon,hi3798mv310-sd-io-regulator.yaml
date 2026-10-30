@@ -1,0 +1,48 @@
+# SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/regulator/hisilicon,hi3798mv310-sd-io-regulator.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: HiSilicon Hi3798MV310 SD0 3.3 V I/O regulator
+
+maintainers:
+  - Yang Xiwen <forbidden405@outlook.com>
+
+description: |
+  The SD0 I/O supply is controlled by PERI_SD_LDO at peripheral-controller
+  offset 0x11c. Bits 6 and 5 enable 3.3 V bypass, with bit 4 cleared.
+  This binding exposes only 3.3 V signalling, not UHS voltage switching.
+
+allOf:
+  - $ref: regulator.yaml#
+
+properties:
+  compatible:
+    const: hisilicon,hi3798mv310-sd-io-regulator
+
+  hisilicon,peripheral-syscon:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: Peripheral system controller containing PERI_SD_LDO.
+
+  regulator-min-microvolt:
+    const: 3300000
+
+  regulator-max-microvolt:
+    const: 3300000
+
+required:
+  - compatible
+  - hisilicon,peripheral-syscon
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    regulator-sd-io {
+        compatible = "hisilicon,hi3798mv310-sd-io-regulator";
+        hisilicon,peripheral-syscon = <&peri_ctrl>;
+        regulator-name = "sd0-io-3v3";
+        regulator-min-microvolt = <3300000>;
+        regulator-max-microvolt = <3300000>;
+    };
