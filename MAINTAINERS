@@ -10249,6 +10249,13 @@ F:	Documentation/ABI/testing/sysfs-driver-histb-venc
 F:	Documentation/devicetree/bindings/media/hisilicon,hi3798cv200-venc.yaml
 F:	drivers/media/platform/hisilicon/histb-venc-*.[ch]
 
+HISILICON HISTB VIDEO POST-PROCESSING DRIVER
+L:	linux-media@vger.kernel.org
+S:	Orphan
+F:	Documentation/devicetree/bindings/media/hisilicon,hi3798cv200-vpss.yaml
+F:	drivers/media/platform/hisilicon/histb-vpss.[ch]
+F:	include/uapi/linux/histb-vpss.h
+
 HISILICON HNS3 PMU DRIVER
 M:	Jijie Shao <shaojijie@huawei.com>
 S:	Supported
