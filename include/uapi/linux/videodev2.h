@@ -764,6 +764,8 @@ struct v4l2_pix_format {
 #define V4L2_PIX_FMT_FWHT_STATELESS     v4l2_fourcc('S', 'F', 'W', 'H') /* Stateless FWHT (vicodec) */
 #define V4L2_PIX_FMT_H264_SLICE v4l2_fourcc('S', '2', '6', '4') /* H264 parsed slices */
 #define V4L2_PIX_FMT_HEVC_SLICE v4l2_fourcc('S', '2', '6', '5') /* HEVC parsed slices */
+#define V4L2_PIX_FMT_AVS_SLICE  v4l2_fourcc('S', 'A', 'V', 'S') /* AVS parsed slices */
+#define V4L2_PIX_FMT_AVS2       v4l2_fourcc('A', 'V', 'S', '2') /* AVS2 Annex-B access units */
 #define V4L2_PIX_FMT_AV1_FRAME v4l2_fourcc('A', 'V', '1', 'F') /* AV1 parsed frame */
 #define V4L2_PIX_FMT_SPK      v4l2_fourcc('S', 'P', 'K', '0') /* Sorenson Spark */
 #define V4L2_PIX_FMT_RV30     v4l2_fourcc('R', 'V', '3', '0') /* RealVideo 8 */
@@ -1871,6 +1873,10 @@ struct v4l2_ext_control {
 		struct v4l2_ctrl_hevc_slice_params __user *p_hevc_slice_params;
 		struct v4l2_ctrl_hevc_scaling_matrix __user *p_hevc_scaling_matrix;
 		struct v4l2_ctrl_hevc_decode_params __user *p_hevc_decode_params;
+		struct v4l2_ctrl_avs_sequence __user *p_avs_sequence;
+		struct v4l2_ctrl_avs_picture __user *p_avs_picture;
+		struct v4l2_ctrl_avs_slice_params __user *p_avs_slice_params;
+		struct v4l2_ctrl_avs_decode_params __user *p_avs_decode_params;
 		struct v4l2_ctrl_av1_sequence __user *p_av1_sequence;
 		struct v4l2_ctrl_av1_tile_group_entry __user *p_av1_tile_group_entry;
 		struct v4l2_ctrl_av1_frame __user *p_av1_frame;
@@ -1955,6 +1961,11 @@ enum v4l2_ctrl_type {
 	V4L2_CTRL_TYPE_AV1_TILE_GROUP_ENTRY = 0x281,
 	V4L2_CTRL_TYPE_AV1_FRAME	    = 0x282,
 	V4L2_CTRL_TYPE_AV1_FILM_GRAIN	    = 0x283,
+
+	V4L2_CTRL_TYPE_AVS_SEQUENCE	    = 0x0290,
+	V4L2_CTRL_TYPE_AVS_PICTURE	    = 0x0291,
+	V4L2_CTRL_TYPE_AVS_SLICE_PARAMS     = 0x0292,
+	V4L2_CTRL_TYPE_AVS_DECODE_PARAMS    = 0x0293,
 };
 
 /*  Used in the VIDIOC_QUERYCTRL ioctl for querying controls */
