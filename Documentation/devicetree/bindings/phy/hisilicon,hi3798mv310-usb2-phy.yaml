@@ -1,0 +1,158 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/phy/hisilicon,hi3798mv310-usb2-phy.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: HiSilicon Hi3798MV310 USB2 PHY
+
+maintainers:
+  - Shawn Guo <shawn.guo@linaro.org>
+
+description: |
+  The USB2 PHY complex used by the Huawei EC6110T 760 firmware has three
+  native memory-mapped ports. Ports 0 and 1 share a register window with
+  a 0x400-byte stride; port 2 has a separate window. Their reference
+  clocks, power-on resets, controller clocks and controller resets must
+  be sequenced together. These resources belong to this PHY provider,
+  not to individual EHCI or OHCI consumers. Companion controllers may
+  reference the same PHY ports; the hardware remains enabled until the
+  last PHY consumer releases it.
+
+  The initialization and analog profile follow static analysis of the
+  EC6110T 760 U-Boot image, not the older two-port MV310 BSP or MV300
+  analog tuning. This does not establish universal MV310 analog values
+  or hardware runtime validation. The observed firmware shutdown asserts
+  resets but leaves clocks enabled; the generic PHY provider additionally
+  releases its own clock enables after the final consumer powers off.
+
+  This interface is distinct from the serial test-port programming
+  interface used on Hi3798CV200. It does not describe VBUS switching or
+  select a USB host/device role.
+
+properties:
+  compatible:
+    const: hisilicon,hi3798mv310-usb2-phy
+
+  reg:
+    items:
+      - description: Two-port PHY register window at 0xf9865000, size 0x1000.
+      - description: Third-port PHY register window at 0xf9960000, size 0x1000.
+
+  reg-names:
+    items:
+      - const: phy01
+      - const: phy2
+
+  '#phy-cells':
+    const: 1
+    description: PHY port index, 0, 1 or 2.
+
+  clocks:
+    items:
+      - description: Ports 0 and 1 reference clock (CRG 0xbc bit 0)
+      - description: Port 2 reference clock (CRG 0xbc bit 2)
+      - description: USB2 bus clock (CRG 0xb8 bit 0)
+      - description: OHCI 48 MHz clock (CRG 0xb8 bit 1)
+      - description: OHCI 12 MHz clock (CRG 0xb8 bit 2)
+      - description: OTG UTMI clock (CRG 0xb8 bit 3)
+      - description: Host PHY clock (CRG 0xb8 bit 4)
+      - description: Port 0 UTMI clock (CRG 0xb8 bit 5)
+      - description: Port 1 UTMI clock (CRG 0xb8 bit 6)
+      - description: Port 2 UTMI clock (CRG 0xb8 bit 7)
+
+  clock-names:
+    items:
+      - const: ref
+      - const: ref2
+      - const: bus
+      - const: ohci48
+      - const: ohci12
+      - const: otg-utmi
+      - const: host-phy
+      - const: utmi0
+      - const: utmi1
+      - const: utmi2
+
+  resets:
+    items:
+      - description: USB2 bus reset (CRG 0xb8 bit 12)
+      - description: Port 0 controller UTMI reset (CRG 0xb8 bit 13)
+      - description: Port 1 controller UTMI reset (CRG 0xb8 bit 14)
+      - description: Port 2 controller UTMI reset (CRG 0xb8 bit 15)
+      - description: Host PHY system reset (CRG 0xb8 bit 16)
+      - description: OTG PHY system reset (CRG 0xb8 bit 17)
+      - description: Ports 0 and 1 power-on reset (CRG 0xbc bit 4)
+      - description: Port 2 power-on reset (CRG 0xbc bit 6)
+      - description: PHY port 0 reset (CRG 0xbc bit 8)
+      - description: PHY port 1 reset (CRG 0xbc bit 9)
+      - description: PHY port 2 reset (CRG 0xbc bit 10)
+      - description: Ports 0 and 1 test reset (CRG 0xbc bit 16)
+      - description: Port 2 test reset (CRG 0xbc bit 15)
+
+  reset-names:
+    items:
+      - const: bus
+      - const: utmi0
+      - const: utmi1
+      - const: utmi2
+      - const: host-phy
+      - const: otg-phy
+      - const: por
+      - const: por2
+      - const: port0
+      - const: port1
+      - const: port2
+      - const: phy-test
+      - const: phy-test2
+
+  hisilicon,peripheral-syscon:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: |
+      Peripheral controller syscon at 0xf8a20000. The ASIC USB interface
+      setup clears the word-interface and INCR16 bits (0 and 9) at 0x12c.
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - '#phy-cells'
+  - clocks
+  - clock-names
+  - resets
+  - reset-names
+  - hisilicon,peripheral-syscon
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/clock/hi3798mv310-clock.h>
+
+    usb2_phy: phy@f9865000 {
+        compatible = "hisilicon,hi3798mv310-usb2-phy";
+        reg = <0xf9865000 0x1000>, <0xf9960000 0x1000>;
+        reg-names = "phy01", "phy2";
+        #phy-cells = <1>;
+        clocks = <&crg HI3798MV310_USB2_REF>,
+                 <&crg HI3798MV310_USB2_REF2>,
+                 <&crg HI3798MV310_USB2_BUS>,
+                 <&crg HI3798MV310_USB2_OHCI48>,
+                 <&crg HI3798MV310_USB2_OHCI12>,
+                 <&crg HI3798MV310_USB2_OTG_UTMI>,
+                 <&crg HI3798MV310_USB2_HOST_PHY>,
+                 <&crg HI3798MV310_USB2_UTMI0>,
+                 <&crg HI3798MV310_USB2_UTMI1>,
+                 <&crg HI3798MV310_USB2_UTMI2>;
+        clock-names = "ref", "ref2", "bus", "ohci48", "ohci12",
+                      "otg-utmi", "host-phy", "utmi0", "utmi1", "utmi2";
+        resets = <&crg 0xb8 12>, <&crg 0xb8 13>, <&crg 0xb8 14>,
+                 <&crg 0xb8 15>, <&crg 0xb8 16>, <&crg 0xb8 17>,
+                 <&crg 0xbc 4>, <&crg 0xbc 6>, <&crg 0xbc 8>,
+                 <&crg 0xbc 9>, <&crg 0xbc 10>, <&crg 0xbc 16>,
+                 <&crg 0xbc 15>;
+        reset-names = "bus", "utmi0", "utmi1", "utmi2", "host-phy",
+                      "otg-phy", "por", "por2", "port0", "port1",
+                      "port2", "phy-test", "phy-test2";
+        hisilicon,peripheral-syscon = <&peri_ctrl>;
+    };
