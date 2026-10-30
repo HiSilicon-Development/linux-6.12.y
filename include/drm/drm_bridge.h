@@ -849,6 +849,13 @@ struct drm_bridge {
 	unsigned int supported_formats;
 
 	/**
+	 * @color_format_property: Expose the generic connector color-format
+	 * property for this HDMI bridge. Drivers must opt in because attaching
+	 * the property changes the userspace-visible connector ABI.
+	 */
+	bool color_format_property;
+
+	/**
 	 * @max_bpc: Maximum bits per char the HDMI bridge supports. Allowed
 	 * values are 8, 10 and 12. This is only relevant if
 	 * @DRM_BRIDGE_OP_HDMI is set.

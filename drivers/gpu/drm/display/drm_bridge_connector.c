@@ -396,10 +396,7 @@ struct drm_connector *drm_bridge_connector_init(struct drm_device *drm,
 
 	bridge_connector->encoder = encoder;
 
-	/*
-	 * TODO: Handle doublescan_allowed, stereo_allowed and
-	 * ycbcr_420_allowed.
-	 */
+	/* TODO: Handle doublescan_allowed and stereo_allowed. */
 	connector = &bridge_connector->base;
 	connector->interlace_allowed = true;
 
@@ -457,6 +454,11 @@ struct drm_connector *drm_bridge_connector_init(struct drm_device *drm,
 	if (connector_type == DRM_MODE_CONNECTOR_Unknown)
 		return ERR_PTR(-EINVAL);
 
+	if (bridge_connector->bridge_hdmi &&
+	    bridge_connector->bridge_hdmi->color_format_property)
+		connector->ycbcr_420_allowed =
+			!!(supported_formats & BIT(HDMI_COLORSPACE_YUV420));
+
 	if (bridge_connector->bridge_hdmi)
 		ret = drmm_connector_hdmi_init(drm, connector,
 					       bridge_connector->bridge_hdmi->vendor,
@@ -472,6 +474,14 @@ struct drm_connector *drm_bridge_connector_init(struct drm_device *drm,
 					  connector_type, ddc);
 	if (ret)
 		return ERR_PTR(ret);
+
+	if (bridge_connector->bridge_hdmi &&
+	    bridge_connector->bridge_hdmi->color_format_property) {
+		ret = drm_connector_attach_color_format_property(connector,
+							 supported_formats);
+		if (ret)
+			return ERR_PTR(ret);
+	}
 
 	drm_connector_helper_add(connector, &drm_bridge_connector_helper_funcs);
 
