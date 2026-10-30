@@ -241,6 +241,15 @@ PHONY += virtconfig
 virtconfig:
 	$(call merge_into_defconfig_override,defconfig,virt)
 
+PHONY += dvbip_1001_defconfig dvbip_1002_defconfig \
+	 dvbip_1004_defconfig dvbip_1006_defconfig
+dvbip_1001_defconfig dvbip_1002_defconfig \
+dvbip_1004_defconfig dvbip_1006_defconfig:
+	$(Q)$(CONFIG_SHELL) $(srctree)/scripts/kconfig/merge_config.sh -m \
+		-O $(objtree) $(srctree)/arch/arm64/configs/hi3798cv200_defconfig \
+		$(srctree)/arch/arm64/configs/$@
+	+$(Q)$(MAKE) -f $(srctree)/Makefile olddefconfig
+
 define archhelp
   echo  '* Image.gz      - Compressed kernel image (arch/$(ARCH)/boot/Image.gz)'
   echo  '  Image         - Uncompressed kernel image (arch/$(ARCH)/boot/Image)'
