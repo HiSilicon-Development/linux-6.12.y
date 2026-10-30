@@ -11,15 +11,68 @@ maintainers:
 
 allOf:
   - $ref: thermal-sensor.yaml
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - hisilicon,hi3798cv200-tsensor
+              - hisilicon,hi3798mv310-tsensor
+    then:
+      properties:
+        clocks: false
+        clock-names: false
+    else:
+      required:
+        - interrupts
+  - if:
+      properties:
+        compatible:
+          const: hisilicon,hi3798mv310-tsensor
+    then:
+      properties:
+        reg:
+          maxItems: 1
+        reg-names:
+          items:
+            - const: sensor
+        nvmem-cells:
+          maxItems: 1
+        nvmem-cell-names:
+          items:
+            - const: temperature
+      required:
+        - reg-names
+        - nvmem-cells
+        - nvmem-cell-names
+    else:
+      properties:
+        reg:
+          maxItems: 1
+        reg-names: false
+        nvmem-cells: false
+        nvmem-cell-names: false
 
 properties:
   compatible:
     enum:
       - hisilicon,tsensor
       - hisilicon,hi3660-tsensor
+      - hisilicon,hi3798cv200-tsensor
+      - hisilicon,hi3798mv310-tsensor
 
   reg:
     maxItems: 1
+
+  reg-names:
+    maxItems: 1
+
+  nvmem-cells:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    description: Reference to the OTP temperature calibration cell.
+  nvmem-cell-names:
+    items:
+      - const: temperature
 
   clocks:
     maxItems: 1
@@ -33,11 +86,9 @@ properties:
 
   '#thermal-sensor-cells':
     const: 1
-
 required:
   - compatible
   - reg
-  - interrupts
   - '#thermal-sensor-cells'
 
 unevaluatedProperties: false

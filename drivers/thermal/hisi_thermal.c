@@ -11,8 +11,14 @@
 
 #include <linux/cpufreq.h>
 #include <linux/delay.h>
+#include <linux/hi3798cv200-thermal.h>
+#include <linux/hwmon.h>
 #include <linux/interrupt.h>
+#include <linux/iopoll.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
+#include <linux/nvmem-consumer.h>
+#include <linux/unaligned.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/io.h>
@@ -37,6 +43,13 @@
 #define HI3660_INT_EN(chan)		(HI3660_OFFSET(chan) + 0x2C)
 #define HI3660_INT_CLR(chan)		(HI3660_OFFSET(chan) + 0x30)
 
+#define HI3798_TEMP_CTRL			0x0
+#define HI3798_TEMP_DATA(chan)		(0x8 + ((chan) * 0x4))
+#define HI3798CV200_TEMP_START		0x6005
+#define HI3798_TEMP_SAMPLE_MASK		GENMASK(9, 0)
+#define HI3798_TEMP_NUM_REGS			4
+#define HI3798_TEMP_NUM_SAMPLES		8
+
 #define HI6220_TEMP_BASE			(-60000)
 #define HI6220_TEMP_RESET			(100000)
 #define HI6220_TEMP_STEP			(785)
@@ -59,13 +72,17 @@ struct hisi_thermal_data;
 struct hisi_thermal_sensor {
 	struct hisi_thermal_data *data;
 	struct thermal_zone_device *tzd;
+#if IS_REACHABLE(CONFIG_HWMON)
+	struct device *hwmon_dev;
+#endif
 	const char *irq_name;
 	uint32_t id;
 	uint32_t thres_temp;
+	bool enabled;
 };
 
 struct hisi_thermal_ops {
-	int (*get_temp)(struct hisi_thermal_sensor *sensor);
+	int (*get_temp)(struct hisi_thermal_sensor *sensor, int *temp);
 	int (*enable_sensor)(struct hisi_thermal_sensor *sensor);
 	int (*disable_sensor)(struct hisi_thermal_sensor *sensor);
 	int (*irq_handler)(struct hisi_thermal_sensor *sensor);
@@ -78,8 +95,16 @@ struct hisi_thermal_data {
 	struct platform_device *pdev;
 	struct clk *clk;
 	void __iomem *regs;
+	/* Serialize the start/read/stop sampling sequence. */
+	struct mutex lock;
 	int nr_sensors;
+	bool suspended;
+	int trim_mc;
 };
+
+/* Protect publication and drain AVS readers before devres frees the sensor. */
+static DEFINE_MUTEX(hi3798cv200_provider_lock);
+static struct hisi_thermal_data *hi3798cv200_provider;
 
 /*
  * The temperature computation on the tsensor is as follow:
@@ -287,18 +312,123 @@ static int hi3660_thermal_irq_handler(struct hisi_thermal_sensor *sensor)
 	return 0;
 }
 
-static int hi6220_thermal_get_temp(struct hisi_thermal_sensor *sensor)
+static int hi6220_thermal_get_temp(struct hisi_thermal_sensor *sensor, int *temp)
 {
 	struct hisi_thermal_data *data = sensor->data;
 
-	return hi6220_thermal_get_temperature(data->regs);
+	*temp = hi6220_thermal_get_temperature(data->regs);
+	return 0;
 }
 
-static int hi3660_thermal_get_temp(struct hisi_thermal_sensor *sensor)
+static int hi3660_thermal_get_temp(struct hisi_thermal_sensor *sensor, int *temp)
 {
 	struct hisi_thermal_data *data = sensor->data;
 
-	return hi3660_thermal_get_temperature(data->regs, sensor->id);
+	*temp = hi3660_thermal_get_temperature(data->regs, sensor->id);
+	return 0;
+}
+
+/* CV200 sampling and conversion: BSP msp/drv/pm/drv_pmoc_intf.c. */
+static int hi3798cv200_thermal_get_temp(struct hisi_thermal_sensor *sensor,
+				       int *temp)
+{
+	struct hisi_thermal_data *data = sensor->data;
+	unsigned int sample_sum = 0;
+	unsigned int value;
+	int average;
+	int i;
+
+	mutex_lock(&data->lock);
+	if (data->suspended) {
+		mutex_unlock(&data->lock);
+		return -EAGAIN;
+	}
+	writel(HI3798CV200_TEMP_START, data->regs + HI3798_TEMP_CTRL);
+	usleep_range(16000, 17000);
+
+	for (i = 0; i < HI3798_TEMP_NUM_REGS; i++) {
+		value = readl(data->regs + HI3798_TEMP_DATA(i));
+		sample_sum += value & HI3798_TEMP_SAMPLE_MASK;
+		sample_sum += (value >> 16) & HI3798_TEMP_SAMPLE_MASK;
+	}
+
+	writel(0, data->regs + HI3798_TEMP_CTRL);
+	mutex_unlock(&data->lock);
+
+	average = sample_sum / HI3798_TEMP_NUM_SAMPLES;
+	if (!average || average == HI3798_TEMP_SAMPLE_MASK)
+		return -EIO;
+
+	*temp = ((((average - 125) * 165) / 806) - 40) * 1000;
+	return 0;
+}
+
+/* MV310 uses a different transfer function and signed OTP correction. */
+static int hi3798mv310_thermal_get_temp(struct hisi_thermal_sensor *sensor,
+				       int *temp)
+{
+	struct hisi_thermal_data *data = sensor->data;
+	u32 value, saved;
+	unsigned int sum = 0;
+	int average, i;
+
+	mutex_lock(&data->lock);
+	if (data->suspended) {
+		mutex_unlock(&data->lock);
+		return -EAGAIN;
+	}
+	saved = readl(data->regs);
+	writel(0x72, data->regs);
+	usleep_range(16000, 17000);
+	for (i = 0; i < HI3798_TEMP_NUM_REGS; i++) {
+		value = readl(data->regs + HI3798_TEMP_DATA(i));
+		sum += value & HI3798_TEMP_SAMPLE_MASK;
+		sum += (value >> 16) & HI3798_TEMP_SAMPLE_MASK;
+	}
+	writel(saved, data->regs);
+	readl(data->regs);
+	mutex_unlock(&data->lock);
+
+	average = sum / HI3798_TEMP_NUM_SAMPLES;
+	if (!average || average == HI3798_TEMP_SAMPLE_MASK)
+		return -EIO;
+	*temp = ((((average - 138) * 165) / 793) - 40) * 1000 +
+		data->trim_mc;
+	return 0;
+}
+
+int hi3798cv200_avs_get_temp(int *temperature)
+{
+	int ret = -ENODEV;
+
+	mutex_lock(&hi3798cv200_provider_lock);
+	if (hi3798cv200_provider)
+		ret = hi3798cv200_thermal_get_temp(hi3798cv200_provider->sensor,
+						 temperature);
+	mutex_unlock(&hi3798cv200_provider_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(hi3798cv200_avs_get_temp);
+
+static void hi3798cv200_thermal_unpublish(void *arg)
+{
+	mutex_lock(&hi3798cv200_provider_lock);
+	if (hi3798cv200_provider == arg)
+		hi3798cv200_provider = NULL;
+	mutex_unlock(&hi3798cv200_provider_lock);
+}
+
+static int hi3798cv200_thermal_publish(struct hisi_thermal_data *data)
+{
+	int ret = 0;
+
+	mutex_lock(&hi3798cv200_provider_lock);
+	if (hi3798cv200_provider)
+		ret = -EBUSY;
+	else
+		hi3798cv200_provider = data;
+	mutex_unlock(&hi3798cv200_provider_lock);
+	return ret;
 }
 
 static int hi6220_thermal_disable_sensor(struct hisi_thermal_sensor *sensor)
@@ -384,6 +514,26 @@ static int hi3660_thermal_enable_sensor(struct hisi_thermal_sensor *sensor)
 	return 0;
 }
 
+static int hi3798cv200_thermal_enable_sensor(struct hisi_thermal_sensor *sensor)
+{
+	struct hisi_thermal_data *data = sensor->data;
+
+	mutex_lock(&data->lock);
+	data->suspended = false;
+	mutex_unlock(&data->lock);
+	return 0;
+}
+
+static int hi3798cv200_thermal_disable_sensor(struct hisi_thermal_sensor *sensor)
+{
+	struct hisi_thermal_data *data = sensor->data;
+
+	mutex_lock(&data->lock);
+	data->suspended = true;
+	mutex_unlock(&data->lock);
+	return 0;
+}
+
 static int hi6220_thermal_probe(struct hisi_thermal_data *data)
 {
 	struct platform_device *pdev = data->pdev;
@@ -424,15 +574,114 @@ static int hi3660_thermal_probe(struct hisi_thermal_data *data)
 	return 0;
 }
 
+static int hi3798cv200_thermal_probe(struct hisi_thermal_data *data)
+{
+	struct device *dev = &data->pdev->dev;
+
+	data->sensor = devm_kzalloc(dev, sizeof(*data->sensor), GFP_KERNEL);
+	if (!data->sensor)
+		return -ENOMEM;
+
+	data->sensor[0].data = data;
+	data->nr_sensors = 1;
+
+	return 0;
+}
+
+static int hi3798mv310_thermal_probe(struct hisi_thermal_data *data)
+{
+	struct device *dev = &data->pdev->dev;
+	struct nvmem_cell *cell;
+	void *value;
+	size_t len;
+	u32 trim;
+	int ret;
+
+	cell = devm_nvmem_cell_get(dev, "temperature");
+	if (IS_ERR(cell))
+		return PTR_ERR(cell);
+	value = nvmem_cell_read(cell, &len);
+	if (IS_ERR(value))
+		return PTR_ERR(value);
+	if (len != sizeof(trim)) {
+		kfree(value);
+		return -EINVAL;
+	}
+	trim = get_unaligned_le32(value);
+	kfree(value);
+	ret = hi3798cv200_thermal_probe(data);
+	if (ret)
+		return ret;
+	data->trim_mc = ((trim >> 18) & 0xf) * 1000;
+	if (trim & BIT(22))
+		data->trim_mc = -data->trim_mc;
+	return 0;
+}
+
 static int hisi_thermal_get_temp(struct thermal_zone_device *tz, int *temp)
 {
 	struct hisi_thermal_sensor *sensor = thermal_zone_device_priv(tz);
 	struct hisi_thermal_data *data = sensor->data;
 
-	*temp = data->ops->get_temp(sensor);
+	return data->ops->get_temp(sensor, temp);
+}
+
+#if IS_REACHABLE(CONFIG_HWMON)
+static int hisi_thermal_hwmon_read(struct device *dev,
+				   enum hwmon_sensor_types type, u32 attr,
+				  int channel, long *val)
+{
+	struct hisi_thermal_sensor *sensor = dev_get_drvdata(dev);
+	int temperature;
+	int ret;
+
+	if (type != hwmon_temp || channel != 0)
+		return -EOPNOTSUPP;
+
+	switch (attr) {
+	case hwmon_temp_input:
+		ret = thermal_zone_get_temp(sensor->tzd, &temperature);
+		break;
+	case hwmon_temp_crit:
+		ret = thermal_zone_get_crit_temp(sensor->tzd, &temperature);
+		break;
+	default:
+		return -EOPNOTSUPP;
+	}
+
+	if (ret)
+		return ret;
+
+	*val = temperature;
+	return 0;
+}
+
+static umode_t hisi_thermal_hwmon_is_visible(const void *data,
+					     enum hwmon_sensor_types type,
+					     u32 attr, int channel)
+{
+	if (type == hwmon_temp && channel == 0 &&
+	    (attr == hwmon_temp_input || attr == hwmon_temp_crit))
+		return 0444;
 
 	return 0;
 }
+
+static const struct hwmon_channel_info * const hisi_thermal_hwmon_info[] = {
+	HWMON_CHANNEL_INFO(temp, HWMON_T_INPUT | HWMON_T_CRIT),
+	NULL
+};
+
+static const struct hwmon_ops hisi_thermal_hwmon_ops = {
+	.is_visible = hisi_thermal_hwmon_is_visible,
+	.read = hisi_thermal_hwmon_read,
+};
+
+static const struct hwmon_chip_info hisi_thermal_hwmon_chip_info = {
+	.ops = &hisi_thermal_hwmon_ops,
+	.info = hisi_thermal_hwmon_info,
+};
+#endif
 
 static const struct thermal_zone_device_ops hisi_of_thermal_ops = {
 	.get_temp = hisi_thermal_get_temp,
@@ -446,7 +695,8 @@ static irqreturn_t hisi_thermal_alarm_irq_thread(int irq, void *dev)
 
 	data->ops->irq_handler(sensor);
 
-	temp = data->ops->get_temp(sensor);
+	if (data->ops->get_temp(sensor, &temp))
+		return IRQ_HANDLED;
 
 	if (temp >= sensor->thres_temp) {
 		dev_crit(&data->pdev->dev,
@@ -514,6 +764,20 @@ static const struct hisi_thermal_ops hi3660_ops = {
 	.probe		= hi3660_thermal_probe,
 };
 
+static const struct hisi_thermal_ops hi3798cv200_ops = {
+	.get_temp	= hi3798cv200_thermal_get_temp,
+	.enable_sensor	= hi3798cv200_thermal_enable_sensor,
+	.disable_sensor	= hi3798cv200_thermal_disable_sensor,
+	.probe		= hi3798cv200_thermal_probe,
+};
+
+static const struct hisi_thermal_ops hi3798mv310_ops = {
+	.get_temp	= hi3798mv310_thermal_get_temp,
+	.enable_sensor	= hi3798cv200_thermal_enable_sensor,
+	.disable_sensor	= hi3798cv200_thermal_disable_sensor,
+	.probe		= hi3798mv310_thermal_probe,
+};
+
 static const struct of_device_id of_hisi_thermal_match[] = {
 	{
 		.compatible = "hisilicon,tsensor",
@@ -522,6 +786,14 @@ static const struct of_device_id of_hisi_thermal_match[] = {
 	{
 		.compatible = "hisilicon,hi3660-tsensor",
 		.data = &hi3660_ops,
+	},
+	{
+		.compatible = "hisilicon,hi3798cv200-tsensor",
+		.data = &hi3798cv200_ops,
+	},
+	{
+		.compatible = "hisilicon,hi3798mv310-tsensor",
+		.data = &hi3798mv310_ops,
 	},
 	{ /* end */ }
 };
@@ -551,6 +823,8 @@ static int hisi_thermal_probe(struct platform_device *pdev)
 	data->pdev = pdev;
 	platform_set_drvdata(pdev, data);
 	data->ops = of_device_get_match_data(dev);
+	data->suspended = true;
+	mutex_init(&data->lock);
 
 	data->regs = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(data->regs))
@@ -567,32 +841,71 @@ static int hisi_thermal_probe(struct platform_device *pdev)
 		if (ret) {
 			dev_err(dev, "failed to register thermal sensor: %d\n",
 				ret);
-			return ret;
+			goto disable_sensors;
 		}
 
-		ret = platform_get_irq(pdev, 0);
-		if (ret < 0)
-			return ret;
+#if IS_REACHABLE(CONFIG_HWMON)
+		sensor->hwmon_dev =
+			devm_hwmon_device_register_with_info(dev, "hisi_thermal",
+							     sensor,
+							     &hisi_thermal_hwmon_chip_info,
+							     NULL);
+		if (IS_ERR(sensor->hwmon_dev)) {
+			ret = PTR_ERR(sensor->hwmon_dev);
+			dev_warn(dev, "failed to register hwmon interface: %d\n", ret);
+			sensor->hwmon_dev = NULL;
+		}
+#endif
 
-		ret = devm_request_threaded_irq(dev, ret, NULL,
-						hisi_thermal_alarm_irq_thread,
-						IRQF_ONESHOT, sensor->irq_name,
-						sensor);
-		if (ret < 0) {
-			dev_err(dev, "Failed to request alarm irq: %d\n", ret);
-			return ret;
+		if (data->ops->irq_handler) {
+			ret = platform_get_irq(pdev, 0);
+			if (ret < 0)
+				goto disable_sensors;
+
+			ret = devm_request_threaded_irq(dev, ret, NULL,
+							hisi_thermal_alarm_irq_thread,
+							IRQF_ONESHOT,
+							sensor->irq_name, sensor);
+			if (ret < 0) {
+				dev_err(dev, "Failed to request alarm irq: %d\n",
+					ret);
+				goto disable_sensors;
+			}
 		}
 
 		ret = data->ops->enable_sensor(sensor);
 		if (ret) {
 			dev_err(dev, "Failed to setup the sensor: %d\n", ret);
-			return ret;
+			goto disable_sensors;
 		}
 
+		sensor->enabled = true;
 		hisi_thermal_toggle_sensor(sensor, true);
 	}
 
+	if (data->ops == &hi3798cv200_ops) {
+		ret = hi3798cv200_thermal_publish(data);
+		if (ret)
+			goto disable_sensors;
+		ret = devm_add_action_or_reset(dev, hi3798cv200_thermal_unpublish,
+					       data);
+		if (ret)
+			goto disable_sensors;
+	}
+
 	return 0;
+
+disable_sensors:
+	for (i = data->nr_sensors - 1; i >= 0; i--) {
+		struct hisi_thermal_sensor *sensor = &data->sensor[i];
+
+		if (!sensor->enabled)
+			continue;
+		hisi_thermal_toggle_sensor(sensor, false);
+		data->ops->disable_sensor(sensor);
+		sensor->enabled = false;
+	}
+	return ret;
 }
 
 static void hisi_thermal_remove(struct platform_device *pdev)
@@ -600,33 +913,56 @@ static void hisi_thermal_remove(struct platform_device *pdev)
 	struct hisi_thermal_data *data = platform_get_drvdata(pdev);
 	int i;
 
+	hi3798cv200_thermal_unpublish(data);
+
 	for (i = 0; i < data->nr_sensors; i++) {
 		struct hisi_thermal_sensor *sensor = &data->sensor[i];
 
 		hisi_thermal_toggle_sensor(sensor, false);
-		data->ops->disable_sensor(sensor);
+		if (sensor->enabled)
+			data->ops->disable_sensor(sensor);
 	}
 }
 
 static int hisi_thermal_suspend(struct device *dev)
 {
 	struct hisi_thermal_data *data = dev_get_drvdata(dev);
-	int i;
+	int i, ret;
 
-	for (i = 0; i < data->nr_sensors; i++)
-		data->ops->disable_sensor(&data->sensor[i]);
-
+	for (i = 0; i < data->nr_sensors; i++) {
+		ret = data->ops->disable_sensor(&data->sensor[i]);
+		if (ret)
+			goto restore_sensors;
+		data->sensor[i].enabled = false;
+	}
 	return 0;
+
+restore_sensors:
+	while (--i >= 0) {
+		if (!data->ops->enable_sensor(&data->sensor[i]))
+			data->sensor[i].enabled = true;
+	}
+	return ret;
 }
 
 static int hisi_thermal_resume(struct device *dev)
 {
 	struct hisi_thermal_data *data = dev_get_drvdata(dev);
-	int i, ret = 0;
+	int i, ret;
 
-	for (i = 0; i < data->nr_sensors; i++)
-		ret |= data->ops->enable_sensor(&data->sensor[i]);
+	for (i = 0; i < data->nr_sensors; i++) {
+		ret = data->ops->enable_sensor(&data->sensor[i]);
+		if (ret)
+			goto disable_sensors;
+		data->sensor[i].enabled = true;
+	}
+	return 0;
 
+disable_sensors:
+	while (--i >= 0) {
+		data->ops->disable_sensor(&data->sensor[i]);
+		data->sensor[i].enabled = false;
+	}
 	return ret;
 }
 
