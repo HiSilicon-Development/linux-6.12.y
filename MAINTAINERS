@@ -14140,6 +14140,14 @@ F:	Documentation/devicetree/bindings/media/maxlinear,mxl214.yaml
 F:	drivers/media/dvb-frontends/mxl2x4/
 F:	include/media/mxl214.h
 
+MAXLINEAR MXL603 TUNER DRIVER
+M:	Dong Liu
+M:	Mahendra Kondur
+M:	Brenndon Lee
+L:	linux-media@vger.kernel.org
+S:	Supported
+F:	drivers/media/tuners/mxl603.[ch]
+
 MCAN MMIO DEVICE DRIVER
 M:	Chandrasekar Ramakrishnan <rcsekar@samsung.com>
 L:	linux-can@vger.kernel.org
