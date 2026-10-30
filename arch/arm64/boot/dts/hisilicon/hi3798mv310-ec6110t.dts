@@ -1,0 +1,227 @@
+// SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+/dts-v1/;
+#include "hi3798mv310.dtsi"
+#include <dt-bindings/gpio/gpio.h>
+
+/ {
+	model = "Huawei EC6110-T Hi3798MV310 ARM64";
+	compatible = "huawei,ec6110t", "hisilicon,hi3798mv310";
+
+	aliases {
+		serial0 = &uart0;
+		serial1 = &uart2;
+		mmc0 = &emmc;
+		mmc1 = &sd0;
+		mmc2 = &sdio;
+		ethernet0 = &ethernet;
+	};
+
+	chosen {
+		stdout-path = "serial0:115200n8";
+		bootargs = "console=ttyAMA0,115200 earlycon=pl011,0xf8b00000 loglevel=8 ignore_loglevel keep_bootcon printk.time=1 clk_ignore_unused rdinit=/init panic=0";
+	};
+
+	memory@0 {
+		device_type = "memory";
+		reg = <0 0 0 0x40000000>;
+	};
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		handoff@11000000 {
+			reg = <0 0x11000000 0 0x10000>;
+			no-map;
+		};
+
+		/* Keep the vendor's high-memory DMA area out of early bring-up. */
+		boot-reserved@3c000000 {
+			reg = <0 0x3c000000 0 0x4000000>;
+			no-map;
+		};
+
+		/* Reusable: idle decoder pages remain available to Linux. */
+		vdec_reconstruction: dma-pool@18000000 {
+			compatible = "shared-dma-pool";
+			reg = <0 0x18000000 0 0x18000000>;
+			reusable;
+		};
+
+		vdec_capture: dma-pool@4000000 {
+			compatible = "shared-dma-pool";
+			reg = <0 0x04000000 0 0x0c000000>;
+			reusable;
+		};
+	};
+
+	hdmi-connector {
+		compatible = "hdmi-connector";
+		type = "a";
+		port {
+			hdmi_connector_in: endpoint {
+				remote-endpoint = <&hdmi_out>;
+			};
+		};
+	};
+
+	sd_io: regulator-sd-io {
+		compatible = "hisilicon,hi3798mv310-sd-io-regulator";
+		hisilicon,peripheral-syscon = <&peri_ctrl>;
+		regulator-name = "sd0-io-3v3";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+	};
+};
+
+/* The bundled EL3 handoff owns this mailbox; do not claim vendor PSCI. */
+&cpu0 {
+	enable-method = "spin-table";
+	cpu-release-addr = <0 0x1100f000>;
+};
+&cpu1 {
+	enable-method = "spin-table";
+	cpu-release-addr = <0 0x1100f000>;
+};
+&cpu2 {
+	enable-method = "spin-table";
+	cpu-release-addr = <0 0x1100f000>;
+};
+&cpu3 {
+	enable-method = "spin-table";
+	cpu-release-addr = <0 0x1100f000>;
+};
+
+&uart0 {
+	status = "okay";
+};
+
+/* Vendor ttyAMA1/H5 route; retain the observed bootloader clock and pinmux. */
+&uart2 {
+	status = "okay";
+
+	bluetooth {
+		compatible = "realtek,rtl8822bs-bt";
+		/* Reference rtk_rfkill pulses GPIO19 (GPIO2_3) low, then high. */
+		enable-gpios = <&gpio2 3 GPIO_ACTIVE_HIGH>;
+	};
+};
+
+&gpio2 {
+	status = "okay";
+};
+
+&emmc {
+	bus-width = <8>;
+	max-frequency = <50000000>;
+	non-removable;
+	cap-mmc-highspeed;
+	/* BSP MV310 legacy/MMC_HS: sample tap7, drive tap4. */
+	clk-phase-legacy = <315 180>;
+	clk-phase-mmc-hs = <315 180>;
+	no-sd;
+	no-sdio;
+	status = "okay";
+};
+
+&sd0 {
+	bus-width = <4>;
+	max-frequency = <50000000>;
+	cap-sd-highspeed;
+	disable-wp;
+	no-1-8-v;
+	no-mmc;
+	no-sdio;
+	vqmmc-supply = <&sd_io>;
+	pinctrl-names = "default";
+	pinctrl-0 = <&sd0_pins>;
+	/* BSP SD0 legacy/SD_HS: sample tap0, drive tap4. */
+	clk-phase-legacy = <0 180>;
+	clk-phase-sd-hs = <0 180>;
+	status = "okay";
+};
+
+&sdio {
+	bus-width = <4>;
+	max-frequency = <25000000>;
+	non-removable;
+	cap-sd-highspeed;
+	cap-sdio-irq;
+	keep-power-in-suspend;
+	no-1-8-v;
+	no-mmc;
+	no-sd;
+	/* Inherit bootloader mux, bias and supply; do not guess module GPIOs. */
+	clk-phase-legacy = <0 180>;
+	clk-phase-sd-hs = <0 180>;
+	status = "okay";
+};
+
+&usb2_phy {
+	status = "okay";
+};
+&ohci {
+	status = "okay";
+};
+&ehci {
+	status = "okay";
+};
+
+&ethernet {
+	phy-mode = "mii";
+	phy-handle = <&internal_phy>;
+	status = "okay";
+
+	mdio {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		internal_phy: ethernet-phy@2 {
+			reg = <2>;
+		};
+	};
+};
+
+&gpu {
+	status = "okay";
+};
+
+&vdec {
+	memory-region = <&vdec_reconstruction>, <&vdec_capture>;
+	memory-region-names = "reconstruction", "capture";
+	status = "okay";
+};
+
+&jpgd {
+	status = "okay";
+};
+
+&png {
+	status = "okay";
+};
+
+&venc {
+	status = "okay";
+};
+
+&vpss {
+	status = "okay";
+};
+
+&ir {
+	linux,rc-map-name = "rc-ec6110t";
+	status = "okay";
+};
+
+&vdp {
+	status = "okay";
+};
+
+&hdmi {
+	status = "okay";
+};
+
+&hdmi_out {
+	remote-endpoint = <&hdmi_connector_in>;
+};
