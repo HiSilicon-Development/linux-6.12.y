@@ -1,0 +1,57 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/media/hisilicon,hi3798-jpgd.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: HiSilicon HiSTB JPEG decoders
+
+maintainers:
+  - linux-media@vger.kernel.org
+
+description:
+  Stand-alone baseline JPEG decoder with a core and an integrated SMMU.
+  The register aperture includes the SMMU registers at offset 0xf000.
+
+properties:
+  compatible:
+    enum:
+      - hisilicon,hi3798cv200-jpgd
+      - hisilicon,hi3798mv310-jpgd
+
+  reg:
+    maxItems: 1
+
+  interrupts:
+    maxItems: 1
+
+  clocks:
+    items:
+      - description: JPEG decoder core clock
+      - description: JPEG decoder SMMU clock
+
+  clock-names:
+    items:
+      - const: core
+      - const: smmu
+
+  resets:
+    items:
+      - description: JPEG decoder core reset
+      - description: JPEG decoder SMMU reset
+
+  reset-names:
+    items:
+      - const: core
+      - const: smmu
+
+required:
+  - compatible
+  - reg
+  - interrupts
+  - clocks
+  - clock-names
+  - resets
+  - reset-names
+
+additionalProperties: false
