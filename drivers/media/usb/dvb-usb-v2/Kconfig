@@ -46,6 +46,9 @@ config DVB_USB_AF9035
 	select MEDIA_TUNER_IT913X if MEDIA_SUBDRV_AUTOSELECT
 	help
 	  Say Y here to support the Afatech AF9035 based DVB USB receiver.
+	  This is mutually exclusive with DVB_USB_AVL6381: the generic IT9303
+	  binding claims USB ID 048d:9306, which is also claimed by the AVL6381
+	  DTMB binding.
 
 config DVB_USB_ANYSEE
 	tristate "Anysee DVB-T/C USB2.0 support"
@@ -120,6 +123,23 @@ config DVB_USB_GL861
 	  receiver with USB ID 0db0:5581, Friio White ISDB-T receiver
 	  with USB ID 0x7a69:0001.
 
+config DVB_USB_HD2312
+	tristate "HDIC HD2312 DTMB USB2.0 support"
+	depends on DVB_USB_V2
+	help
+	  Say Y here to support Cypress FX2 based DTMB receivers using the
+	  HDIC HD2312 demodulator. This includes known Letv, Aiwa and CVB
+	  firmware variants with USB ID 04b4:1004.
+
+config DVB_USB_ICAST
+	tristate "SMIT iCast DVB-C/DTMB USB2.0 support"
+	depends on DVB_USB_V2
+	help
+	  Say Y here to support SMIT iCast receivers with USB ID 29df:0001.
+	  The receiver's GDHW capability reply selects DVB-C Annex A only
+	  (DTMB:N) or DVB-C Annex A and DTMB (DTMB:Y). Unknown or malformed
+	  capability replies are rejected.
+
 config DVB_USB_LME2510
 	tristate "LME DM04/QQBOX DVB-S USB2.0 support"
 	depends on DVB_USB_V2
@@ -133,7 +153,34 @@ config DVB_USB_LME2510
 	select DVB_M88RS2000 if MEDIA_SUBDRV_AUTOSELECT
 	select DVB_TS2020 if MEDIA_SUBDRV_AUTOSELECT
 	help
-	  Say Y here to support the LME DM04/QQBOX DVB-S USB2.0
+	  Say Y here to support the LME DM04/QQBOX DVB-S USB2.0 receiver.
+	  This is mutually exclusive with DVB_USB_LME2510_DTMB: both bindings
+	  claim USB IDs 3344:1120 and 3344:1122, but use different firmware
+	  and protocols.
+
+config DVB_USB_LME2510_DTMB
+	tristate "LME2510C DTMB USB2.0 support"
+	depends on DVB_USB_V2
+	depends on DVB_USB_LME2510 = n
+	help
+	  Say Y here to support DTMB receivers using an LME2510C USB
+	  bridge, LGS8GL5 demodulator and MAX2165 tuner. This is mutually
+	  exclusive with DVB_USB_LME2510: both bindings claim USB IDs
+	  3344:1120 and 3344:1122, but use different firmware and protocols.
+	  The receiver requires firmware extracted from its Windows driver. Three
+	  firmware files are used for the boot ROM, normal runtime image and the
+	  alternate PID 0x22d0 runtime image. These files are not distributed with
+	  the kernel.
+
+config DVB_USB_EM28XX_DTMB
+	tristate "eMPIA EM28xx DTMB USB2.0 support (Aigo DT5236)"
+	depends on DVB_USB_V2
+	depends on VIDEO_EM28XX = n
+	help
+	  Say Y here to support the Aigo DT5236 DTMB receiver using an
+	  eMPIA EM2884 USB bridge, LGS8GL5 demodulator and XC5000 tuner.
+	  This is mutually exclusive with VIDEO_EM28XX: both bindings claim
+	  USB ID eb1a:2885, but use different board profiles and protocols.
 
 config DVB_USB_MXL111SF
 	tristate "MxL111SF DTV USB2.0 support"
@@ -175,4 +222,15 @@ config DVB_USB_ZD1301
 	help
 	  Say Y here to support the ZyDAS ZD1301 DVB USB receiver.
 
+config DVB_USB_AVL6381
+	tristate "Availink AVL6381 DTMB (IT9303 bridge)"
+	depends on DVB_USB_V2
+	depends on DVB_USB_AF9035 = n
+	select DVB_AVL6381 if MEDIA_SUBDRV_AUTOSELECT
+	select MEDIA_TUNER_MXL603 if MEDIA_SUBDRV_AUTOSELECT
+	help
+	  Say Y here to support the runqida AVL6381 DTMB stick built on
+	  the IT9303 USB bridge (04b4:9306 / 048d:9306). This is mutually
+	  exclusive with DVB_USB_AF9035, whose generic IT9303 binding claims
+	  USB ID 048d:9306.
 endif
