@@ -30,6 +30,9 @@
 #define IR_INTC			0x30
 #define IR_START		0x34
 
+/* CPU MMIO exposes the symbol count in the low seven bits, including 64. */
+#define IR_DATAH_COUNT		GENMASK(6, 0)
+
 /* interrupt mask */
 #define INTMS_SYMBRCV		(BIT(24) | BIT(8))
 #define INTMS_TIMEOUT		(BIT(25) | BIT(9))
@@ -38,6 +41,7 @@
 #define INT_CLR_TIMEOUT		BIT(17)
 #define INT_CLR_RCV		BIT(16)
 #define INT_CLR_RCVTIMEOUT	(BIT(16) | BIT(17))
+#define IR_INT_MASK_SYMBOL	((u32)~GENMASK(18, 16))
 
 #define IR_CLK_ENABLE		BIT(4)
 #define IR_CLK_RESET		BIT(5)
@@ -63,21 +67,30 @@
 
 #define IR_HIX5HD2_NAME		"hix5hd2-ir"
 
-/* Need to set extra bit for enabling IR */
+/* Hi3796CV300 needs an additional enable bit in IR_ENABLE. */
 #define HIX5HD2_FLAG_EXTRA_ENABLE	BIT(0)
 
 struct hix5hd2_soc_data {
 	u32 clk_reg;
 	u32 flags;
-};
-
-static const struct hix5hd2_soc_data hix5hd2_data = {
-	.clk_reg = 0x48,
+	/* The interrupt-level field is programmed with the raw level on this SoC */
+	bool int_level_raw;
+	u32 irq_mask;
 };
 
 static const struct hix5hd2_soc_data hi3796cv300_data = {
 	.clk_reg = 0x60,
 	.flags = HIX5HD2_FLAG_EXTRA_ENABLE,
+};
+
+static const struct hix5hd2_soc_data hi3798cv200_data = {
+	.clk_reg = 0x48,
+	.int_level_raw = true,
+	.irq_mask = IR_INT_MASK_SYMBOL,
+};
+
+static const struct hix5hd2_soc_data hix5hd2_data = {
+	.clk_reg = 0x48,
 };
 
 struct hix5hd2_ir_priv {
@@ -89,31 +102,21 @@ struct hix5hd2_ir_priv {
 	struct clk		*clock;
 	unsigned long		rate;
 	const struct hix5hd2_soc_data *socdata;
+	bool			irq_enabled;
+	bool			registered;
+	bool			clock_enabled;
 };
 
-static int hix5hd2_ir_clk_enable(struct hix5hd2_ir_priv *dev, bool on)
+static int hix5hd2_ir_power(struct hix5hd2_ir_priv *priv, bool on)
 {
-	u32 clk_reg = dev->socdata->clk_reg;
-	u32 val;
-	int ret = 0;
+	u32 mask = IR_CLK_ENABLE | IR_CLK_RESET;
+	u32 val = on ? IR_CLK_ENABLE : IR_CLK_RESET;
 
-	if (dev->regmap) {
-		regmap_read(dev->regmap, clk_reg, &val);
-		if (on) {
-			val &= ~IR_CLK_RESET;
-			val |= IR_CLK_ENABLE;
-		} else {
-			val &= ~IR_CLK_ENABLE;
-			val |= IR_CLK_RESET;
-		}
-		regmap_write(dev->regmap, clk_reg, val);
-	} else {
-		if (on)
-			ret = clk_prepare_enable(dev->clock);
-		else
-			clk_disable_unprepare(dev->clock);
-	}
-	return ret;
+	if (!priv->regmap)
+		return 0;
+
+	return regmap_update_bits(priv->regmap, priv->socdata->clk_reg,
+				  mask, val);
 }
 
 static inline void hix5hd2_ir_enable(struct hix5hd2_ir_priv *priv)
@@ -124,6 +127,45 @@ static inline void hix5hd2_ir_enable(struct hix5hd2_ir_priv *priv)
 		val |= IR_ENABLE_EN_EXTRA;
 
 	writel_relaxed(val, priv->base + IR_ENABLE);
+}
+
+static void hix5hd2_ir_disable(struct hix5hd2_ir_priv *priv)
+{
+	writel(0, priv->base + IR_ENABLE);
+}
+
+static u32 hix5hd2_ir_fifo_count(struct hix5hd2_ir_priv *priv)
+{
+	return readl(priv->base + IR_DATAH) & IR_DATAH_COUNT;
+}
+
+static void hix5hd2_ir_clear_fifo(struct hix5hd2_ir_priv *priv)
+{
+	u32 count, i;
+
+	count = hix5hd2_ir_fifo_count(priv);
+	for (i = 0; i < count; i++)
+		readl(priv->base + IR_DATAL);
+}
+
+static void hix5hd2_ir_stop(struct hix5hd2_ir_priv *priv)
+{
+	writel(~0U, priv->base + IR_INTM);
+	hix5hd2_ir_clear_fifo(priv);
+	writel(~0U, priv->base + IR_INTC);
+	readl(priv->base + IR_INTS);
+	hix5hd2_ir_disable(priv);
+}
+
+/* A level source with an unknown status must not be handed back to the GIC. */
+static void hix5hd2_ir_quench_unknown_irq(struct hix5hd2_ir_priv *priv)
+{
+	writel(~0U, priv->base + IR_INTM);
+	hix5hd2_ir_clear_fifo(priv);
+	writel(~0U, priv->base + IR_INTC);
+	readl(priv->base + IR_INTS);
+	dev_warn_ratelimited(priv->dev,
+			     "quenching unknown interrupt status\n");
 }
 
 static int hix5hd2_ir_config(struct hix5hd2_ir_priv *priv)
@@ -144,18 +186,49 @@ static int hix5hd2_ir_config(struct hix5hd2_ir_priv *priv)
 
 	/* Now only support raw mode, with symbol start from low to high */
 	rate = DIV_ROUND_CLOSEST(priv->rate, 1000000);
-	val = IR_CFG_SYMBOL_MAXWIDTH & IR_CFG_WIDTH_MASK << IR_CFG_WIDTH_SHIFT;
-	val |= IR_CFG_SYMBOL_FMT & IR_CFG_FORMAT_MASK << IR_CFG_FORMAT_SHIFT;
-	val |= (IR_CFG_INT_THRESHOLD - 1) & IR_CFG_INT_LEVEL_MASK
-	       << IR_CFG_INT_LEVEL_SHIFT;
-	val |= IR_CFG_MODE_RAW;
-	val |= (rate - 1) & IR_CFG_FREQ_MASK << IR_CFG_FREQ_SHIFT;
-	writel_relaxed(val, priv->base + IR_CONFIG);
+	if (!rate || rate > IR_CFG_FREQ_MASK + 1)
+		return -EINVAL;
 
-	writel_relaxed(0x00, priv->base + IR_INTM);
-	/* write arbitrary value to start  */
-	writel_relaxed(0x01, priv->base + IR_START);
+	val = (IR_CFG_SYMBOL_MAXWIDTH & IR_CFG_WIDTH_MASK)
+	      << IR_CFG_WIDTH_SHIFT;
+	val |= (IR_CFG_SYMBOL_FMT & IR_CFG_FORMAT_MASK)
+	       << IR_CFG_FORMAT_SHIFT;
+	/*
+	 * CV200 ir_s2 programs the threshold directly; older HIX5HD2
+	 * controllers encode it as threshold minus one.
+	 */
+	val |= ((priv->socdata->int_level_raw ? IR_CFG_INT_THRESHOLD
+					      : IR_CFG_INT_THRESHOLD - 1)
+		& IR_CFG_INT_LEVEL_MASK) << IR_CFG_INT_LEVEL_SHIFT;
+	val |= IR_CFG_MODE_RAW;
+	val |= ((rate - 1) & IR_CFG_FREQ_MASK) << IR_CFG_FREQ_SHIFT;
+
+	writel(val, priv->base + IR_CONFIG);
+
+	hix5hd2_ir_clear_fifo(priv);
+	writel(~0U, priv->base + IR_INTC);
+	readl(priv->base + IR_INTS);
+	/* CV200 masks the key-status sources while receiving raw symbols. */
+	writel(priv->socdata->irq_mask, priv->base + IR_INTM);
+	/* Start symbol capture. */
+	writel(0x01, priv->base + IR_START);
 	return 0;
+}
+
+static void hix5hd2_ir_irq_enable(struct hix5hd2_ir_priv *priv)
+{
+	if (priv->registered && !priv->irq_enabled) {
+		enable_irq(priv->irq);
+		priv->irq_enabled = true;
+	}
+}
+
+static void hix5hd2_ir_irq_disable(struct hix5hd2_ir_priv *priv)
+{
+	if (priv->irq_enabled) {
+		disable_irq(priv->irq);
+		priv->irq_enabled = false;
+	}
 }
 
 static int hix5hd2_ir_open(struct rc_dev *rdev)
@@ -163,86 +236,133 @@ static int hix5hd2_ir_open(struct rc_dev *rdev)
 	struct hix5hd2_ir_priv *priv = rdev->priv;
 	int ret;
 
-	ret = hix5hd2_ir_clk_enable(priv, true);
+	ret = clk_prepare_enable(priv->clock);
 	if (ret)
 		return ret;
+	priv->clock_enabled = true;
+
+	ret = hix5hd2_ir_power(priv, true);
+	if (ret)
+		goto err_clock;
 
 	ret = hix5hd2_ir_config(priv);
-	if (ret) {
-		hix5hd2_ir_clk_enable(priv, false);
-		return ret;
+	if (!ret) {
+		/* Probe enables reception after raw decoder registration completes. */
+		hix5hd2_ir_irq_enable(priv);
+		return 0;
 	}
-	return 0;
+
+	hix5hd2_ir_stop(priv);
+	hix5hd2_ir_power(priv, false);
+err_clock:
+	clk_disable_unprepare(priv->clock);
+	priv->clock_enabled = false;
+	return ret;
 }
 
 static void hix5hd2_ir_close(struct rc_dev *rdev)
 {
 	struct hix5hd2_ir_priv *priv = rdev->priv;
 
-	hix5hd2_ir_clk_enable(priv, false);
+	hix5hd2_ir_irq_disable(priv);
+	if (!priv->clock_enabled)
+		return;
+
+	hix5hd2_ir_stop(priv);
+	hix5hd2_ir_power(priv, false);
+	clk_disable_unprepare(priv->clock);
+	priv->clock_enabled = false;
 }
 
 static irqreturn_t hix5hd2_ir_rx_interrupt(int irq, void *data)
 {
 	u32 symb_num, symb_val, symb_time;
 	u32 data_l, data_h;
+	u32 irq_clear = 0;
 	u32 irq_sr, i;
 	struct hix5hd2_ir_priv *priv = data;
+	bool events = false;
+	bool handled = false;
 
-	irq_sr = readl_relaxed(priv->base + IR_INTS);
+	irq_sr = readl(priv->base + IR_INTS);
 	if (irq_sr & INTMS_OVERFLOW) {
+		handled = true;
+		events = true;
 		/*
 		 * we must read IR_DATAL first, then we can clean up
 		 * IR_INTS availably since logic would not clear
-		 * fifo when overflow, drv do the job
+		 * FIFO when overflow; drain it before acknowledging the source.
 		 */
 		ir_raw_event_overflow(priv->rdev);
-		symb_num = readl_relaxed(priv->base + IR_DATAH);
+		symb_num = hix5hd2_ir_fifo_count(priv);
 		for (i = 0; i < symb_num; i++)
-			readl_relaxed(priv->base + IR_DATAL);
+			readl(priv->base + IR_DATAL);
 
-		writel_relaxed(INT_CLR_OVERFLOW, priv->base + IR_INTC);
-		dev_info(priv->dev, "overflow, level=%d\n",
-			 IR_CFG_INT_THRESHOLD);
+		irq_clear |= INT_CLR_OVERFLOW;
+		dev_warn_ratelimited(priv->dev, "overflow, level=%d\n",
+				     IR_CFG_INT_THRESHOLD);
 	}
 
 	if ((irq_sr & INTMS_SYMBRCV) || (irq_sr & INTMS_TIMEOUT)) {
 		struct ir_raw_event ev = {};
 
-		symb_num = readl_relaxed(priv->base + IR_DATAH);
+		handled = true;
+		events = true;
+		symb_num = hix5hd2_ir_fifo_count(priv);
 		for (i = 0; i < symb_num; i++) {
-			symb_val = readl_relaxed(priv->base + IR_DATAL);
+			symb_val = readl(priv->base + IR_DATAL);
 			data_l = ((symb_val & 0xffff) * 10);
 			data_h =  ((symb_val >> 16) & 0xffff) * 10;
 			symb_time = (data_l + data_h) / 10;
 
-			ev.duration = data_l;
-			ev.pulse = true;
-			ir_raw_event_store(priv->rdev, &ev);
-
-			if (symb_time < IR_CFG_SYMBOL_MAXWIDTH) {
-				ev.duration = data_h;
-				ev.pulse = false;
-				ir_raw_event_store(priv->rdev, &ev);
-			} else {
-				ir_raw_event_set_idle(priv->rdev, true);
+			if (data_l) {
+				ev.duration = data_l;
+				ev.pulse = true;
+				ir_raw_event_store_with_filter(priv->rdev, &ev);
 			}
+
+			ev.pulse = false;
+			if (symb_time >= IR_CFG_SYMBOL_MAXWIDTH)
+				ev.duration = priv->rdev->timeout;
+			else
+				ev.duration = data_h;
+			if (ev.duration)
+				ir_raw_event_store_with_filter(priv->rdev, &ev);
+		}
+
+		/* A timeout can arrive after the last FIFO symbol was drained. */
+		if ((irq_sr & INTMS_TIMEOUT) && !priv->rdev->idle) {
+			ev.duration = priv->rdev->timeout;
+			ev.pulse = false;
+			ir_raw_event_store_with_filter(priv->rdev, &ev);
 		}
 
 		if (irq_sr & INTMS_SYMBRCV)
-			writel_relaxed(INT_CLR_RCV, priv->base + IR_INTC);
+			irq_clear |= INT_CLR_RCV;
 		if (irq_sr & INTMS_TIMEOUT)
-			writel_relaxed(INT_CLR_TIMEOUT, priv->base + IR_INTC);
+			irq_clear |= INT_CLR_TIMEOUT;
 	}
 
-	/* Empty software fifo */
-	ir_raw_event_handle(priv->rdev);
+	if (!handled) {
+		hix5hd2_ir_quench_unknown_irq(priv);
+		return IRQ_NONE;
+	}
+
+	writel(irq_clear, priv->base + IR_INTC);
+	/* Flush the W1C write before the GIC unmasks this level interrupt. */
+	readl(priv->base + IR_INTS);
+
+	if (events)
+		ir_raw_event_handle(priv->rdev);
+
 	return IRQ_HANDLED;
 }
 
 static const struct of_device_id hix5hd2_ir_table[] = {
-	{ .compatible = "hisilicon,hix5hd2-ir", &hix5hd2_data, },
-	{ .compatible = "hisilicon,hi3796cv300-ir", &hi3796cv300_data, },
+	{ .compatible = "hisilicon,hi3796cv300-ir", .data = &hi3796cv300_data },
+	{ .compatible = "hisilicon,hi3798cv200-ir", .data = &hi3798cv200_data },
+	{ .compatible = "hisilicon,hi3798mv310-ir", .data = &hi3798cv200_data },
+	{ .compatible = "hisilicon,hix5hd2-ir", .data = &hix5hd2_data },
 	{},
 };
 MODULE_DEVICE_TABLE(of, hix5hd2_ir_table);
@@ -259,6 +379,7 @@ static int hix5hd2_ir_probe(struct platform_device *pdev)
 	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
 	if (!priv)
 		return -ENOMEM;
+	priv->dev = dev;
 
 	priv->socdata = device_get_match_data(dev);
 	if (!priv->socdata) {
@@ -266,10 +387,13 @@ static int hix5hd2_ir_probe(struct platform_device *pdev)
 		return -ENODEV;
 	}
 
-	priv->regmap = syscon_regmap_lookup_by_phandle(node,
-						       "hisilicon,power-syscon");
-	if (IS_ERR(priv->regmap)) {
-		dev_info(dev, "no power-reg\n");
+	if (of_property_present(node, "hisilicon,power-syscon")) {
+		priv->regmap = syscon_regmap_lookup_by_phandle(node,
+							       "hisilicon,power-syscon");
+		if (IS_ERR(priv->regmap))
+			return dev_err_probe(dev, PTR_ERR(priv->regmap),
+					     "power syscon lookup failed\n");
+	} else {
 		priv->regmap = NULL;
 	}
 
@@ -287,14 +411,16 @@ static int hix5hd2_ir_probe(struct platform_device *pdev)
 
 	priv->clock = devm_clk_get(dev, NULL);
 	if (IS_ERR(priv->clock)) {
-		dev_err(dev, "clock not found\n");
 		ret = PTR_ERR(priv->clock);
+		dev_err(dev, "clock lookup failed: %d\n", ret);
 		goto err;
 	}
-	ret = clk_prepare_enable(priv->clock);
-	if (ret)
-		goto err;
 	priv->rate = clk_get_rate(priv->clock);
+	if (!priv->rate) {
+		ret = -EINVAL;
+		dev_err(dev, "clock has no usable rate\n");
+		goto err;
+	}
 
 	rdev->allowed_protocols = RC_PROTO_BIT_ALL_IR_DECODER;
 	rdev->priv = priv;
@@ -311,28 +437,37 @@ static int hix5hd2_ir_probe(struct platform_device *pdev)
 	rdev->input_id.version = 0x0100;
 	rdev->rx_resolution = 10;
 	rdev->timeout = IR_CFG_SYMBOL_MAXWIDTH * 10;
+	priv->rdev = rdev;
+
+	/* Keep the receiver reset and its level IRQ disabled until opened. */
+	ret = hix5hd2_ir_power(priv, false);
+	if (ret) {
+		dev_err(dev, "failed to reset receiver: %d\n", ret);
+		goto err;
+	}
+
+	ret = devm_request_irq(dev, priv->irq, hix5hd2_ir_rx_interrupt,
+			       IRQF_NO_AUTOEN, pdev->name, priv);
+	if (ret) {
+		dev_err(dev, "IRQ %d registration failed: %d\n",
+			priv->irq, ret);
+		goto err;
+	}
 
 	ret = rc_register_device(rdev);
 	if (ret < 0)
-		goto clkerr;
+		goto err;
 
-	if (devm_request_irq(dev, priv->irq, hix5hd2_ir_rx_interrupt,
-			     0, pdev->name, priv) < 0) {
-		dev_err(dev, "IRQ %d register failed\n", priv->irq);
-		ret = -EINVAL;
-		goto regerr;
-	}
+	mutex_lock(&rdev->lock);
+	priv->registered = true;
+	if (rdev->users)
+		hix5hd2_ir_irq_enable(priv);
+	mutex_unlock(&rdev->lock);
 
-	priv->rdev = rdev;
-	priv->dev = dev;
 	platform_set_drvdata(pdev, priv);
 
-	return ret;
+	return 0;
 
-regerr:
-	rc_unregister_device(rdev);
-clkerr:
-	clk_disable_unprepare(priv->clock);
 err:
 	rc_free_device(rdev);
 	dev_err(dev, "Unable to register device (%d)\n", ret);
@@ -343,7 +478,12 @@ static void hix5hd2_ir_remove(struct platform_device *pdev)
 {
 	struct hix5hd2_ir_priv *priv = platform_get_drvdata(pdev);
 
-	clk_disable_unprepare(priv->clock);
+	/* Stop IRQ producers before rc-core stops the raw decoder thread. */
+	mutex_lock(&priv->rdev->lock);
+	priv->registered = false;
+	hix5hd2_ir_irq_disable(priv);
+	mutex_unlock(&priv->rdev->lock);
+
 	rc_unregister_device(priv->rdev);
 	rc_free_device(priv->rdev);
 }
@@ -352,35 +492,56 @@ static void hix5hd2_ir_remove(struct platform_device *pdev)
 static int hix5hd2_ir_suspend(struct device *dev)
 {
 	struct hix5hd2_ir_priv *priv = dev_get_drvdata(dev);
+	int ret = 0;
 
-	clk_disable_unprepare(priv->clock);
-	hix5hd2_ir_clk_enable(priv, false);
+	mutex_lock(&priv->rdev->lock);
+	if (priv->clock_enabled) {
+		hix5hd2_ir_irq_disable(priv);
+		hix5hd2_ir_stop(priv);
+		ret = hix5hd2_ir_power(priv, false);
+		if (ret) {
+			if (!hix5hd2_ir_power(priv, true) &&
+			    !hix5hd2_ir_config(priv))
+				hix5hd2_ir_irq_enable(priv);
+		} else {
+			clk_disable_unprepare(priv->clock);
+			priv->clock_enabled = false;
+		}
+	}
+	mutex_unlock(&priv->rdev->lock);
 
-	return 0;
+	return ret;
 }
 
 static int hix5hd2_ir_resume(struct device *dev)
 {
 	struct hix5hd2_ir_priv *priv = dev_get_drvdata(dev);
-	int ret;
+	int ret = 0;
 
-	ret = hix5hd2_ir_clk_enable(priv, true);
-	if (ret)
-		return ret;
+	mutex_lock(&priv->rdev->lock);
+	if (!priv->rdev->users || priv->clock_enabled)
+		goto out;
 
 	ret = clk_prepare_enable(priv->clock);
+	if (ret)
+		goto out;
+	priv->clock_enabled = true;
+
+	ret = hix5hd2_ir_power(priv, true);
+	if (!ret)
+		ret = hix5hd2_ir_config(priv);
 	if (ret) {
-		hix5hd2_ir_clk_enable(priv, false);
-		return ret;
+		hix5hd2_ir_stop(priv);
+		hix5hd2_ir_power(priv, false);
+		clk_disable_unprepare(priv->clock);
+		priv->clock_enabled = false;
+	} else {
+		hix5hd2_ir_irq_enable(priv);
 	}
 
-	hix5hd2_ir_enable(priv);
-
-	writel_relaxed(0x00, priv->base + IR_INTM);
-	writel_relaxed(0xff, priv->base + IR_INTC);
-	writel_relaxed(0x01, priv->base + IR_START);
-
-	return 0;
+out:
+	mutex_unlock(&priv->rdev->lock);
+	return ret;
 }
 #endif
 
@@ -399,7 +560,7 @@ static struct platform_driver hix5hd2_ir_driver = {
 
 module_platform_driver(hix5hd2_ir_driver);
 
-MODULE_DESCRIPTION("IR controller driver for hix5hd2 platforms");
+MODULE_DESCRIPTION("IR controller driver for HiSilicon STB platforms");
 MODULE_AUTHOR("Guoxiong Yan <yanguoxiong@huawei.com>");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");
 MODULE_ALIAS("platform:hix5hd2-ir");
