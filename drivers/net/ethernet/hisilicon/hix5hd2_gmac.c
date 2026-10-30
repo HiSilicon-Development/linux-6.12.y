@@ -13,6 +13,7 @@
 #include <linux/of_mdio.h>
 #include <linux/reset.h>
 #include <linux/clk.h>
+#include <linux/rtnetlink.h>
 #include <linux/circ_buf.h>
 
 #define STATION_ADDR_LOW		0x0000
@@ -237,6 +238,24 @@ struct sg_desc {
 	struct frags_info frags[SG_MAX_SKB_FRAGS + 1];
 };
 
+struct hix5hd2_variant {
+	unsigned long hw_cap;
+	bool cv200_policy;
+};
+
+static const struct hix5hd2_variant hix5hd2_generic_variant = {
+	.hw_cap = GEMAC_V1,
+};
+
+static const struct hix5hd2_variant hix5hd2_generic_tso_variant = {
+	.hw_cap = GEMAC_V2,
+};
+
+static const struct hix5hd2_variant hix5hd2_cv200_variant = {
+	.hw_cap = GEMAC_V2,
+	.cv200_policy = true,
+};
+
 #define QUEUE_NUMS	4
 struct hix5hd2_priv {
 	struct hix5hd2_desc_sw pool[QUEUE_NUMS];
@@ -258,7 +277,7 @@ struct hix5hd2_priv {
 	struct device_node *phy_node;
 	phy_interface_t	phy_mode;
 
-	unsigned long hw_cap;
+	const struct hix5hd2_variant *variant;
 	unsigned int speed;
 	unsigned int duplex;
 
@@ -272,6 +291,8 @@ struct hix5hd2_priv {
 	struct napi_struct napi;
 	struct work_struct tx_timeout_task;
 };
+
+static int hix5hd2_mac_core_reset(struct hix5hd2_priv *priv);
 
 static inline void hix5hd2_mac_interface_reset(struct hix5hd2_priv *priv)
 {
@@ -292,6 +313,9 @@ static void hix5hd2_config_port(struct net_device *dev, u32 speed, u32 duplex)
 
 	switch (priv->phy_mode) {
 	case PHY_INTERFACE_MODE_RGMII:
+	case PHY_INTERFACE_MODE_RGMII_ID:
+	case PHY_INTERFACE_MODE_RGMII_RXID:
+	case PHY_INTERFACE_MODE_RGMII_TXID:
 		if (speed == SPEED_1000)
 			val = RGMII_SPEED_1000;
 		else if (speed == SPEED_100)
@@ -539,14 +563,14 @@ static int hix5hd2_rx(struct net_device *dev, int limit)
 		dma_unmap_single(priv->dev, addr, MAC_MAX_FRAME_SIZE,
 				 DMA_FROM_DEVICE);
 
-		skb_put(skb, len);
-		if (skb->len > MAC_MAX_FRAME_SIZE) {
-			netdev_err(dev, "rcv len err, len = %d\n", skb->len);
+		if (unlikely(len < ETH_HLEN || len > MAC_MAX_FRAME_SIZE)) {
+			netdev_err(dev, "rcv len err, len = %u\n", len);
 			dev->stats.rx_errors++;
 			dev->stats.rx_length_errors++;
 			dev_kfree_skb_any(skb);
 			goto next;
 		}
+		skb_put(skb, len);
 
 		skb->protocol = eth_type_trans(skb, dev);
 		napi_gro_receive(&priv->napi, skb);
@@ -645,6 +669,10 @@ static int hix5hd2_poll(struct napi_struct *napi, int budget)
 	struct net_device *dev = priv->netdev;
 	int work_done = 0, task = budget;
 	int ints, num;
+	if (!budget) {
+		hix5hd2_xmit_reclaim(dev);
+		return 0;
+	}
 
 	do {
 		hix5hd2_xmit_reclaim(dev);
@@ -659,8 +687,8 @@ static int hix5hd2_poll(struct napi_struct *napi, int budget)
 	} while (ints & DEF_INT_MASK);
 
 	if (work_done < budget) {
-		napi_complete_done(napi, work_done);
-		hix5hd2_irq_enable(priv);
+		if (napi_complete_done(napi, work_done))
+			hix5hd2_irq_enable(priv);
 	}
 
 	return work_done;
@@ -705,7 +733,6 @@ static int hix5hd2_fill_sg_desc(struct hix5hd2_priv *priv,
 {
 	struct sg_desc *desc;
 	dma_addr_t addr;
-	int ret;
 	int i;
 
 	desc = priv->tx_ring.desc + pos;
@@ -723,14 +750,23 @@ static int hix5hd2_fill_sg_desc(struct hix5hd2_priv *priv,
 		int len = skb_frag_size(frag);
 
 		addr = skb_frag_dma_map(priv->dev, frag, 0, len, DMA_TO_DEVICE);
-		ret = dma_mapping_error(priv->dev, addr);
-		if (unlikely(ret))
-			return -EINVAL;
+		if (dma_mapping_error(priv->dev, addr))
+			goto err_unmap;
 		desc->frags[i].addr = cpu_to_le32(addr);
 		desc->frags[i].size = cpu_to_le32(len);
 	}
 
 	return 0;
+
+err_unmap:
+	while (i--) {
+		addr = le32_to_cpu(desc->frags[i].addr);
+		dma_unmap_page(priv->dev, addr,
+			       le32_to_cpu(desc->frags[i].size), DMA_TO_DEVICE);
+	}
+	dma_unmap_single(priv->dev, le32_to_cpu(desc->linear_addr),
+			 skb_headlen(skb), DMA_TO_DEVICE);
+	return -ENOMEM;
 }
 
 static netdev_tx_t hix5hd2_net_xmit(struct sk_buff *skb, struct net_device *dev)
@@ -741,6 +777,13 @@ static netdev_tx_t hix5hd2_net_xmit(struct sk_buff *skb, struct net_device *dev)
 	u32 pos;
 	u32 cmd;
 	int ret;
+
+	if (skb_shinfo(skb)->nr_frags > SG_MAX_SKB_FRAGS &&
+	    skb_linearize(skb)) {
+		dev_kfree_skb_any(skb);
+		dev->stats.tx_dropped++;
+		return NETDEV_TX_OK;
+	}
 
 	/* software write pointer */
 	pos = dma_cnt(readl_relaxed(priv->base + TX_BQ_WR_ADDR));
@@ -753,7 +796,7 @@ static netdev_tx_t hix5hd2_net_xmit(struct sk_buff *skb, struct net_device *dev)
 
 	desc = priv->tx_bq.desc + pos;
 
-	cmd = hix5hd2_get_desc_cmd(skb, priv->hw_cap);
+	cmd = hix5hd2_get_desc_cmd(skb, priv->variant->hw_cap);
 	desc->cmd = cpu_to_le32(cmd);
 
 	if (skb_shinfo(skb)->nr_frags) {
@@ -815,9 +858,13 @@ static void hix5hd2_free_dma_desc_rings(struct hix5hd2_priv *priv)
 		if (skb == NULL)
 			continue;
 
-		desc = priv->tx_rq.desc + i;
-		addr = le32_to_cpu(desc->buff_addr);
-		dma_unmap_single(priv->dev, addr, skb->len, DMA_TO_DEVICE);
+		if (skb_shinfo(skb)->nr_frags) {
+			hix5hd2_clean_sg_desc(priv, skb, i);
+		} else {
+			desc = priv->tx_bq.desc + i;
+			addr = le32_to_cpu(desc->buff_addr);
+			dma_unmap_single(priv->dev, addr, skb->len, DMA_TO_DEVICE);
+		}
 		dev_kfree_skb_any(skb);
 		priv->tx_skb[i] = NULL;
 	}
@@ -842,6 +889,22 @@ static int hix5hd2_net_open(struct net_device *dev)
 		return ret;
 	}
 
+	if (priv->variant->cv200_policy) {
+		ret = hix5hd2_mac_core_reset(priv);
+		if (ret) {
+			netdev_err(dev, "failed to reset mac core %d\n", ret);
+			clk_disable_unprepare(priv->mac_ifc_clk);
+			clk_disable_unprepare(priv->mac_core_clk);
+			return ret;
+		}
+
+		priv->speed = SPEED_UNKNOWN;
+		priv->duplex = DUPLEX_UNKNOWN;
+
+		/* Writes made while the interface is down are clock-gated. */
+		hix5hd2_hw_set_mac_addr(dev);
+	}
+
 	phy = of_phy_connect(dev, priv->phy_node,
 			     &hix5hd2_adjust_link, 0, priv->phy_mode);
 	if (!phy) {
@@ -850,6 +913,8 @@ static int hix5hd2_net_open(struct net_device *dev)
 		return -ENODEV;
 	}
 
+	if (priv->variant->cv200_policy)
+		netif_carrier_off(dev);
 	phy_start(phy);
 	hix5hd2_hw_init(priv);
 	hix5hd2_rx_refill(priv);
@@ -870,6 +935,7 @@ static int hix5hd2_net_close(struct net_device *dev)
 
 	hix5hd2_port_disable(priv);
 	hix5hd2_irq_disable(priv);
+	synchronize_irq(dev->irq);
 	napi_disable(&priv->napi);
 	netif_stop_queue(dev);
 	hix5hd2_free_dma_desc_rings(priv);
@@ -890,8 +956,13 @@ static void hix5hd2_tx_timeout_task(struct work_struct *work)
 	struct hix5hd2_priv *priv;
 
 	priv = container_of(work, struct hix5hd2_priv, tx_timeout_task);
-	hix5hd2_net_close(priv->netdev);
-	hix5hd2_net_open(priv->netdev);
+	rtnl_lock();
+	if (netif_running(priv->netdev)) {
+		dev_close(priv->netdev);
+		if (dev_open(priv->netdev, NULL))
+			netdev_err(priv->netdev, "failed to reopen after TX timeout\n");
+	}
+	rtnl_unlock();
 }
 
 static void hix5hd2_net_timeout(struct net_device *dev, unsigned int txqueue)
@@ -934,7 +1005,8 @@ static int hix5hd2_mdio_read(struct mii_bus *bus, int phy, int reg)
 {
 	struct hix5hd2_priv *priv = bus->priv;
 	void __iomem *base = priv->base;
-	int val, ret;
+	u32 cmd, data, status;
+	int ret;
 
 	ret = hix5hd2_mdio_wait_ready(bus);
 	if (ret < 0)
@@ -945,15 +1017,19 @@ static int hix5hd2_mdio_read(struct mii_bus *bus, int phy, int reg)
 	if (ret < 0)
 		goto out;
 
-	val = readl_relaxed(base + MDIO_RDATA_STATUS);
-	if (val & MDIO_R_VALID) {
-		dev_err(bus->parent, "SMI bus read not valid\n");
+	status = readl_relaxed(base + MDIO_RDATA_STATUS);
+	if (status & MDIO_R_VALID) {
+		cmd = readl_relaxed(base + MDIO_SINGLE_CMD);
+		data = readl_relaxed(base + MDIO_SINGLE_DATA);
+		dev_err_ratelimited(bus->parent,
+				    "SMI read invalid: phy=%d reg=%d cmd=%#x status=%#x data=%#x\n",
+				    phy, reg, cmd, status, data);
 		ret = -ENODEV;
 		goto out;
 	}
 
-	val = readl_relaxed(priv->base + MDIO_SINGLE_DATA);
-	ret = (val >> 16) & 0xFFFF;
+	data = readl_relaxed(priv->base + MDIO_SINGLE_DATA);
+	ret = (data >> 16) & 0xFFFF;
 out:
 	return ret;
 }
@@ -1047,13 +1123,23 @@ static void hix5hd2_destroy_sg_desc_queue(struct hix5hd2_priv *priv)
 	}
 }
 
-static inline void hix5hd2_mac_core_reset(struct hix5hd2_priv *priv)
+static int hix5hd2_mac_core_reset(struct hix5hd2_priv *priv)
 {
-	if (!priv->mac_core_rst)
-		return;
+	int ret;
 
-	reset_control_assert(priv->mac_core_rst);
-	reset_control_deassert(priv->mac_core_rst);
+	if (!priv->mac_core_rst)
+		return 0;
+	if (!priv->variant->cv200_policy) {
+		reset_control_assert(priv->mac_core_rst);
+		reset_control_deassert(priv->mac_core_rst);
+		return 0;
+	}
+
+	ret = reset_control_assert(priv->mac_core_rst);
+	if (ret)
+		return ret;
+
+	return reset_control_deassert(priv->mac_core_rst);
 }
 
 static void hix5hd2_sleep_us(u32 time_us)
@@ -1070,23 +1156,51 @@ static void hix5hd2_sleep_us(u32 time_us)
 		msleep(time_ms);
 }
 
-static void hix5hd2_phy_reset(struct hix5hd2_priv *priv)
+static int hix5hd2_phy_reset(struct hix5hd2_priv *priv)
 {
+	int ret;
+
+	if (!priv->variant->cv200_policy) {
+		reset_control_deassert(priv->phy_rst);
+		hix5hd2_sleep_us(priv->phy_reset_delays[PRE_DELAY]);
+		reset_control_assert(priv->phy_rst);
+		hix5hd2_sleep_us(priv->phy_reset_delays[PULSE]);
+		reset_control_deassert(priv->phy_rst);
+		hix5hd2_sleep_us(priv->phy_reset_delays[POST_DELAY]);
+		return 0;
+	}
+
 	/* To make sure PHY hardware reset success,
 	 * we must keep PHY in deassert state first and
 	 * then complete the hardware reset operation
 	 */
-	reset_control_deassert(priv->phy_rst);
+	if (priv->variant->cv200_policy)
+		dev_info(priv->dev, "PHY reset delays: %u/%u/%u us\n",
+			 priv->phy_reset_delays[PRE_DELAY],
+			 priv->phy_reset_delays[PULSE],
+			 priv->phy_reset_delays[POST_DELAY]);
+
+	ret = reset_control_deassert(priv->phy_rst);
+	if (ret)
+		return ret;
 	hix5hd2_sleep_us(priv->phy_reset_delays[PRE_DELAY]);
 
-	reset_control_assert(priv->phy_rst);
+	ret = reset_control_assert(priv->phy_rst);
+	if (ret)
+		return ret;
 	/* delay some time to ensure reset ok,
 	 * this depends on PHY hardware feature
 	 */
 	hix5hd2_sleep_us(priv->phy_reset_delays[PULSE]);
-	reset_control_deassert(priv->phy_rst);
+	ret = reset_control_deassert(priv->phy_rst);
+	if (ret)
+		return ret;
 	/* delay some time to ensure later MDIO access */
 	hix5hd2_sleep_us(priv->phy_reset_delays[POST_DELAY]);
+
+	if (priv->variant->cv200_policy)
+		dev_info(priv->dev, "PHY reset sequence complete\n");
+	return 0;
 }
 
 static const struct of_device_id hix5hd2_of_match[];
@@ -1109,8 +1223,9 @@ static int hix5hd2_dev_probe(struct platform_device *pdev)
 	priv = netdev_priv(ndev);
 	priv->dev = dev;
 	priv->netdev = ndev;
-
-	priv->hw_cap = (unsigned long)device_get_match_data(dev);
+	priv->variant = device_get_match_data(dev);
+	if (!priv->variant)
+		priv->variant = &hix5hd2_generic_variant;
 
 	priv->base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(priv->base)) {
@@ -1147,26 +1262,69 @@ static int hix5hd2_dev_probe(struct platform_device *pdev)
 		goto out_disable_mac_core_clk;
 	}
 
-	priv->mac_core_rst = devm_reset_control_get(dev, "mac_core");
-	if (IS_ERR(priv->mac_core_rst))
-		priv->mac_core_rst = NULL;
-	hix5hd2_mac_core_reset(priv);
+	if (priv->variant->cv200_policy) {
+		priv->mac_core_rst =
+			devm_reset_control_get_optional_exclusive(dev, "mac_core");
+		if (IS_ERR(priv->mac_core_rst)) {
+			ret = dev_err_probe(dev, PTR_ERR(priv->mac_core_rst),
+					    "failed to get MAC core reset\n");
+			goto out_disable_clk;
+		}
 
-	priv->mac_ifc_rst = devm_reset_control_get(dev, "mac_ifc");
-	if (IS_ERR(priv->mac_ifc_rst))
-		priv->mac_ifc_rst = NULL;
+		priv->mac_ifc_rst =
+			devm_reset_control_get_optional_exclusive(dev, "mac_ifc");
+		if (IS_ERR(priv->mac_ifc_rst)) {
+			ret = dev_err_probe(dev, PTR_ERR(priv->mac_ifc_rst),
+					    "failed to get MAC interface reset\n");
+			goto out_disable_clk;
+		}
 
-	priv->phy_rst = devm_reset_control_get(dev, "phy");
-	if (IS_ERR(priv->phy_rst)) {
-		priv->phy_rst = NULL;
+		priv->phy_rst =
+			devm_reset_control_get_optional_exclusive(dev, "phy");
+		if (IS_ERR(priv->phy_rst)) {
+			ret = dev_err_probe(dev, PTR_ERR(priv->phy_rst),
+					    "failed to get PHY reset\n");
+			goto out_disable_clk;
+		}
+
+		dev_info(dev, "reset controls: core=%s interface=%s phy=%s\n",
+			 priv->mac_core_rst ? "present" : "absent",
+			 priv->mac_ifc_rst ? "present" : "absent",
+			 priv->phy_rst ? "present" : "absent");
+
+		ret = hix5hd2_mac_core_reset(priv);
+		if (ret) {
+			dev_err(dev, "MAC core reset failed: %d\n", ret);
+			goto out_disable_clk;
+		}
 	} else {
+		priv->mac_core_rst = devm_reset_control_get(dev, "mac_core");
+		if (IS_ERR(priv->mac_core_rst))
+			priv->mac_core_rst = NULL;
+		hix5hd2_mac_core_reset(priv);
+
+		priv->mac_ifc_rst = devm_reset_control_get(dev, "mac_ifc");
+		if (IS_ERR(priv->mac_ifc_rst))
+			priv->mac_ifc_rst = NULL;
+
+		priv->phy_rst = devm_reset_control_get(dev, "phy");
+		if (IS_ERR(priv->phy_rst))
+			priv->phy_rst = NULL;
+	}
+
+	if (priv->phy_rst) {
 		ret = of_property_read_u32_array(node,
 						 PHY_RESET_DELAYS_PROPERTY,
 						 priv->phy_reset_delays,
 						 DELAYS_NUM);
 		if (ret)
 			goto out_disable_clk;
-		hix5hd2_phy_reset(priv);
+
+		ret = hix5hd2_phy_reset(priv);
+		if (ret && priv->variant->cv200_policy) {
+			dev_err(dev, "PHY reset failed: %d\n", ret);
+			goto out_disable_clk;
+		}
 	}
 
 	bus = mdiobus_alloc();
@@ -1227,7 +1385,7 @@ static int hix5hd2_dev_probe(struct platform_device *pdev)
 	ndev->ethtool_ops = &hix5hd2_ethtools_ops;
 	SET_NETDEV_DEV(ndev, dev);
 
-	if (HAS_CAP_TSO(priv->hw_cap))
+	if (HAS_CAP_TSO(priv->variant->hw_cap))
 		ndev->hw_features |= NETIF_F_SG;
 
 	ndev->features |= ndev->hw_features | NETIF_F_HIGHDMA;
@@ -1239,7 +1397,7 @@ static int hix5hd2_dev_probe(struct platform_device *pdev)
 
 	netif_napi_add(ndev, &priv->napi, hix5hd2_poll);
 
-	if (HAS_CAP_TSO(priv->hw_cap)) {
+	if (HAS_CAP_TSO(priv->variant->hw_cap)) {
 		ret = hix5hd2_init_sg_desc_queue(priv);
 		if (ret)
 			goto out_destroy_queue;
@@ -1257,7 +1415,7 @@ static int hix5hd2_dev_probe(struct platform_device *pdev)
 	return ret;
 
 out_destroy_queue:
-	if (HAS_CAP_TSO(priv->hw_cap))
+	if (HAS_CAP_TSO(priv->variant->hw_cap))
 		hix5hd2_destroy_sg_desc_queue(priv);
 	netif_napi_del(&priv->napi);
 	hix5hd2_destroy_hw_desc_queue(priv);
@@ -1286,7 +1444,7 @@ static void hix5hd2_dev_remove(struct platform_device *pdev)
 	mdiobus_unregister(priv->bus);
 	mdiobus_free(priv->bus);
 
-	if (HAS_CAP_TSO(priv->hw_cap))
+	if (HAS_CAP_TSO(priv->variant->hw_cap))
 		hix5hd2_destroy_sg_desc_queue(priv);
 	hix5hd2_destroy_hw_desc_queue(priv);
 	of_node_put(priv->phy_node);
@@ -1295,11 +1453,16 @@ static void hix5hd2_dev_remove(struct platform_device *pdev)
 }
 
 static const struct of_device_id hix5hd2_of_match[] = {
-	{ .compatible = "hisilicon,hisi-gmac-v1", .data = (void *)GEMAC_V1 },
-	{ .compatible = "hisilicon,hisi-gmac-v2", .data = (void *)GEMAC_V2 },
-	{ .compatible = "hisilicon,hix5hd2-gmac", .data = (void *)GEMAC_V1 },
-	{ .compatible = "hisilicon,hi3798cv200-gmac", .data = (void *)GEMAC_V2 },
-	{ .compatible = "hisilicon,hi3516a-gmac", .data = (void *)GEMAC_V2 },
+	{ .compatible = "hisilicon,hisi-gmac-v1",
+	  .data = &hix5hd2_generic_variant },
+	{ .compatible = "hisilicon,hisi-gmac-v2",
+	  .data = &hix5hd2_generic_tso_variant },
+	{ .compatible = "hisilicon,hix5hd2-gmac",
+	  .data = &hix5hd2_generic_variant },
+	{ .compatible = "hisilicon,hi3798cv200-gmac",
+	  .data = &hix5hd2_cv200_variant },
+	{ .compatible = "hisilicon,hi3516a-gmac",
+	  .data = &hix5hd2_generic_tso_variant },
 	{},
 };
 
