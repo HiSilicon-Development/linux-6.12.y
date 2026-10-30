@@ -10226,6 +10226,11 @@ F:	drivers/crypto/hisilicon/hpre/hpre.h
 F:	drivers/crypto/hisilicon/hpre/hpre_crypto.c
 F:	drivers/crypto/hisilicon/hpre/hpre_main.c
 
+HISILICON HISTB MEDIA SMMU
+L:	linux-media@vger.kernel.org
+S:	Orphan
+F:	drivers/media/platform/hisilicon/histb-media-smmu.[ch]
+
 HISILICON HNS3 PMU DRIVER
 M:	Jijie Shao <shaojijie@huawei.com>
 S:	Supported
