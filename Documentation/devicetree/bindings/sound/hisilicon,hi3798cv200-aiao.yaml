@@ -17,10 +17,14 @@ description:
   The PCM DMA path accepts signed 16-bit samples or 24 significant bits in
   the most significant bits of a 32-bit word (ALSA S32_LE with msbits 24).
   Low-justified S24_LE is not a native DMA format.
+  CV200 uses the 933.888 MHz audio PLL, while MV310 uses the BSP's
+  860.160 MHz source and has a different internal HDMI transmit port.
 
 properties:
   compatible:
-    const: hisilicon,hi3798cv200-aiao
+    enum:
+      - hisilicon,hi3798cv200-aiao
+      - hisilicon,hi3798mv310-aiao
 
   reg:
     maxItems: 1
@@ -40,14 +44,18 @@ properties:
     maxItems: 1
 
   "#sound-dai-cells":
-    const: 0
+    const: 1
+    description: |
+      DAI 0 is the board-selected analog/external I2S port. DAI 1 is the
+      internal HDMI port (TX3 on CV200, TX2 on MV310). The two PCM devices
+      share the driver's DMA state and cannot be opened simultaneously.
 
   hisilicon,tx-channel:
     $ref: /schemas/types.yaml#/definitions/uint32
     minimum: 0
     maximum: 3
     default: 0
-    description: Transmit port index selected by the board's audio routing.
+    description: Analog/external I2S transmit port index (DAI 0 only).
 
 required:
   - compatible
@@ -75,6 +83,6 @@ examples:
         clocks = <&crg HISTB_AIAO_CLK>, <&crg HISTB_AIAO_MCLK>;
         clock-names = "bus", "mclk";
         resets = <&crg 0x118 4>;
-        #sound-dai-cells = <0>;
+        #sound-dai-cells = <1>;
     };
 ...

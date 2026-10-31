@@ -18,6 +18,7 @@
 #include <linux/iopoll.h>
 #include <linux/module.h>
 #include <linux/property.h>
+#include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/rcupdate.h>
 #include <linux/reset.h>
@@ -96,6 +97,7 @@ struct hi3798cv200_aiao {
 	void __iomem *base;
 	struct clk *bus_clk;
 	struct clk *mclk;
+	unsigned long mclk_rate;
 	struct reset_control *reset;
 	struct snd_pcm_substream __rcu *substream;
 	/* Serializes top-level and channel register read-modify-write cycles. */
@@ -103,7 +105,10 @@ struct hi3798cv200_aiao {
 	u32 dsp_ctrl;
 	/* Selected by the board's audio routing. */
 	unsigned int tx_channel;
+	unsigned int analog_tx_channel;
+	unsigned int hdmi_tx_channel;
 	int irq;
+	atomic_t opened;
 };
 
 static inline u32 aiao_tx_reg(const struct hi3798cv200_aiao *aiao, u32 tx0_reg)
@@ -178,11 +183,11 @@ static void aiao_update_bits(struct hi3798cv200_aiao *aiao, u32 reg,
 	spin_unlock_irqrestore(&aiao->reg_lock, flags);
 }
 
-static u32 aiao_mclk_div(unsigned int rate)
+static u32 aiao_mclk_div(struct hi3798cv200_aiao *aiao, unsigned int rate)
 {
 	u64 numerator = (u64)rate * AIAO_MCLK_RATIO * BIT_ULL(27);
 
-	return DIV_ROUND_CLOSEST_ULL(numerator, AIAO_EPLL_RATE);
+	return DIV_ROUND_CLOSEST_ULL(numerator, aiao->mclk_rate);
 }
 
 static int aiao_stop_tx(struct hi3798cv200_aiao *aiao)
@@ -225,6 +230,7 @@ static int aiao_stop_tx(struct hi3798cv200_aiao *aiao)
 static int hi3798cv200_aiao_open(struct snd_soc_component *component,
 				 struct snd_pcm_substream *substream)
 {
+	struct hi3798cv200_aiao *aiao = dev_get_drvdata(component->dev);
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	int ret;
 
@@ -235,29 +241,37 @@ static int hi3798cv200_aiao_open(struct snd_soc_component *component,
 	 * not ALSA S24_LE's low three bytes. Let userspace convert to S32.
 	 */
 	ret = snd_pcm_hw_constraint_msbits(runtime, 0, 32, 24);
-	if (ret)
+	if (ret < 0)
 		return ret;
 
 	ret = snd_pcm_hw_constraint_step(runtime, 0,
 					 SNDRV_PCM_HW_PARAM_PERIOD_BYTES,
 					 AIAO_BUFFER_ALIGN);
-	if (ret)
+	if (ret < 0)
 		return ret;
 
 	ret = snd_pcm_hw_constraint_step(runtime, 0,
 					 SNDRV_PCM_HW_PARAM_BUFFER_BYTES,
 					 AIAO_BUFFER_ALIGN);
-	if (ret)
+	if (ret < 0)
 		return ret;
 
-	return snd_pcm_hw_constraint_integer(runtime,
-					     SNDRV_PCM_HW_PARAM_PERIODS);
+	ret = snd_pcm_hw_constraint_integer(runtime, SNDRV_PCM_HW_PARAM_PERIODS);
+	if (ret < 0)
+		return ret;
+	/* Constraint refinement can return positive success; always claim DMA. */
+	if (atomic_cmpxchg(&aiao->opened, 0, 1))
+		return -EBUSY;
+	return 0;
 }
 
 static int hi3798cv200_aiao_close(struct snd_soc_component *component,
 				  struct snd_pcm_substream *substream)
 {
+	struct hi3798cv200_aiao *aiao = dev_get_drvdata(component->dev);
+
 	synchronize_rcu();
+	atomic_set(&aiao->opened, 0);
 	return 0;
 }
 
@@ -271,6 +285,7 @@ static int hi3798cv200_aiao_sync_stop(struct snd_soc_component *component,
 	return 0;
 }
 
+
 static int hi3798cv200_aiao_hw_params(struct snd_soc_component *component,
 				      struct snd_pcm_substream *substream,
 				      struct snd_pcm_hw_params *params)
@@ -283,6 +298,8 @@ static int hi3798cv200_aiao_hw_params(struct snd_soc_component *component,
 	u32 tx_crg0, tx_crg1, tx_if, tx_dsp, tx_addr, tx_size;
 	u32 tx_wptr, tx_rptr, tx_alempty, tx_trans;
 
+	if (params_channels(params) != 2)
+		return -EINVAL;
 	if (!IS_ALIGNED(runtime->dma_addr, AIAO_BUFFER_ALIGN) ||
 	    upper_32_bits(runtime->dma_addr))
 		return -EINVAL;
@@ -322,7 +339,7 @@ static int hi3798cv200_aiao_hw_params(struct snd_soc_component *component,
 	aiao_update_bits(aiao, tx_crg1, AIAO_CRG_CLK_EN, 0);
 	aiao_write(aiao, tx_crg0,
 		   FIELD_PREP(AIAO_CRG_MCLK_DIV_MASK,
-			      aiao_mclk_div(params_rate(params))));
+			      aiao_mclk_div(aiao, params_rate(params))));
 	aiao_write(aiao, tx_crg1, crg1);
 	aiao_write(aiao, tx_crg1, crg1 | AIAO_CRG_CLK_EN);
 	aiao_update_bits(aiao, AIAO_SWITCH_TX_BCLK,
@@ -341,8 +358,8 @@ static int hi3798cv200_aiao_hw_params(struct snd_soc_component *component,
 	aiao_write(aiao, tx_alempty, period_bytes);
 	aiao_write(aiao, tx_trans, period_bytes);
 
-	dev_info(aiao->dev, "AIAO TX%u configured for HDMI/PCM\n",
-		 aiao->tx_channel);
+	dev_dbg(aiao->dev, "AIAO TX%u: %u Hz, %u significant bits\n",
+		aiao->tx_channel, params_rate(params), precision == 1 ? 16 : 24);
 	return 0;
 }
 
@@ -504,20 +521,47 @@ static int hi3798cv200_aiao_set_fmt(struct snd_soc_dai *dai,
 	return 0;
 }
 
+static int hi3798cv200_aiao_dai_startup(struct snd_pcm_substream *substream,
+				      struct snd_soc_dai *dai)
+{
+	struct hi3798cv200_aiao *aiao = snd_soc_dai_get_drvdata(dai);
+
+	aiao->tx_channel = dai->id ? aiao->hdmi_tx_channel : aiao->analog_tx_channel;
+	return 0;
+}
+
 static const struct snd_soc_dai_ops hi3798cv200_aiao_dai_ops = {
+	.startup = hi3798cv200_aiao_dai_startup,
 	.set_fmt = hi3798cv200_aiao_set_fmt,
 };
 
-static struct snd_soc_dai_driver hi3798cv200_aiao_dai = {
-	.name = "hi3798cv200-aiao-tx0",
-	.playback = {
-		.stream_name = "Playback",
-		.channels_min = 2,
-		.channels_max = 2,
-		.rates = AIAO_RATES,
-		.formats = SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S32_LE,
+static struct snd_soc_dai_driver hi3798cv200_aiao_dais[] = {
+	{
+		.id = 0,
+		.name = "hi3798-aiao-analog",
+		.playback = {
+			.stream_name = "Analog Playback",
+			.channels_min = 2,
+			.channels_max = 2,
+			.rates = AIAO_RATES,
+			.formats = SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S32_LE,
+		},
+		.ops = &hi3798cv200_aiao_dai_ops,
+	}, {
+		.id = 1,
+		.name = "hi3798-aiao-hdmi",
+		.playback = {
+			.stream_name = "HDMI Playback",
+			.channels_min = 2,
+			.channels_max = 2,
+			.rates = SNDRV_PCM_RATE_32000 | SNDRV_PCM_RATE_44100 |
+				 SNDRV_PCM_RATE_48000 | SNDRV_PCM_RATE_88200 |
+				 SNDRV_PCM_RATE_96000 | SNDRV_PCM_RATE_176400 |
+				 SNDRV_PCM_RATE_192000,
+			.formats = SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S32_LE,
+		},
+		.ops = &hi3798cv200_aiao_dai_ops,
 	},
-	.ops = &hi3798cv200_aiao_dai_ops,
 };
 
 static bool hi3798cv200_aiao_ack_tx0(struct hi3798cv200_aiao *aiao,
@@ -622,6 +666,10 @@ static int hi3798cv200_aiao_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, -EINVAL, "invalid TX channel %u\n",
 				     aiao->tx_channel);
 
+	aiao->analog_tx_channel = aiao->tx_channel;
+	/* BSP drv_ao_op.c:64-78: S40/CV200 HDMI is TX3, S28/MV310 TX2. */
+	aiao->hdmi_tx_channel = of_device_is_compatible(dev->of_node,
+						      "hisilicon,hi3798mv310-aiao") ? 2 : 3;
 	aiao->base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(aiao->base))
 		return PTR_ERR(aiao->base);
@@ -649,9 +697,14 @@ static int hi3798cv200_aiao_probe(struct platform_device *pdev)
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to select 50 MHz bus clock\n");
 
-	ret = clk_set_rate(aiao->mclk, AIAO_EPLL_RATE);
+	aiao->mclk_rate = of_device_is_compatible(dev->of_node,
+						 "hisilicon,hi3798mv310-aiao") ?
+		860160000 : AIAO_EPLL_RATE;
+	ret = clk_set_rate(aiao->mclk, aiao->mclk_rate);
 	if (ret)
-		return dev_err_probe(dev, ret, "failed to select EPLL clock\n");
+		return dev_err_probe(dev, ret, "failed to select audio PLL clock\n");
+	if (clk_get_rate(aiao->mclk) != aiao->mclk_rate)
+		return dev_err_probe(dev, -ERANGE, "unexpected audio PLL rate\n");
 
 	ret = reset_control_assert(aiao->reset);
 	if (ret)
@@ -703,7 +756,8 @@ static int hi3798cv200_aiao_probe(struct platform_device *pdev)
 
 	return devm_snd_soc_register_component(dev,
 					       &hi3798cv200_aiao_component,
-					       &hi3798cv200_aiao_dai, 1);
+					       hi3798cv200_aiao_dais,
+					       ARRAY_SIZE(hi3798cv200_aiao_dais));
 
 assert_reset:
 	reset_control_assert(aiao->reset);
@@ -715,6 +769,7 @@ disable_clocks:
 
 static const struct of_device_id hi3798cv200_aiao_of_match[] = {
 	{ .compatible = "hisilicon,hi3798cv200-aiao" },
+	{ .compatible = "hisilicon,hi3798mv310-aiao" },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, hi3798cv200_aiao_of_match);
@@ -728,5 +783,5 @@ static struct platform_driver hi3798cv200_aiao_driver = {
 };
 module_platform_driver(hi3798cv200_aiao_driver);
 
-MODULE_DESCRIPTION("HiSilicon Hi3798CV200 AIAO playback driver");
+MODULE_DESCRIPTION("HiSilicon Hi3798CV200/Hi3798MV310 AIAO playback driver");
 MODULE_LICENSE("GPL");

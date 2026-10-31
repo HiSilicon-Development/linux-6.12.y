@@ -6,10 +6,12 @@ config SND_I2S_HI6210_I2S
 	  Hisilicon I2S
 
 config SND_SOC_HI3798CV200_AIAO
-	tristate "HiSilicon Hi3798CV200 AIAO controller"
+	tristate "HiSilicon Hi3798CV200/Hi3798MV310 AIAO controller"
 	depends on ARCH_HISI || COMPILE_TEST
 	help
 	  Say Y or M to enable the standard ASoC playback interface for the
-	  Hi3798CV200 AIAO controller. The driver uses the controller's native
-	  circular DMA buffer and exposes no vendor private userspace ABI. It
-	  connects to codecs through the standard ASoC DAI and PCM interfaces.
+	  Hi3798CV200 and Hi3798MV310 AIAO controllers. The driver uses native
+	  circular DMA buffers with standard ASoC DAI and PCM interfaces.
+	  DAI 0 preserves the board's analog/external I2S routing; DAI 1 uses
+	  the SoC's internal HDMI port. Both expose stereo 16-bit or 24-bit
+	  PCM (24 significant MSBs in S32_LE DMA words).
