@@ -10,11 +10,14 @@ config DRM_HISI_HISTB_HDMI
 	select MFD_SYSCON
 	select CEC_CORE
 	select CEC_NOTIFIER
+	select SND_SOC_HDMI_CODEC if SND_SOC
 	help
 	  Enable support for the HDMI transmitter integrated in the HiSilicon
 	  Hi3798CV200 and Hi3798MV310. The drivers use the DRM bridge API and
 	  provide physical hot-plug detection and internal DDC EDID reads.
 	  MV310 uses its native hisiv100 controller and external HDMI PHY,
-	  supporting progressive RGB video at 8 bpc without audio or CEC.
+	  supporting progressive RGB video at 8 bpc. Both controllers provide
+	  stereo I2S PCM through hdmi-codec when ASoC is enabled. Board sound
+	  links connect the AIAO CPU DAI to the transmitter's sound DAI.
 
 	  If M is selected, the modules are histb-hdmi and histb-hdmi-mv310.
