@@ -30,6 +30,7 @@
 #include <linux/reset.h>
 #include <linux/workqueue.h>
 #include "histb-hdmi-audio.h"
+#include "histb-hdmi-hdcp.h"
 #if IS_ENABLED(CONFIG_CEC_CORE)
 #include <media/cec.h>
 #endif
@@ -44,6 +45,8 @@
 #include <drm/drm_print.h>
 #include <drm/drm_property.h>
 #include <drm/drm_device.h>
+#include <drm/drm_modeset_lock.h>
+#include <drm/display/drm_hdcp_helper.h>
 #include <drm/bridge/histb-hdmi.h>
 #include <drm/display/drm_hdmi_state_helper.h>
 #include <drm/display/drm_scdc_helper.h>
@@ -365,8 +368,19 @@ struct histb_hdmi {
 	struct i2c_adapter ddc;
 	struct drm_bridge bridge;
 	struct drm_connector *active_connector;
+	struct drm_connector *hdcp_connector;
 	struct drm_device *connector_dev;
 	struct delayed_work hpd_work;
+	struct delayed_work hdcp_work;
+	struct histb_hdcp_io hdcp_io;
+	struct histb_hdcp14 *hdcp14;
+	struct histb_hdcp22 *hdcp22;
+	struct reset_control *cipher_reset;
+	unsigned int hdcp_protocol;
+	bool cipher_active;
+	bool hdcp_requested;
+	/* audio_lock protects the attachment and every HDCP enqueue. */
+	bool attached;
 	bool removing;
 	int tx_irq;
 	int last_reported_status;
@@ -1499,6 +1513,146 @@ static enum drm_connector_status histb_hdmi_bridge_detect(struct drm_bridge *bri
 		       connector_status_connected : connector_status_disconnected;
 }
 
+/* Stop under audio_lock, before dropping pixel/auxiliary clocks. A queued
+ * property worker observes hdcp_requested=false after the modeset unlocks.
+ */
+static void histb_hdmi_hdcp_stop(struct histb_hdmi *hdmi)
+{
+	guard(mutex)(&hdmi->ddc_lock);
+	if (hdmi->hdcp_protocol == 22)
+		histb_hdcp22_stop(hdmi->hdcp22);
+	else if (hdmi->hdcp_protocol == 14)
+		histb_hdcp14_stop(hdmi->hdcp14);
+	hdmi->hdcp_protocol = 0;
+	/* Cipher reset covers other secure-world channels: never assert it here. */
+	hdmi->cipher_active = false;
+}
+
+static int histb_hdmi_hdcp_start(struct histb_hdmi *hdmi)
+{
+	int ret = -ENODEV;
+
+	lockdep_assert_held(&hdmi->audio_lock);
+	guard(mutex)(&hdmi->ddc_lock);
+	if (hdmi->hdcp22) {
+		ret = histb_hdcp22_start(hdmi->hdcp22);
+		if (!ret) {
+			hdmi->hdcp_protocol = 22;
+			drm_dbg_kms(hdmi->bridge.dev,
+				    "HDCP 2.2 program code-check passed; authentication started\n");
+			return 0;
+		}
+		drm_dbg_kms(hdmi->bridge.dev, "HDCP 2.2 startup failed: %pe\n",
+			    ERR_PTR(ret));
+		histb_hdcp22_stop(hdmi->hdcp22);
+	}
+	/* Content Type 0 permits a genuine 1.4 fallback, never plaintext
+	 * masquerading as Enabled. No Content Type 1 property is exposed.
+	 */
+	if (!hdmi->hdcp14)
+		return ret;
+	ret = reset_control_deassert(hdmi->cipher_reset);
+	if (ret)
+		return ret;
+	/* CV200 BSP sets clk_valid=0: CRG48[12] is a selector, not a gate.
+	 * Preserve the boot clock selection; only own the real cipher reset.
+	 */
+	hdmi->cipher_active = true;
+	ret = histb_hdcp14_start(hdmi->hdcp14);
+	if (!ret)
+		hdmi->hdcp_protocol = 14;
+	else {
+		histb_hdcp14_stop(hdmi->hdcp14);
+		hdmi->cipher_active = false;
+	}
+	return ret;
+}
+
+static void histb_hdmi_hdcp_queue(struct histb_hdmi *hdmi, unsigned long delay)
+{
+	lockdep_assert_held(&hdmi->audio_lock);
+	if (hdmi->attached && hdmi->hdcp_connector)
+		mod_delayed_work(system_wq, &hdmi->hdcp_work, delay);
+}
+
+static void histb_hdmi_hdcp_work(struct work_struct *work)
+{
+	struct histb_hdmi *hdmi = container_of(to_delayed_work(work),
+					      struct histb_hdmi, hdcp_work);
+	struct drm_connector *connector;
+	struct drm_device *drm;
+	unsigned long delay = msecs_to_jiffies(50);
+	bool retry = false;
+	int ret;
+
+	/* Detach drains this worker before bridge.dev or the connector can go
+	 * away. Never wait for connection_mutex: teardown may already own it.
+	 */
+	mutex_lock(&hdmi->audio_lock);
+	if (!hdmi->attached || !hdmi->hdcp_connector) {
+		mutex_unlock(&hdmi->audio_lock);
+		return;
+	}
+	drm = hdmi->bridge.dev;
+	mutex_unlock(&hdmi->audio_lock);
+	if (!ww_mutex_trylock(&drm->mode_config.connection_mutex.mutex, NULL)) {
+		mutex_lock(&hdmi->audio_lock);
+		histb_hdmi_hdcp_queue(hdmi, delay);
+		mutex_unlock(&hdmi->audio_lock);
+		return;
+	}
+	mutex_lock(&hdmi->audio_lock);
+	connector = hdmi->hdcp_connector;
+	if (!hdmi->attached || !connector)
+		goto unlock;
+	if (!hdmi->hdcp_requested || !hdmi->aux_enabled || !hdmi->mode_ready ||
+	    histb_hdmi_bridge_detect(&hdmi->bridge) != connector_status_connected) {
+		histb_hdmi_hdcp_stop(hdmi);
+		if (connector->state->content_protection ==
+		    DRM_MODE_CONTENT_PROTECTION_ENABLED)
+			drm_hdcp_update_content_protection(connector,
+					DRM_MODE_CONTENT_PROTECTION_DESIRED);
+		retry = hdmi->hdcp_requested && hdmi->mode_ready && hdmi->aux_enabled;
+		delay = msecs_to_jiffies(500);
+		goto unlock;
+	}
+	retry = true;
+	if (!hdmi->hdcp_protocol) {
+		ret = histb_hdmi_hdcp_start(hdmi);
+		if (ret)
+			goto failed;
+	}
+	mutex_lock(&hdmi->ddc_lock);
+	ret = hdmi->hdcp_protocol == 22 ?
+		histb_hdcp22_poll(hdmi->hdcp22, connector) :
+		histb_hdcp14_poll(hdmi->hdcp14, connector);
+	mutex_unlock(&hdmi->ddc_lock);
+	if (ret < 0)
+		goto failed;
+	if (ret == 1 && connector->state->content_protection ==
+	    DRM_MODE_CONTENT_PROTECTION_DESIRED)
+		drm_hdcp_update_content_protection(connector,
+					DRM_MODE_CONTENT_PROTECTION_ENABLED);
+	else if (!ret && connector->state->content_protection ==
+		 DRM_MODE_CONTENT_PROTECTION_ENABLED)
+		drm_hdcp_update_content_protection(connector,
+					DRM_MODE_CONTENT_PROTECTION_DESIRED);
+	goto unlock;
+
+failed:
+	histb_hdmi_hdcp_stop(hdmi);
+	if (connector->state->content_protection == DRM_MODE_CONTENT_PROTECTION_ENABLED)
+		drm_hdcp_update_content_protection(connector,
+					DRM_MODE_CONTENT_PROTECTION_DESIRED);
+	dev_warn_ratelimited(hdmi->dev, "HDCP authentication unavailable/failed: %d\n", ret);
+	delay = msecs_to_jiffies(2000);
+unlock:
+	if (retry)
+		histb_hdmi_hdcp_queue(hdmi, delay);
+	mutex_unlock(&hdmi->audio_lock);
+	drm_modeset_unlock(&drm->mode_config.connection_mutex);
+}
+
 /* Registered after the managed connector, so it runs before its cleanup. */
 static void histb_hdmi_connector_release(struct drm_device *drm, void *data);
 
@@ -1522,8 +1676,15 @@ int histb_hdmi_connector_init(struct drm_bridge *bridge,
 	ret = drm_connector_attach_hdr_output_metadata_property(connector);
 	if (ret)
 		return ret;
+	if (hdmi->hdcp14 || hdmi->hdcp22) {
+		ret = drm_connector_attach_content_protection_property(connector, false);
+		if (ret)
+			return ret;
+	}
 	mutex_lock(&hdmi->audio_lock);
 	hdmi->connector_dev = connector->dev;
+	if (hdmi->hdcp14 || hdmi->hdcp22)
+		hdmi->hdcp_connector = connector;
 	mutex_unlock(&hdmi->audio_lock);
 #if IS_ENABLED(CONFIG_CEC_CORE)
 	{
@@ -1562,6 +1723,8 @@ static void histb_hdmi_hpd_work(struct work_struct *work)
 	if (status != connector_status_connected) {
 		mutex_lock(&hdmi->audio_lock);
 		histb_audio_disable(&hdmi->audio);
+		histb_hdmi_hdcp_stop(hdmi);
+		histb_hdmi_hdcp_queue(hdmi, 0);
 		mutex_unlock(&hdmi->audio_lock);
 	}
 #if IS_ENABLED(CONFIG_CEC_CORE)
@@ -1607,7 +1770,7 @@ static void histb_hdmi_bridge_hpd_enable(struct drm_bridge *bridge)
 
 	guard(mutex)(&hdmi->audio_lock);
 
-	if (!hdmi->aux_enabled)
+	if (!hdmi->attached || !hdmi->aux_enabled)
 		return;
 	WRITE_ONCE(hdmi->hpd_enabled, true);
 	WRITE_ONCE(hdmi->last_reported_status, -1);
@@ -1638,15 +1801,73 @@ static void histb_hdmi_bridge_hpd_disable(struct drm_bridge *bridge)
 	cancel_delayed_work(&hdmi->hpd_work);
 }
 
+static void histb_hdmi_quiesce(struct histb_hdmi *hdmi)
+{
+	/* Close every HDCP enqueue path before draining either worker. Atomic
+	 * callbacks use audio_lock too, but never wait for a worker here.
+	 */
+	mutex_lock(&hdmi->audio_lock);
+	hdmi->attached = false;
+	hdmi->hdcp_requested = false;
+	mutex_unlock(&hdmi->audio_lock);
+
+	/* Clear the core's connector callback, mask the source, then drain the
+	 * IRQ and HPD worker before the final HDCP stop/cancel. Do not hold
+	 * hpd_mutex, audio_lock or connection_mutex across the drains. Encoder
+	 * cleanup and the managed connector release call us outside modeset locks.
+	 */
+	drm_bridge_hpd_disable(&hdmi->bridge);
+	if (hdmi->tx_irq >= 0 && !hdmi->hpd_polling)
+		synchronize_irq(hdmi->tx_irq);
+	cancel_delayed_work_sync(&hdmi->hpd_work);
+	mutex_lock(&hdmi->audio_lock);
+	histb_hdmi_hdcp_stop(hdmi);
+	histb_audio_disable(&hdmi->audio);
+	mutex_unlock(&hdmi->audio_lock);
+	cancel_delayed_work_sync(&hdmi->hdcp_work);
+#if IS_ENABLED(CONFIG_CEC_CORE)
+	cec_phys_addr_invalidate(hdmi->cec_adap);
+	cec_s_conn_info(hdmi->cec_adap, NULL);
+#endif
+
+	mutex_lock(&hdmi->audio_lock);
+	hdmi->hdcp_connector = NULL;
+	hdmi->active_connector = NULL;
+	mutex_unlock(&hdmi->audio_lock);
+}
+
 static void histb_hdmi_connector_release(struct drm_device *drm, void *data)
 {
 	struct histb_hdmi *hdmi = data;
 
 	hdmi->connector_dev = NULL;
-#if IS_ENABLED(CONFIG_CEC_CORE)
-	cec_phys_addr_invalidate(hdmi->cec_adap);
-	cec_s_conn_info(hdmi->cec_adap, NULL);
-#endif
+	histb_hdmi_quiesce(hdmi);
+}
+
+static int histb_hdmi_bridge_attach(struct drm_bridge *bridge,
+				  enum drm_bridge_attach_flags flags)
+{
+	struct histb_hdmi *hdmi = bridge_to_histb_hdmi(bridge);
+	guard(mutex)(&hdmi->audio_lock);
+
+	if (hdmi->removing)
+		return -ENODEV;
+	hdmi->attached = true;
+	return 0;
+}
+
+static void histb_hdmi_bridge_detach(struct drm_bridge *bridge)
+{
+	struct histb_hdmi *hdmi = bridge_to_histb_hdmi(bridge);
+
+	/* Remove the managed callback as well: the provider may be removed
+	 * before the DRM device's last reference is dropped.
+	 */
+	if (hdmi->connector_dev)
+		drmm_release_action(hdmi->connector_dev,
+				    histb_hdmi_connector_release, hdmi);
+	else
+		histb_hdmi_quiesce(hdmi);
 }
 
 static const struct drm_edid *
@@ -2007,7 +2228,8 @@ static int histb_hdmi_bridge_atomic_check(struct drm_bridge *bridge,
 	 */
 	if (old_state &&
 	    (!drm_connector_atomic_hdr_metadata_equal(old_state, conn_state) ||
-	     old_state->colorspace != conn_state->colorspace))
+	     old_state->colorspace != conn_state->colorspace ||
+	     old_state->content_protection != conn_state->content_protection))
 		crtc_state->mode_changed = true;
 
 	avi = &conn_state->hdmi.infoframes.avi.data.avi;
@@ -2193,6 +2415,11 @@ histb_hdmi_bridge_atomic_enable(struct drm_bridge *bridge,
 		if (ret)
 			dev_err(hdmi->dev, "HDMI PCM restore failed: %d\n", ret);
 	}
+	if (hdmi->attached && (hdmi->hdcp14 || hdmi->hdcp22)) {
+		hdmi->hdcp_requested = connector->state->content_protection !=
+			DRM_MODE_CONTENT_PROTECTION_UNDESIRED;
+		histb_hdmi_hdcp_queue(hdmi, 0);
+	}
 }
 
 static void
@@ -2202,6 +2429,9 @@ histb_hdmi_bridge_atomic_disable(struct drm_bridge *bridge,
 	struct histb_hdmi *hdmi = bridge_to_histb_hdmi(bridge);
 
 	guard(mutex)(&hdmi->audio_lock);
+	hdmi->hdcp_requested = false;
+	histb_hdmi_hdcp_stop(hdmi);
+	histb_hdmi_hdcp_queue(hdmi, 0);
 	histb_audio_disable(&hdmi->audio);
 	histb_hdmi_tmds_enable(hdmi, false);
 	histb_hdmi_scdc_disable(hdmi);
@@ -2226,6 +2456,8 @@ histb_hdmi_bridge_atomic_post_disable(struct drm_bridge *bridge,
 }
 
 static const struct drm_bridge_funcs histb_hdmi_bridge_funcs = {
+	.attach = histb_hdmi_bridge_attach,
+	.detach = histb_hdmi_bridge_detach,
 	.atomic_reset = drm_atomic_helper_bridge_reset,
 	.atomic_duplicate_state = drm_atomic_helper_bridge_duplicate_state,
 	.atomic_destroy_state = drm_atomic_helper_bridge_destroy_state,
@@ -2247,6 +2479,8 @@ static const struct drm_bridge_funcs histb_hdmi_bridge_funcs = {
 static void histb_hdmi_disable_resources(struct histb_hdmi *hdmi)
 {
 	guard(mutex)(&hdmi->audio_lock);
+	hdmi->hdcp_requested = false;
+	histb_hdmi_hdcp_stop(hdmi);
 	histb_audio_disable(&hdmi->audio);
 	if (hdmi->aux_enabled) {
 		histb_hdmi_tmds_enable(hdmi, false);
@@ -2285,6 +2519,22 @@ static int __maybe_unused histb_hdmi_suspend(struct device *dev)
 	if (hdmi->tx_irq >= 0)
 		synchronize_irq(hdmi->tx_irq);
 	cancel_delayed_work_sync(&hdmi->hpd_work);
+	mutex_lock(&hdmi->audio_lock);
+	hdmi->hdcp_requested = false;
+	histb_hdmi_hdcp_stop(hdmi);
+	mutex_unlock(&hdmi->audio_lock);
+	cancel_delayed_work_sync(&hdmi->hdcp_work);
+	if (hdmi->hdcp_connector && hdmi->bridge.dev) {
+		ret = drm_modeset_lock(&hdmi->bridge.dev->mode_config.connection_mutex,
+				       NULL);
+		if (ret)
+			return ret;
+		if (hdmi->hdcp_connector->state->content_protection ==
+		    DRM_MODE_CONTENT_PROTECTION_ENABLED)
+			drm_hdcp_update_content_protection(hdmi->hdcp_connector,
+					DRM_MODE_CONTENT_PROTECTION_DESIRED);
+		drm_modeset_unlock(&hdmi->bridge.dev->mode_config.connection_mutex);
+	}
 
 	guard(mutex)(&hdmi->audio_lock);
 	histb_audio_disable(&hdmi->audio);
@@ -2359,6 +2609,61 @@ static const struct dev_pm_ops histb_hdmi_pm_ops = {
 	SET_SYSTEM_SLEEP_PM_OPS(histb_hdmi_suspend, histb_hdmi_resume)
 };
 
+static u8 histb_hdmi_hdcp_read(void *ctx, u32 reg)
+{
+	return histb_hdmi_readb(ctx, reg);
+}
+
+static void histb_hdmi_hdcp_write(void *ctx, u32 reg, u8 value)
+{
+	histb_hdmi_writeb(ctx, reg, value);
+}
+
+static int histb_hdmi_hdcp_init(struct platform_device *pdev,
+				struct histb_hdmi *hdmi)
+{
+	struct histb_hdcp_io *io = &hdmi->hdcp_io;
+	struct resource *core = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	struct resource *cipher = platform_get_resource_byname(pdev, IORESOURCE_MEM,
+							     "cipher");
+	struct resource *ctrl = platform_get_resource_byname(pdev, IORESOURCE_MEM,
+							   "hdcp-ctrl");
+
+	io->dev = hdmi->dev;
+	io->ctx = hdmi;
+	io->read = histb_hdmi_hdcp_read;
+	io->write = histb_hdmi_hdcp_write;
+	io->peri = hdmi->perictrl;
+	if (cipher) {
+		if (resource_size(cipher) < 0x4000)
+			return -EINVAL;
+		io->cipher = devm_ioremap_resource(hdmi->dev, cipher);
+		if (IS_ERR(io->cipher))
+			return PTR_ERR(io->cipher);
+		hdmi->cipher_reset = devm_reset_control_get_exclusive(hdmi->dev, "cipher");
+		if (IS_ERR(hdmi->cipher_reset))
+			return PTR_ERR(hdmi->cipher_reset);
+		hdmi->hdcp14 = histb_hdcp14_create(io);
+		if (IS_ERR(hdmi->hdcp14))
+			return PTR_ERR(hdmi->hdcp14);
+	}
+	if (ctrl) {
+		/* PRAM is already covered by the controller's 128 KiB region.
+		 * Do not reserve/map it a second time with an overlapping resource.
+		 */
+		if (!core || resource_size(core) < 0x20000 || resource_size(ctrl) < 4)
+			return -EINVAL;
+		io->pram = hdmi->base + 0x10000;
+		io->avcttpt = devm_ioremap_resource(hdmi->dev, ctrl);
+		if (IS_ERR(io->avcttpt))
+			return PTR_ERR(io->avcttpt);
+		hdmi->hdcp22 = histb_hdcp22_create(io);
+		if (IS_ERR(hdmi->hdcp22))
+			return PTR_ERR(hdmi->hdcp22);
+	}
+	return 0;
+}
+
 static int histb_hdmi_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -2373,6 +2678,7 @@ static int histb_hdmi_probe(struct platform_device *pdev)
 	mutex_init(&hdmi->audio_lock);
 	mutex_init(&hdmi->packet_lock);
 	mutex_init(&hdmi->ddc_lock);
+	INIT_DELAYED_WORK(&hdmi->hdcp_work, histb_hdmi_hdcp_work);
 	hdmi->audio.lock = &hdmi->audio_lock;
 	hdmi->audio.data = hdmi;
 	hdmi->audio.program = histb_hdmi_audio_program;
@@ -2415,6 +2721,9 @@ static int histb_hdmi_probe(struct platform_device *pdev)
 	if (IS_ERR(hdmi->perictrl))
 		return dev_err_probe(dev, PTR_ERR(hdmi->perictrl),
 				     "failed to get peripheral control register\n");
+	ret = histb_hdmi_hdcp_init(pdev, hdmi);
+	if (ret)
+		return dev_err_probe(dev, ret, "failed to initialize HDCP resources\n");
 
 	ret = clk_bulk_prepare_enable(HISTB_HDMI_AUX_CLK_COUNT, hdmi->clks);
 	if (ret)
@@ -2546,13 +2855,8 @@ static void histb_hdmi_remove(struct platform_device *pdev)
 	mutex_lock(&hdmi->audio_lock);
 	hdmi->removing = true;
 	mutex_unlock(&hdmi->audio_lock);
+	histb_hdmi_bridge_detach(&hdmi->bridge);
 	histb_audio_unregister(&hdmi->audio);
-	WRITE_ONCE(hdmi->hpd_enabled, false);
-	if (hdmi->aux_enabled)
-		histb_hdmi_writeb(hdmi, HISTB_HDMI_INTR1_MASK, 0);
-	if (hdmi->tx_irq >= 0)
-		synchronize_irq(hdmi->tx_irq);
-	cancel_delayed_work_sync(&hdmi->hpd_work);
 #if IS_ENABLED(CONFIG_CEC_CORE)
 	if (hdmi->cec_adap)
 		devm_release_action(&pdev->dev, histb_hdmi_cec_release, hdmi);
