@@ -6,6 +6,9 @@ config DRM_HISI_HISTB_HDMI
 	depends on ARCH_HISI || COMPILE_TEST
 	select DRM_DISPLAY_HELPER
 	select DRM_DISPLAY_HDMI_STATE_HELPER
+	select DRM_DISPLAY_HDCP_HELPER
+	select FW_LOADER
+	select CRC32
 	select DRM_KMS_HELPER
 	select MFD_SYSCON
 	select CEC_CORE
@@ -19,5 +22,8 @@ config DRM_HISI_HISTB_HDMI
 	  supporting progressive RGB video at 8 bpc. Both controllers provide
 	  stereo I2S PCM through hdmi-codec when ASoC is enabled. Board sound
 	  links connect the AIAO CPU DAI to the transmitter's sound DAI.
+	  CV200 also supports HDR10/HLG signaling for ten-bit BT.2020 RGB
+	  scanout, and HDCP with the optional cipher/MCU resources and licensed
+	  board firmware/key packages. These are not MV310 capabilities.
 
 	  If M is selected, the modules are histb-hdmi and histb-hdmi-mv310.
