@@ -101,6 +101,9 @@
 #define HISTB_TSI_INDEPENDENT_CLK		91
 #define HISTB_JPGD_CORE_CLK		92
 #define HISTB_JPGD_SMMU_CLK		93
+#define HISTB_VDP_G1_CLK			94
+#define HISTB_VDP_G3_CLK			95
+#define HISTB_VDP_V1_CLK			96
 
 /* clocks provided by mcu CRG */
 #define HISTB_MCE_CLK			1
