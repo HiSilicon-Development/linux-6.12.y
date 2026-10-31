@@ -201,6 +201,9 @@ static int aiao_stop_tx(struct hi3798cv200_aiao *aiao)
 	const u32 tx_int_clr = aiao_tx_reg(aiao, AIAO_TX0_INT_CLR);
 	const u32 top_irq = aiao_tx_top_irq(aiao);
 
+	/* Stop delivery before the disable handshake can empty the FIFO. */
+	aiao_write(aiao, tx_int_ena, 0);
+	aiao_update_bits(aiao, AIAO_INT_ENA, top_irq, 0);
 	trans_size = aiao_read(aiao, tx_trans);
 	val = aiao_read(aiao, tx_dsp);
 	if (val & AIAO_TX_ENABLE) {
@@ -220,9 +223,7 @@ static int aiao_stop_tx(struct hi3798cv200_aiao *aiao)
 			aiao_write(aiao, tx_trans, trans_size);
 	}
 
-	aiao_write(aiao, tx_int_ena, 0);
 	aiao_write(aiao, tx_int_clr, AIAO_TX_INT_ALL);
-	aiao_update_bits(aiao, AIAO_INT_ENA, top_irq, 0);
 	rcu_assign_pointer(aiao->substream, NULL);
 	return ret;
 }
@@ -456,6 +457,13 @@ static int hi3798cv200_aiao_publish(struct snd_soc_component *component,
 		      buffer_bytes;
 	dma_wmb();
 	aiao_write(aiao, aiao_tx_reg(aiao, AIAO_TX0_BUF_WPTR), pos);
+	/* EMPTY is a level condition. Rearm it only when scanout has more data;
+	 * ALSA still decides genuine underrun versus normal final-buffer drain.
+	 */
+	if (queued_bytes &&
+	    (aiao_read(aiao, aiao_tx_reg(aiao, AIAO_TX0_DSP_CTRL)) & AIAO_TX_ENABLE))
+		aiao_update_bits(aiao, aiao_tx_reg(aiao, AIAO_TX0_INT_ENA),
+				 AIAO_TX_INT_EMPTY, AIAO_TX_INT_EMPTY);
 	return 0;
 }
 
@@ -575,6 +583,12 @@ static bool hi3798cv200_aiao_ack_tx0(struct hi3798cv200_aiao *aiao,
 	u32 tx_int_ena = aiao_tx_reg(aiao, AIAO_TX0_INT_ENA);
 	u32 top_irq = aiao_tx_top_irq(aiao);
 
+	/* An empty ring immediately reasserts EMPTY after W1C. Consume that
+	 * notification once, then let period_elapsed handle drain/XRUN and
+	 * publish() rearm it when another DMA range becomes available.
+	 */
+	if (raw & AIAO_TX_INT_EMPTY)
+		aiao_update_bits(aiao, tx_int_ena, AIAO_TX_INT_EMPTY, 0);
 	for (attempt = 0; attempt < AIAO_IRQ_ACK_RETRIES; attempt++) {
 		if (raw)
 			aiao_write(aiao, tx_int_clr, raw);
