@@ -155,6 +155,8 @@ static int mv310_register_mmc_mux(struct device *dev, void __iomem *base,
  * so those gates deliberately have no invented fixed-rate parent.
  */
 static const struct hisi_gate_clock mv310_gate_clks[] = {
+	{ HI3798MV310_AIAO_CLK, "mv310_aiao", "mv310_aiao_mux",
+	  CLK_SET_RATE_PARENT, 0x118, 0, 0 },
 	{ HI3798MV310_MMC0_BIU, "mv310_mmc0_biu", NULL, 0, 0xa0, 0, 0 },
 	{ HI3798MV310_MMC0_CIU, "mv310_mmc0_ciu", "mv310_mmc0_mux",
 	  CLK_SET_RATE_PARENT | CLK_GET_RATE_NOCACHE, 0xa0, 1, 0 },
@@ -647,6 +649,45 @@ static int mv310_register_venc_mux(struct device *dev, void __iomem *base)
 	return PTR_ERR_OR_ZERO(mux);
 }
 
+static int mv310_register_audio(struct device *dev, struct hisi_clock_data *data)
+{
+	static const char * const parents[] = { "mv310_aiao_100m", "mv310_aiao_50m" };
+	struct clk_hw *hw;
+	unsigned long flags;
+	u32 reg;
+
+	/* BSP hi3798mv310/hi_reg_crg.h:819-827; hal_aiao_priv.c:720-740.
+	 * The skip divider is bypassed, then the source selects 50/100 MHz.
+	 */
+	hw = devm_clk_hw_register_fixed_rate(dev, parents[0], NULL, 0, 100000000);
+	if (IS_ERR(hw))
+		return PTR_ERR(hw);
+	hw = devm_clk_hw_register_fixed_rate(dev, parents[1], NULL, 0, 50000000);
+	if (IS_ERR(hw))
+		return PTR_ERR(hw);
+	hw = devm_clk_hw_register_mux(dev, "mv310_aiao_mux", parents,
+		ARRAY_SIZE(parents), CLK_SET_RATE_PARENT, data->base + 0x118,
+		22, 1, 0, &hisi_clk_lock);
+	if (IS_ERR(hw))
+		return PTR_ERR(hw);
+	/* 860.160 MHz is the source encoded by the BSP's AIAO_PLL_860MHZ
+	 * coefficients: e.g. 256*48k*2^27/860160000 = 0x1d41d4 (truncated).
+	 * EPLL is established by firmware; never retune the shared PLL here.
+	 */
+	hw = devm_clk_hw_register_fixed_rate(dev, "mv310_aiao_mclk", NULL,
+					 0, 860160000);
+	if (IS_ERR(hw))
+		return PTR_ERR(hw);
+	data->clk_data.clks[HI3798MV310_AIAO_MCLK] = hw->clk;
+	spin_lock_irqsave(&hisi_clk_lock, flags);
+	reg = readl(data->base + 0x118);
+	reg &= ~(BIT(21) | BIT(17) | GENMASK(16, 12));
+	writel(reg, data->base + 0x118);
+	writel(reg | BIT(17), data->base + 0x118);
+	spin_unlock_irqrestore(&hisi_clk_lock, flags);
+	return 0;
+}
+
 static void mv310_unregister_gates(void *data)
 {
 	hisi_clk_unregister_gate(mv310_gate_clks, ARRAY_SIZE(mv310_gate_clks), data);
@@ -722,6 +763,9 @@ static int hi3798mv310_crg_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 	ret = mv310_register_venc_mux(dev, data->base);
+	if (ret)
+		return ret;
+	ret = mv310_register_audio(dev, data);
 	if (ret)
 		return ret;
 

@@ -35,6 +35,12 @@ description: |
   native CRG67 SSC, bypass, oscillator, OS, AS and pixel gates, plus the
   CRG68 TMDS gate. CV200 video-layer gate bits are reserved on MV310.
 
+  AIAO uses CRG70 (0x118): working clock gate bit0, reset request bit4,
+  50/100 MHz source selector bit22 and audio source selector bit21.
+  Its fractional MCLK generator uses the BSP's 860.160 MHz EPLL source;
+  this provider bypasses the working-clock skip divider but never retunes
+  EPLL. The audio PLL must already be configured by the platform firmware.
+
 properties:
   compatible:
     items:
