@@ -29,7 +29,9 @@
 #include <linux/seq_file.h>
 #include <linux/slab.h>
 
+#include <drm/drm_atomic_state_helper.h>
 #include <drm/drm_atomic_helper.h>
+#include <drm/bridge/histb-hdmi.h>
 #include <drm/drm_blend.h>
 #include <drm/drm_bridge.h>
 #include <drm/drm_bridge_connector.h>
@@ -225,6 +227,7 @@
 #define HISTB_VDP_G0_IFMT		GENMASK(7, 0)
 #define HISTB_VDP_G0_BITEXT		GENMASK(9, 8)
 #define HISTB_VDP_G0_REQ_CTRL		GENMASK(15, 14)
+#define HISTB_VDP_G0_FETCH_POLICY	GENMASK(18, 14)
 #define HISTB_VDP_G0_READ_PROGRESSIVE	BIT(26)
 #define HISTB_VDP_G0_UPDATE_PROGRESSIVE	BIT(27)
 #define HISTB_VDP_G0_NONSECURE		BIT(30)
@@ -400,6 +403,40 @@
 #define MV310_POS(x, y)			((x) | ((y) << 16))
 #define MV310_SIZE(w, h)			MV310_POS((w) - 1, (h) - 1)
 
+/* CV200 HIFB maps logical HD2 to physical G3; there is no G2 gate. */
+#define HISTB_VDP_GFX_COUNT	3
+#define HISTB_VDP_VIDEO_COUNT	2
+#define HISTB_VDP_PLANE_COUNT	5
+#define HISTB_VDP_GFX_OFFSET	0x200
+#define HISTB_VDP_VIDEO_OFFSET	0x800
+
+static const u8 histb_vdp_gfx_ids[] = { 0, 1, 3 };
+
+struct histb_vdp_overlay {
+	struct drm_plane plane;
+	u8 id;
+};
+
+struct histb_vdp_zme {
+	void *cpu;
+	dma_addr_t dma;
+	u32 src_width, src_height, dst_width, dst_height;
+	u8 bank;
+	bool valid;
+};
+
+struct histb_vdp_mixer {
+	u32 graphics, video, output;
+	u8 graphics_count, graphics_alpha;
+};
+
+struct histb_vdp_crtc_state {
+	struct drm_crtc_state base;
+	struct histb_vdp_mixer mixer;
+	u32 plane_updates;
+	bool inputs_failed;
+};
+
 struct histb_vdp_soc_data {
 	u32 g0_ctrl;
 	u32 g0_upd;
@@ -440,20 +477,15 @@ enum histb_vdp_gfx_format {
 struct histb_vdp {
 	struct drm_device drm;
 	struct drm_simple_display_pipe pipe;
-	struct drm_plane v0_plane;
+	struct drm_crtc_helper_funcs crtc_helper_funcs;
+	struct histb_vdp_overlay overlays[HISTB_VDP_PLANE_COUNT - 1];
 	struct drm_connector *connector;
-	void *zme_coef;
-	dma_addr_t zme_coef_dma;
-	u32 zme_src_width, zme_src_height;
-	u32 zme_dst_width, zme_dst_height;
+	struct histb_vdp_zme zme[HISTB_VDP_VIDEO_COUNT];
 	u32 display_width, display_height;
-	u32 g0_zpos, v0_zpos;
-	u8 zme_bank;
-	bool zme_valid;
-	bool v0_enabled;
+	bool video_enabled[HISTB_VDP_VIDEO_COUNT];
 	void __iomem *base;
 	const struct histb_vdp_soc_data *soc;
-	struct clk_bulk_data clks[7];
+	struct clk_bulk_data clks[10];
 	unsigned int num_clks;
 	unsigned int close_delay_us;
 	struct reset_control *reset;
@@ -500,6 +532,30 @@ static inline struct histb_vdp *to_histb_vdp(struct drm_device *drm)
 	return container_of(drm, struct histb_vdp, drm);
 }
 
+static struct histb_vdp_crtc_state *
+to_histb_vdp_crtc_state(struct drm_crtc_state *state)
+{
+	return container_of(state, struct histb_vdp_crtc_state, base);
+}
+
+static struct drm_plane *histb_vdp_plane(struct histb_vdp *vdp, unsigned int id)
+{
+	return id ? &vdp->overlays[id - 1].plane : &vdp->pipe.plane;
+}
+
+static unsigned int histb_vdp_plane_id(struct histb_vdp *vdp,
+				     struct drm_plane *plane)
+{
+	if (plane == &vdp->pipe.plane)
+		return 0;
+	return container_of(plane, struct histb_vdp_overlay, plane)->id;
+}
+
+static bool histb_vdp_plane_visible(const struct drm_plane_state *state)
+{
+	return state && state->fb && state->crtc && state->visible && state->alpha;
+}
+
 static inline struct histb_vdp_shadow_object *
 to_histb_vdp_shadow_object(struct drm_gem_object *obj)
 {
@@ -523,10 +579,12 @@ static u64 histb_vdp_plane_address(const struct drm_plane_state *state,
 	struct drm_gem_dma_object *obj = drm_fb_dma_get_gem_obj(fb, index);
 	u32 hsub = index ? fb->format->hsub : 1;
 	u32 vsub = index ? fb->format->vsub : 1;
+	u32 block = drm_format_info_block_width(fb->format, index);
+	u32 bytes = fb->format->char_per_block[index];
 
 	return (u64)obj->dma_addr + fb->offsets[index] +
 		(u64)((state->src.y1 >> 16) / vsub) * fb->pitches[index] +
-		((state->src.x1 >> 16) / hsub) * fb->format->cpp[index];
+		((state->src.x1 >> 16) / hsub / block) * bytes;
 }
 
 static void histb_vdp_shadow_object_free(struct drm_gem_object *obj)
@@ -739,10 +797,20 @@ histb_vdp_plane_config_unchanged(const struct drm_plane_state *old_state,
  */
 static void histb_vdp_latch_gfx(struct histb_vdp *vdp)
 {
-	/* Keep the framebuffer writes ordered before both posted latch requests. */
+	unsigned int i;
+
 	dma_wmb();
-	writel(1, vdp->base + vdp->soc->g0_upd);
-	readl(vdp->base + vdp->soc->g0_upd);
+	if (vdp->soc->mv310) {
+		writel(1, vdp->base + vdp->soc->g0_upd);
+		readl(vdp->base + vdp->soc->g0_upd);
+	} else {
+		for (i = 0; i < HISTB_VDP_GFX_COUNT; i++) {
+			u32 reg = HISTB_VDP_G0_UPD + histb_vdp_gfx_ids[i] * HISTB_VDP_GFX_OFFSET;
+
+			writel(1, vdp->base + reg);
+			readl(vdp->base + reg);
+		}
+	}
 	writel(1, vdp->base + vdp->soc->gp0_upd);
 	readl(vdp->base + vdp->soc->gp0_upd);
 }
@@ -794,95 +862,129 @@ static void histb_mv310_program_plane(struct histb_vdp *vdp,
 	       vdp->base + MV310_G0_CTRL);
 }
 
-static int histb_vdp_program_plane(struct histb_vdp *vdp,
-				   struct drm_plane_state *state,
-				   const struct drm_plane_state *old_state)
+static void histb_vdp_destroy_crtc_state(struct drm_simple_display_pipe *pipe,
+					  struct drm_crtc_state *state)
+{
+	__drm_atomic_helper_crtc_destroy_state(state);
+	kfree(to_histb_vdp_crtc_state(state));
+}
+
+static void histb_vdp_reset_crtc(struct drm_simple_display_pipe *pipe)
+{
+	struct histb_vdp_crtc_state *state;
+
+	if (pipe->crtc.state)
+		histb_vdp_destroy_crtc_state(pipe, pipe->crtc.state);
+	pipe->crtc.state = NULL;
+	state = kzalloc(sizeof(*state), GFP_KERNEL);
+	if (!state)
+		return;
+	__drm_atomic_helper_crtc_reset(&pipe->crtc, &state->base);
+	state->mixer.graphics = 1;
+	state->mixer.output = 2;
+	state->mixer.graphics_alpha = 0xff;
+}
+
+static struct drm_crtc_state *
+histb_vdp_duplicate_crtc_state(struct drm_simple_display_pipe *pipe)
+{
+	struct histb_vdp_crtc_state *old = to_histb_vdp_crtc_state(pipe->crtc.state);
+	struct histb_vdp_crtc_state *state = kzalloc(sizeof(*state), GFP_KERNEL);
+
+	if (!state)
+		return NULL;
+	__drm_atomic_helper_crtc_duplicate_state(&pipe->crtc, &state->base);
+	state->mixer = old->mixer;
+	return &state->base;
+}
+
+static void histb_vdp_gfx_disable(struct histb_vdp *vdp, unsigned int id)
+{
+	u32 reg = vdp->soc->mv310 ? MV310_G0_CTRL :
+		HISTB_VDP_G0_CTRL + histb_vdp_gfx_ids[id] * HISTB_VDP_GFX_OFFSET;
+
+	writel(readl(vdp->base + reg) & ~HISTB_VDP_G0_ENABLE, vdp->base + reg);
+}
+
+static int histb_vdp_program_gfx(struct histb_vdp *vdp, unsigned int id,
+				struct drm_plane_state *state,
+				const struct drm_plane_state *old_state,
+				const struct histb_vdp_mixer *mixer, bool copy)
 {
 	struct drm_framebuffer *fb = state->fb;
 	dma_addr_t address;
-	u32 format = histb_vdp_gfx_format(fb->format->format);
-	u32 width = state->src_w >> 16;
-	u32 height = state->src_h >> 16;
-	u32 x = state->crtc_x;
-	u32 y = state->crtc_y;
-	u32 ctrl;
-	u8 alpha = state->alpha >> 8;
+	u32 off = histb_vdp_gfx_ids[id] * HISTB_VDP_GFX_OFFSET;
+	u32 width, height, x, y, ctrl;
+	u8 alpha = mixer->graphics_count > 1 ? state->alpha >> 8 : 0xff;
 	int ret;
 
-	vdp->g0_zpos = state->normalized_zpos;
-	ret = histb_vdp_copy_shadow(state);
-	if (ret)
-		return ret;
-
-	address = drm_fb_dma_get_gem_addr(fb, state, 0);
-	if (!histb_vdp_dma_address_valid(address)) {
-		drm_err(&vdp->drm, "invalid G0 DMA address %pad\n", &address);
-		return -EINVAL;
+	if (!histb_vdp_plane_visible(state)) {
+		histb_vdp_gfx_disable(vdp, id);
+		return 0;
 	}
-
+	if (copy) {
+		ret = histb_vdp_copy_shadow(state);
+		if (ret)
+			return ret;
+	}
+	address = histb_vdp_plane_address(state, 0);
 	if (vdp->soc->mv310) {
 		histb_mv310_program_plane(vdp, state, old_state, address);
 		return 0;
 	}
-
-	writel(lower_32_bits(address), vdp->base + HISTB_VDP_G0_ADDR);
-	/* GP0 applies global alpha after G0's per-pixel premultiplication. */
-	writel(alpha, vdp->base + HISTB_VDP_GP0_GALPHA);
-	/*
-	 * A same-configuration page flip only changes the GFX shadow address.
-	 * Avoid restaging live format, geometry and fetch controls before the
-	 * paired GFX/GP update requests.
-	 */
-	if (histb_vdp_plane_config_unchanged(old_state, state)) {
-		return 0;
-	}
-
-	/* G0 is the scanout layer and uses AXI master 0 in the CV200 BSP. */
-	writel(readl(vdp->base + HISTB_VDP_VOMASTERSEL) &
-	       ~HISTB_VDP_VOMASTERSEL_G0,
-	       vdp->base + HISTB_VDP_VOMASTERSEL);
-	/* Keep all unused fetch paths deterministic after the firmware handoff. */
-	writel(0, vdp->base + HISTB_VDP_G0_NADDR);
-	writel(HISTB_VDP_G0_SMMU_BYPASS_2D |
-	       HISTB_VDP_G0_SMMU_BYPASS_3D_READ,
-	       vdp->base + HISTB_VDP_G0_SMMU_BYPASS0);
-	writel(0, vdp->base + HISTB_VDP_G0_DCMP_ADDR);
-	writel(0, vdp->base + HISTB_VDP_G0_DCMP_NADDR);
-	writel(0, vdp->base + HISTB_VDP_G0_DCMP_OFFSET);
-	writel(fb->pitches[0] / HISTB_VDP_G0_STRIDE_UNIT,
-	       vdp->base + HISTB_VDP_G0_STRIDE);
-	writel(HISTB_VDP_SIZE(width, height),
-	       vdp->base + HISTB_VDP_G0_IRESO);
-	writel(0, vdp->base + HISTB_VDP_G0_SFPOS);
-	writel(HISTB_VDP_POS(x, y), vdp->base + HISTB_VDP_G0_DFPOS);
-	writel(HISTB_VDP_POS(x + width - 1, y + height - 1),
-	       vdp->base + HISTB_VDP_G0_DLPOS);
-	writel(HISTB_VDP_POS(x, y), vdp->base + HISTB_VDP_G0_VFPOS);
-	writel(HISTB_VDP_POS(x + width - 1, y + height - 1),
-	       vdp->base + HISTB_VDP_G0_VLPOS);
-
-	ctrl = FIELD_PREP(HISTB_VDP_G0_IFMT, format) |
-	       FIELD_PREP(HISTB_VDP_G0_BITEXT, 3) |
-	       FIELD_PREP(HISTB_VDP_G0_REQ_CTRL, 3) |
-	       HISTB_VDP_G0_READ_PROGRESSIVE |
-	       HISTB_VDP_G0_UPDATE_PROGRESSIVE |
-	       HISTB_VDP_G0_NONSECURE |
-	       HISTB_VDP_G0_ENABLE;
-	ctrl &= ~HISTB_VDP_G0_OFL_MASTER;
-	writel(ctrl, vdp->base + HISTB_VDP_G0_CTRL);
-	writel(0xff | BIT(8) |
+	width = drm_rect_width(&state->src) >> 16;
+	height = drm_rect_height(&state->src) >> 16;
+	x = state->dst.x1;
+	y = state->dst.y1;
+	writel(lower_32_bits(address), vdp->base + HISTB_VDP_G0_ADDR + off);
+	/* Only a lone G input may use GP0 to scale premultiplied RGB and alpha. */
+	writel(alpha | BIT(8) |
 	       (fb->format->has_alpha && state->pixel_blend_mode != DRM_MODE_BLEND_PIXEL_NONE ?
 		HISTB_VDP_G0_PIXEL_ALPHA : 0) |
 	       (state->pixel_blend_mode == DRM_MODE_BLEND_PREMULTI ? BIT(13) : 0),
-	       vdp->base + HISTB_VDP_G0_CBMPARA);
-	writel(0xff, vdp->base + HISTB_VDP_G0_ALPHA);
+	       vdp->base + HISTB_VDP_G0_CBMPARA + off);
+	if (old_state && old_state->visible &&
+	    histb_vdp_plane_config_unchanged(old_state, state))
+		return 0;
 
+	writel(readl(vdp->base + HISTB_VDP_VOMASTERSEL) &
+	       ~BIT(14 + histb_vdp_gfx_ids[id]), vdp->base + HISTB_VDP_VOMASTERSEL);
+	writel(0, vdp->base + HISTB_VDP_G0_NADDR + off);
+	writel(HISTB_VDP_G0_SMMU_BYPASS_2D | HISTB_VDP_G0_SMMU_BYPASS_3D_READ,
+	       vdp->base + HISTB_VDP_G0_SMMU_BYPASS0 + off);
+	writel(0, vdp->base + HISTB_VDP_G0_DCMP_ADDR + off);
+	writel(0, vdp->base + HISTB_VDP_G0_DCMP_NADDR + off);
+	writel(0, vdp->base + HISTB_VDP_G0_DCMP_OFFSET + off);
+	writel(fb->pitches[0] / HISTB_VDP_G0_STRIDE_UNIT,
+	       vdp->base + HISTB_VDP_G0_STRIDE + off);
+	writel(HISTB_VDP_SIZE(width, height), vdp->base + HISTB_VDP_G0_IRESO + off);
+	writel(0, vdp->base + HISTB_VDP_G0_SFPOS + off);
+	writel(HISTB_VDP_POS(x, y), vdp->base + HISTB_VDP_G0_DFPOS + off);
+	writel(HISTB_VDP_POS(x + width - 1, y + height - 1),
+	       vdp->base + HISTB_VDP_G0_DLPOS + off);
+	writel(HISTB_VDP_POS(x, y), vdp->base + HISTB_VDP_G0_VFPOS + off);
+	writel(HISTB_VDP_POS(x + width - 1, y + height - 1),
+	       vdp->base + HISTB_VDP_G0_VLPOS + off);
+	writel(0, vdp->base + HISTB_VDP_G0_CSC_IDC + off);
+	/* BSP assigns request grouping only to G0; HIFB preserves each bank's
+	 * burst length, FIFO policy and the secondary request grouping.
+	 */
+	ctrl = readl(vdp->base + HISTB_VDP_G0_CTRL + off) & HISTB_VDP_G0_FETCH_POLICY;
+	if (!id)
+		ctrl = (ctrl & ~HISTB_VDP_G0_REQ_CTRL) |
+			FIELD_PREP(HISTB_VDP_G0_REQ_CTRL, 3);
+	ctrl |= FIELD_PREP(HISTB_VDP_G0_IFMT, histb_vdp_gfx_format(fb->format->format)) |
+		FIELD_PREP(HISTB_VDP_G0_BITEXT, 3) |
+		HISTB_VDP_G0_READ_PROGRESSIVE | HISTB_VDP_G0_UPDATE_PROGRESSIVE |
+		HISTB_VDP_G0_NONSECURE | HISTB_VDP_G0_ENABLE;
+	writel(ctrl, vdp->base + HISTB_VDP_G0_CTRL + off);
+	writel(0xff, vdp->base + HISTB_VDP_G0_ALPHA + off);
 	return 0;
 }
 
 /* CV200 routes V0 SDR YCbCr conversion through VDM, not the legacy CSC. */
-static void histb_vdp_program_v0_csc(struct histb_vdp *vdp,
-				      const struct drm_plane_state *state)
+static void histb_vdp_program_video_csc(struct histb_vdp *vdp, unsigned int id,
+					const struct drm_plane_state *state)
 {
 	static const s16 matrix[2][2][9] = {
 		[DRM_COLOR_YCBCR_BT601] = {
@@ -905,20 +1007,21 @@ static void histb_vdp_program_v0_csc(struct histb_vdp *vdp,
 	const s16 *coef = matrix[state->color_encoding][state->color_range];
 	s32 y_dc = state->color_range == DRM_COLOR_YCBCR_LIMITED_RANGE ? -1024 : 0;
 	unsigned int i;
+	u32 coef_reg = id ? 0x3528 : HISTB_VDP_VDM_YUV2RGB_COEF00;
+	u32 dc_reg = id ? 0x3568 : HISTB_VDP_VDM_YUV2RGB_IN_DC00;
+	u32 out_reg = id ? 0x3574 : HISTB_VDP_VDM_YUV2RGB_OUT_DC00;
 
 	/* PQ Q10 coefficients become Q13; DC channels are Y, Cb, Cr. */
 	for (i = 0; i < 9; i++)
 		writel((coef[i] * 8) & 0xffff,
-		       vdp->base + HISTB_VDP_VDM_YUV2RGB_COEF00 + i * 4);
+		       vdp->base + coef_reg + i * 4);
 	writel(13, vdp->base + HISTB_VDP_VDM_YUV2RGB_SCALE2P);
-	writel(y_dc & 0x3fff, vdp->base + HISTB_VDP_VDM_YUV2RGB_IN_DC00);
-	writel((-8192) & 0x3fff, vdp->base + HISTB_VDP_VDM_YUV2RGB_IN_DC00 + 4);
-	writel((-8192) & 0x3fff, vdp->base + HISTB_VDP_VDM_YUV2RGB_IN_DC00 + 8);
-	writel(0, vdp->base + HISTB_VDP_VDM_YUV2RGB_OUT_DC00);
-	writel(0, vdp->base + HISTB_VDP_VDM_YUV2RGB_OUT_DC01);
-	writel(0, vdp->base + HISTB_VDP_VDM_YUV2RGB_OUT_DC02);
-	writel(0, vdp->base + HISTB_VDP_V0_CSC_IDC);
-	writel(BIT(0) | BIT(1), vdp->base + HISTB_VDP_VDM_YUV2RGB_CTRL);
+	writel(y_dc & 0x3fff, vdp->base + dc_reg);
+	writel((-8192) & 0x3fff, vdp->base + dc_reg + 4);
+	writel((-8192) & 0x3fff, vdp->base + dc_reg + 8);
+	for (i = 0; i < 3; i++)
+		writel(0, vdp->base + out_reg + i * 4);
+	writel(0, vdp->base + HISTB_VDP_V0_CSC_IDC + id * HISTB_VDP_VIDEO_OFFSET);
 	/* The SDR provider selects 14-bit YCbCr with transfer functions bypassed. */
 	writel(BIT(0) | BIT(4) | BIT(6), vdp->base + HISTB_VDP_VDM_CTRL);
 }
@@ -945,223 +1048,318 @@ static void histb_vdp_v0_chain_init(struct histb_vdp *vdp)
 	writel(1, vdp->base + HISTB_VDP_CVM1_LMS2IPT_CTRL);
 }
 
-static void histb_vdp_v0_program_zme(struct histb_vdp *vdp, u32 sw, u32 sh,
-				     u32 dw, u32 dh)
+static void histb_vdp_program_zme(struct histb_vdp *vdp, unsigned int id,
+				  u32 sw, u32 sh, u32 dw, u32 dh)
 {
-	dma_addr_t address;
-	u32 hratio = div_u64((u64)(sw / 2) << 20, dw) * 2;
-	u32 vratio = div_u64((u64)sh << 12, dh);
+	struct histb_vdp_zme *zme = &vdp->zme[id];
+	u32 off = id * HISTB_VDP_VIDEO_OFFSET;
+	dma_addr_t address = zme->dma;
+	u32 hsp, vsp, vratio;
 
-	if (vdp->zme_valid && vdp->zme_src_width == sw &&
-	    vdp->zme_src_height == sh && vdp->zme_dst_width == dw &&
-	    vdp->zme_dst_height == dh)
+	if (zme->valid && (id || (zme->src_width == sw && zme->src_height == sh &&
+				 zme->dst_width == dw && zme->dst_height == dh)))
 		return;
-
-	/* The preceding commit retires before its inactive DMA bank is reused. */
-	vdp->zme_bank ^= 1;
-	address = vdp->zme_coef_dma + vdp->zme_bank * HISTB_VDP_CV200_ZME_SIZE;
-	histb_vdp_cv200_build_zme(vdp->zme_coef +
-				vdp->zme_bank * HISTB_VDP_CV200_ZME_SIZE,
-				sw, sh, dw, dh);
+	if (!id) {
+		zme->bank ^= 1;
+		address += zme->bank * HISTB_VDP_CV200_ZME_SIZE;
+		histb_vdp_cv200_build_zme(zme->cpu + zme->bank * HISTB_VDP_CV200_ZME_SIZE,
+					sw, sh, dw, dh);
+		hsp = div_u64((u64)(sw / 2) << 20, dw) * 2 |
+			BIT(24) | BIT(25) | BIT(26) | BIT(30) | BIT(31);
+		vsp = FIELD_PREP(GENMASK(20, 19), 1) |
+			BIT(23) | BIT(24) | BIT(30) | BIT(31);
+		vratio = div_u64((u64)sh << 12, dh);
+	} else {
+		/* CV200 V1 is unity scanout with vertical chroma reconstruction only. */
+		hsp = BIT(20) | BIT(24);
+		vsp = FIELD_PREP(GENMASK(20, 19), 1) | BIT(23) | BIT(24) | BIT(30);
+		vratio = BIT(12);
+	}
 	dma_wmb();
-	writel(lower_32_bits(address), vdp->base + HISTB_VDP_V0_HLCOEFAD);
-	writel(lower_32_bits(address + 256), vdp->base + HISTB_VDP_V0_HCCOEFAD);
-	writel(lower_32_bits(address + 512), vdp->base + HISTB_VDP_V0_VLCOEFAD);
-	writel(lower_32_bits(address + 768), vdp->base + HISTB_VDP_V0_VCCOEFAD);
-	writel(0xf, vdp->base + HISTB_VDP_V0_PARAUP);
-	/* Full-tap progressive 420 -> 422, with the BSP's centered chroma phase. */
-	writel(hratio | BIT(24) | BIT(25) | BIT(26) | BIT(30) | BIT(31),
-	       vdp->base + HISTB_VDP_V0_HSP);
-	writel(FIELD_PREP(GENMASK(20, 19), 1) |
-	       BIT(23) | BIT(24) | BIT(30) | BIT(31),
-	       vdp->base + HISTB_VDP_V0_VSP);
-	writel(vratio, vdp->base + HISTB_VDP_V0_VSR);
-	writel(0, vdp->base + HISTB_VDP_V0_HLOFFSET);
-	writel(0, vdp->base + HISTB_VDP_V0_HCOFFSET);
-	writel((u16)-512, vdp->base + HISTB_VDP_V0_VOFFSET);
-	writel((u16)-512, vdp->base + HISTB_VDP_V0_VBOFFSET);
-	vdp->zme_src_width = sw;
-	vdp->zme_src_height = sh;
-	vdp->zme_dst_width = dw;
-	vdp->zme_dst_height = dh;
-	vdp->zme_valid = true;
+	writel(lower_32_bits(address), vdp->base + HISTB_VDP_V0_HLCOEFAD + off);
+	writel(lower_32_bits(address + 256), vdp->base + HISTB_VDP_V0_HCCOEFAD + off);
+	writel(lower_32_bits(address + 512), vdp->base + HISTB_VDP_V0_VLCOEFAD + off);
+	writel(lower_32_bits(address + 768), vdp->base + HISTB_VDP_V0_VCCOEFAD + off);
+	writel(0xf, vdp->base + HISTB_VDP_V0_PARAUP + off);
+	writel(hsp, vdp->base + HISTB_VDP_V0_HSP + off);
+	writel(vsp, vdp->base + HISTB_VDP_V0_VSP + off);
+	writel(vratio, vdp->base + HISTB_VDP_V0_VSR + off);
+	writel(0, vdp->base + HISTB_VDP_V0_HLOFFSET + off);
+	writel(0, vdp->base + HISTB_VDP_V0_HCOFFSET + off);
+	writel(id ? 0 : (u16)-512, vdp->base + HISTB_VDP_V0_VOFFSET + off);
+	writel(id ? 0 : (u16)-512, vdp->base + HISTB_VDP_V0_VBOFFSET + off);
+	zme->src_width = sw;
+	zme->src_height = sh;
+	zme->dst_width = dw;
+	zme->dst_height = dh;
+	zme->valid = true;
 }
 
-static void histb_vdp_v0_disable(struct histb_vdp *vdp)
+static void histb_vdp_video_disable(struct histb_vdp *vdp, unsigned int id)
 {
-	vdp->v0_enabled = false;
-	if (vdp->soc->mv310)
-		return;
-	writel(readl(vdp->base + HISTB_VDP_V0_CTRL) &
+	u32 off = id * HISTB_VDP_VIDEO_OFFSET;
+
+	vdp->video_enabled[id] = false;
+	writel(readl(vdp->base + HISTB_VDP_V0_CTRL + off) &
 	       ~(HISTB_VDP_V0_SURFACE_EN | HISTB_VDP_V0_SURFACE_C_EN),
-	       vdp->base + HISTB_VDP_V0_CTRL);
-	writel(0, vdp->base + HISTB_VDP_V0_16REGIONENL);
+	       vdp->base + HISTB_VDP_V0_CTRL + off);
+	writel(0, vdp->base + HISTB_VDP_V0_16REGIONENL + off);
+	if (id)
+		writel(0, vdp->base + HISTB_VDP_V0_P0CTRL + off);
 }
 
-static void histb_vdp_program_v0(struct histb_vdp *vdp,
-				 struct drm_plane_state *state,
-				 const struct drm_plane_state *old_state)
+static u32 histb_vdp_video_pitch(struct drm_framebuffer *fb, unsigned int index)
+{
+	return fb->pitches[index];
+}
+
+static int histb_vdp_program_video(struct histb_vdp *vdp, unsigned int id,
+				  struct drm_plane_state *state,
+				  const struct drm_plane_state *old_state,
+				  bool copy)
 {
 	struct drm_framebuffer *fb = state->fb;
-	u32 sw = drm_rect_width(&state->src) >> 16;
-	u32 sh = drm_rect_height(&state->src) >> 16;
-	u32 dw = drm_rect_width(&state->dst);
-	u32 dh = drm_rect_height(&state->dst);
-	u32 x = state->dst.x1, y = state->dst.y1;
-	u32 ctrl;
-	bool was_enabled = vdp->v0_enabled;
+	u32 sw, sh, dw, dh, x, y, off = id * HISTB_VDP_VIDEO_OFFSET;
+	u32 pitch, cpitch, ctrl, i;
+	bool was_enabled = vdp->video_enabled[id];
 	int ret;
 
-	if (!state->visible) {
-		histb_vdp_v0_disable(vdp);
-		return;
+	if (!histb_vdp_plane_visible(state)) {
+		histb_vdp_video_disable(vdp, id);
+		return 0;
 	}
-	ret = histb_vdp_copy_shadow(state);
-	if (ret) {
-		drm_err_ratelimited(&vdp->drm, "V0 shadow copy failed: %pe\n",
-				    ERR_PTR(ret));
-		histb_vdp_v0_disable(vdp);
-		return;
+	if (copy) {
+		ret = histb_vdp_copy_shadow(state);
+		if (ret) {
+			histb_vdp_video_disable(vdp, id);
+			return ret;
+		}
 	}
-	vdp->v0_enabled = true;
-	vdp->v0_zpos = state->normalized_zpos;
+	sw = drm_rect_width(&state->src) >> 16;
+	sh = drm_rect_height(&state->src) >> 16;
+	dw = drm_rect_width(&state->dst);
+	dh = drm_rect_height(&state->dst);
+	x = state->dst.x1;
+	y = state->dst.y1;
+	pitch = histb_vdp_video_pitch(fb, 0);
+	cpitch = histb_vdp_video_pitch(fb, 1);
+	vdp->video_enabled[id] = true;
 	writel(lower_32_bits(histb_vdp_plane_address(state, 0)),
-	       vdp->base + HISTB_VDP_V0_P0LADDR);
+	       vdp->base + HISTB_VDP_V0_P0LADDR + off);
 	writel(lower_32_bits(histb_vdp_plane_address(state, 1)),
-	       vdp->base + HISTB_VDP_V0_P0CADDR);
+	       vdp->base + HISTB_VDP_V0_P0CADDR + off);
 	if (was_enabled && histb_vdp_plane_config_unchanged(old_state, state) &&
 	    old_state->fb->pitches[1] == fb->pitches[1] &&
 	    old_state->color_encoding == state->color_encoding &&
 	    old_state->color_range == state->color_range)
-		return;
+		return 0;
 
 	histb_vdp_v0_chain_init(vdp);
-	writel(BIT(31), vdp->base + HISTB_VDP_V0_PRERD);
-	writel(1, vdp->base + HISTB_VDP_V0_16REGIONENL);
-	writel(0, vdp->base + HISTB_VDP_V0_MULTI_MODE);
-	writel(0xf, vdp->base + HISTB_VDP_V0_SMMU_BYPASS0);
-	writel(0, vdp->base + HISTB_VDP_V0_SMMU_BYPASS1);
-	writel(0, vdp->base + HISTB_VDP_V0_SMMU_BYPASS2);
-	writel(0, vdp->base + HISTB_VDP_V0_SMMU_BYPASS3);
-	/* Linear NV12/NV21 strides are byte counts, unlike tiled decoder metadata. */
-	writel(fb->pitches[0] | fb->pitches[1] << 16,
-	       vdp->base + HISTB_VDP_V0_P0STRIDE);
-	writel(HISTB_VDP_SIZE(sw, sh), vdp->base + HISTB_VDP_V0_IRESO);
-	writel(HISTB_VDP_SIZE(dw, dh), vdp->base + HISTB_VDP_V0_ORESO);
-	writel((sw - 1) << 12, vdp->base + HISTB_VDP_V0_CPOS);
-	histb_vdp_v0_program_zme(vdp, sw, sh, dw, dh);
-	writel(HISTB_VDP_POS(x, y), vdp->base + HISTB_VDP_V0_DFPOS);
+	writel(BIT(31), vdp->base + HISTB_VDP_V0_PRERD + off);
+	writel(1, vdp->base + HISTB_VDP_V0_16REGIONENL + off);
+	writel(0, vdp->base + HISTB_VDP_V0_MULTI_MODE + off);
+	writel(0xf, vdp->base + HISTB_VDP_V0_SMMU_BYPASS0 + off);
+	writel(0, vdp->base + HISTB_VDP_V0_SMMU_BYPASS1 + off);
+	writel(0, vdp->base + HISTB_VDP_V0_SMMU_BYPASS2 + off);
+	writel(0, vdp->base + HISTB_VDP_V0_SMMU_BYPASS3 + off);
+	writel(pitch | cpitch << 16, vdp->base + HISTB_VDP_V0_P0STRIDE + off);
+	writel(HISTB_VDP_SIZE(sw, sh), vdp->base + HISTB_VDP_V0_IRESO + off);
+	writel(HISTB_VDP_SIZE(dw, dh), vdp->base + HISTB_VDP_V0_ORESO + off);
+	writel((sw - 1) << 12, vdp->base + HISTB_VDP_V0_CPOS + off);
+	histb_vdp_program_zme(vdp, id, sw, sh, dw, dh);
+	writel(HISTB_VDP_POS(x, y), vdp->base + HISTB_VDP_V0_DFPOS + off);
 	writel(HISTB_VDP_POS(x + dw - 1, y + dh - 1),
-	       vdp->base + HISTB_VDP_V0_DLPOS);
-	writel(HISTB_VDP_POS(x, y), vdp->base + HISTB_VDP_V0_VFPOS);
+	       vdp->base + HISTB_VDP_V0_DLPOS + off);
+	writel(HISTB_VDP_POS(x, y), vdp->base + HISTB_VDP_V0_VFPOS + off);
 	writel(HISTB_VDP_POS(x + dw - 1, y + dh - 1),
-	       vdp->base + HISTB_VDP_V0_VLPOS);
-	writel(0x04080200, vdp->base + HISTB_VDP_V0_BK);
-	writel(0x04080200, vdp->base + HISTB_VDP_V0_MUTE_BK);
-	writel(state->alpha >> 8, vdp->base + HISTB_VDP_V0_CBMPARA);
-	writel(0xff, vdp->base + HISTB_VDP_V0_ALPHA);
-	histb_vdp_program_v0_csc(vdp, state);
+	       vdp->base + HISTB_VDP_V0_VLPOS + off);
+	writel(0x04080200, vdp->base + HISTB_VDP_V0_BK + off);
+	writel(0x04080200, vdp->base + HISTB_VDP_V0_MUTE_BK + off);
+	writel(state->alpha >> 8, vdp->base + HISTB_VDP_V0_CBMPARA + off);
+	/* Transparent letterbox must not hide a lower sibling video layer. */
+	writel(0, vdp->base + HISTB_VDP_V0_ALPHA + off);
+	if (id) {
+		for (i = 1; i < 16; i++)
+			writel(0, vdp->base + HISTB_VDP_V0_P0CTRL + off + i * 0x20);
+		writel(sw - 1, vdp->base + HISTB_VDP_V0_P0RESO + off);
+		writel(HISTB_VDP_POS(x, y), vdp->base + HISTB_VDP_V0_P0VFPOS + off);
+		writel(HISTB_VDP_POS(x + sw - 1, y + sh - 1),
+		       vdp->base + HISTB_VDP_V0_P0VLPOS + off);
+		writel(1, vdp->base + HISTB_VDP_V0_P0CTRL + off);
+	}
+	histb_vdp_program_video_csc(vdp, id, state);
 	ctrl = FIELD_PREP(HISTB_VDP_V0_IFMT, HISTB_VDP_V0_IFMT_SP_420) |
-		FIELD_PREP(HISTB_VDP_V0_REQ_CTRL, 3) |
-		HISTB_VDP_V0_NONSECURE |
-		(fb->format->format == DRM_FORMAT_NV12 ? HISTB_VDP_V0_UV_ORDER : 0) |
+		FIELD_PREP(HISTB_VDP_V0_REQ_CTRL, 3) | HISTB_VDP_V0_NONSECURE |
+		(fb->format->format != DRM_FORMAT_NV21 ? HISTB_VDP_V0_UV_ORDER : 0) |
 		FIELD_PREP(HISTB_VDP_V0_CHM_RMODE, HISTB_VDP_V0_RMODE_PROGRESSIVE) |
 		FIELD_PREP(HISTB_VDP_V0_LM_RMODE, HISTB_VDP_V0_RMODE_PROGRESSIVE) |
 		FIELD_PREP(HISTB_VDP_V0_IFIR_MODE, 3) |
 		HISTB_VDP_V0_SURFACE_EN;
-	writel(ctrl, vdp->base + HISTB_VDP_V0_CTRL);
-
-	/* VP0 spans the output canvas; V0 carries the positioned/scaled rectangle. */
-	writel(HISTB_VDP_SIZE(vdp->display_width, vdp->display_height),
-	       vdp->base + HISTB_VDP_VP0_IRESO);
-	writel(0, vdp->base + HISTB_VDP_VP0_CTRL);
-	writel(0, vdp->base + HISTB_VDP_VP0_DFPOS);
-	writel(HISTB_VDP_POS(vdp->display_width - 1, vdp->display_height - 1),
-	       vdp->base + HISTB_VDP_VP0_DLPOS);
-	writel(0, vdp->base + HISTB_VDP_VP0_VFPOS);
-	writel(HISTB_VDP_POS(vdp->display_width - 1, vdp->display_height - 1),
-	       vdp->base + HISTB_VDP_VP0_VLPOS);
-	writel(0xff, vdp->base + HISTB_VDP_VP0_GALPHA);
-	writel(0xff, vdp->base + HISTB_VDP_VP0_ALPHA);
+	writel(ctrl, vdp->base + HISTB_VDP_V0_CTRL + off);
+	return 0;
 }
 
-static int histb_vdp_v0_plane_atomic_check(struct drm_plane *plane,
-					   struct drm_atomic_state *state)
+static void histb_vdp_plane_atomic_update(struct drm_plane *plane,
+					 struct drm_atomic_state *state)
 {
-	struct drm_plane_state *new_state = drm_atomic_get_new_plane_state(state, plane);
-	struct drm_crtc_state *crtc_state;
-	struct drm_framebuffer *fb = new_state->fb;
-	unsigned int i;
+	struct histb_vdp *vdp = to_histb_vdp(plane->dev);
+	struct drm_crtc_state *crtc_state =
+		drm_atomic_get_new_crtc_state(state, &vdp->pipe.crtc);
+	struct histb_vdp_crtc_state *cs = to_histb_vdp_crtc_state(crtc_state);
+	struct drm_plane_state *ps = drm_atomic_get_new_plane_state(state, plane);
+	struct drm_plane_state *old = drm_atomic_get_old_plane_state(state, plane);
+	unsigned int id = histb_vdp_plane_id(vdp, plane);
+	bool copy = cs->plane_updates & BIT(id);
 	int ret;
 
-	if (!new_state->crtc)
-		return fb ? -EINVAL : 0;
-	crtc_state = drm_atomic_get_crtc_state(state, new_state->crtc);
-	if (IS_ERR(crtc_state))
-		return PTR_ERR(crtc_state);
-	ret = drm_atomic_helper_check_plane_state(new_state, crtc_state,
-					  1 << 13, 8 << 16, true, true);
-	if (ret || !new_state->visible)
-		return ret;
-	/* 420 needs even integral source coordinates after clipping. */
-	if ((new_state->src.x1 | new_state->src.y1 |
-	     drm_rect_width(&new_state->src) | drm_rect_height(&new_state->src)) &
-	    ((2 << 16) - 1))
-		return -EINVAL;
-	for (i = 0; i < 2; i++) {
-		u32 hsub = i ? fb->format->hsub : 1;
-		u32 vsub = i ? fb->format->vsub : 1;
-		u32 width = (drm_rect_width(&new_state->src) >> 16) / hsub;
-		u32 height = (drm_rect_height(&new_state->src) >> 16) / vsub;
-		u64 address = histb_vdp_plane_address(new_state, i);
-		u64 end = address + (u64)(height - 1) * fb->pitches[i] +
-			width * fb->format->cpp[i] - 1;
+	/* A modeset already programmed every input before enabling scanout. */
+	if (!vdp->powered || drm_atomic_crtc_needs_modeset(crtc_state))
+		return;
+	if (id < HISTB_VDP_GFX_COUNT)
+		ret = histb_vdp_program_gfx(vdp, id, ps, old, &cs->mixer, copy);
+	else
+		ret = histb_vdp_program_video(vdp, id - HISTB_VDP_GFX_COUNT,
+					      ps, old, copy);
+	if (ret) {
+		cs->inputs_failed = true;
+		drm_err(&vdp->drm, "failed to program %s: %pe\n",
+			plane->name, ERR_PTR(ret));
+	}
+}
 
-		if (!IS_ALIGNED(fb->pitches[i], HISTB_VDP_V0_STRIDE_UNIT) ||
-		    fb->pitches[i] > U16_MAX || !IS_ALIGNED(address, 16) ||
-		    end > U32_MAX)
+static void histb_vdp_pipe_update(struct drm_simple_display_pipe *pipe,
+				  struct drm_plane_state *old_state)
+{
+	/* Unlike the installed new state, the retired state owns this commit. */
+	histb_vdp_plane_atomic_update(&pipe->plane, old_state->state);
+}
+
+static int histb_vdp_overlay_check(struct drm_plane *plane,
+				   struct drm_atomic_state *state)
+{
+	struct histb_vdp *vdp = to_histb_vdp(plane->dev);
+	unsigned int id = histb_vdp_plane_id(vdp, plane);
+	struct drm_plane_state *ps = drm_atomic_get_new_plane_state(state, plane);
+	struct drm_crtc_state *cs;
+	struct drm_framebuffer *fb = ps->fb;
+	const struct drm_format_info *format;
+	u32 width, height, align;
+	unsigned int i, count;
+	int ret;
+
+	if (!ps->crtc)
+		return fb ? -EINVAL : 0;
+	cs = drm_atomic_get_crtc_state(state, ps->crtc);
+	if (IS_ERR(cs))
+		return PTR_ERR(cs);
+	ret = drm_atomic_helper_check_plane_state(ps, cs,
+		id == 3 ? 1 << 13 : DRM_PLANE_NO_SCALING,
+		id == 3 ? 8 << 16 : DRM_PLANE_NO_SCALING, true, true);
+	if (ret || !ps->visible)
+		return ret;
+	align = id < HISTB_VDP_GFX_COUNT ? 0xffff : (2 << 16) - 1;
+	if ((ps->src.x1 | ps->src.y1 | drm_rect_width(&ps->src) |
+	     drm_rect_height(&ps->src)) & align)
+		return -EINVAL;
+	width = drm_rect_width(&ps->src) >> 16;
+	height = drm_rect_height(&ps->src) >> 16;
+	if (id < HISTB_VDP_GFX_COUNT && (width > 1920 || height > 1080))
+		return -EINVAL;
+	format = fb->format;
+	count = format->num_planes;
+	for (i = 0; i < count; i++) {
+		u32 pitch = fb->pitches[i];
+		u32 rows = drm_format_info_plane_height(format, height, i);
+		u64 address = histb_vdp_plane_address(ps, i);
+		u64 end = address + (u64)(rows - 1) * pitch +
+			drm_format_info_min_pitch(format, i, width) - 1;
+
+		if (!IS_ALIGNED(pitch, 16) || !IS_ALIGNED(address, 16) || end > U32_MAX ||
+		    (id < HISTB_VDP_GFX_COUNT ? pitch / 16 : pitch) > U16_MAX)
 			return -EINVAL;
 	}
 	return 0;
 }
 
-static void histb_vdp_v0_plane_atomic_update(struct drm_plane *plane,
-					     struct drm_atomic_state *state)
-{
-	struct histb_vdp *vdp = to_histb_vdp(plane->dev);
-	struct drm_plane_state *new_state;
-
-	new_state = drm_atomic_get_new_plane_state(state, plane);
-	if (!new_state || !new_state->fb || !vdp->powered)
-		return;
-
-	histb_vdp_program_v0(vdp, new_state,
-			     drm_atomic_get_old_plane_state(state, plane));
-}
-
-static void histb_vdp_v0_plane_atomic_disable(struct drm_plane *plane,
-					      struct drm_atomic_state *state)
-{
-	struct histb_vdp *vdp = to_histb_vdp(plane->dev);
-
-	if (vdp->powered)
-		histb_vdp_v0_disable(vdp);
-}
-
-static const struct drm_plane_helper_funcs histb_vdp_v0_plane_helper_funcs = {
+static const struct drm_plane_helper_funcs histb_vdp_overlay_helper_funcs = {
 	.prepare_fb = drm_gem_plane_helper_prepare_fb,
-	DRM_GEM_SHADOW_PLANE_HELPER_FUNCS,
-	.atomic_check = histb_vdp_v0_plane_atomic_check,
-	.atomic_update = histb_vdp_v0_plane_atomic_update,
-	.atomic_disable = histb_vdp_v0_plane_atomic_disable,
+	.begin_fb_access = drm_gem_begin_shadow_fb_access,
+	.end_fb_access = drm_gem_end_shadow_fb_access,
+	.atomic_check = histb_vdp_overlay_check,
+	.atomic_update = histb_vdp_plane_atomic_update,
 };
 
-static const struct drm_plane_funcs histb_vdp_v0_plane_funcs = {
+static const struct drm_plane_funcs histb_vdp_overlay_funcs = {
 	.update_plane = drm_atomic_helper_update_plane,
 	.disable_plane = drm_atomic_helper_disable_plane,
 	.destroy = drm_plane_cleanup,
 	DRM_GEM_SHADOW_PLANE_FUNCS,
 };
+
+static int histb_vdp_commit_inputs(struct histb_vdp *vdp,
+				   struct drm_atomic_state *state,
+				   struct histb_vdp_crtc_state *cs)
+{
+	unsigned int id, count = vdp->soc->mv310 ? 1 : HISTB_VDP_PLANE_COUNT;
+
+	for (id = 0; id < count; id++) {
+		struct drm_plane *plane = histb_vdp_plane(vdp, id);
+		struct drm_plane_state *ps = drm_atomic_get_new_plane_state(state, plane);
+		int ret;
+
+		if (!ps)
+			continue;
+		if (id < HISTB_VDP_GFX_COUNT)
+			ret = histb_vdp_program_gfx(vdp, id, ps, NULL, &cs->mixer, true);
+		else
+			ret = histb_vdp_program_video(vdp, id - HISTB_VDP_GFX_COUNT,
+					      ps, NULL, true);
+		if (ret) {
+			drm_err(&vdp->drm, "failed to program %s: %pe\n", plane->name, ERR_PTR(ret));
+			return ret;
+		}
+	}
+	return 0;
+}
+
+static void histb_vdp_flush_inputs(struct histb_vdp *vdp,
+				   const struct histb_vdp_mixer *mixer)
+{
+	unsigned int i;
+	u32 csc = 0;
+
+	if (vdp->soc->mv310) {
+		histb_vdp_latch_gfx(vdp);
+		return;
+	}
+	writel(mixer->graphics, vdp->base + HISTB_VDP_MIXG0_MIX);
+	writel(mixer->graphics_alpha, vdp->base + HISTB_VDP_GP0_GALPHA);
+	writel(mixer->video, vdp->base + HISTB_VDP_MIXV0_MIX);
+	writel(mixer->output, vdp->base + HISTB_VDP_CBM_MIX1);
+	if (mixer->video) {
+		writel(HISTB_VDP_SIZE(vdp->display_width, vdp->display_height),
+		       vdp->base + HISTB_VDP_VP0_IRESO);
+		writel(0, vdp->base + HISTB_VDP_VP0_CTRL);
+		writel(0, vdp->base + HISTB_VDP_VP0_DFPOS);
+		writel(HISTB_VDP_POS(vdp->display_width - 1, vdp->display_height - 1),
+		       vdp->base + HISTB_VDP_VP0_DLPOS);
+		writel(0, vdp->base + HISTB_VDP_VP0_VFPOS);
+		writel(HISTB_VDP_POS(vdp->display_width - 1, vdp->display_height - 1),
+		       vdp->base + HISTB_VDP_VP0_VLPOS);
+		writel(0xff, vdp->base + HISTB_VDP_VP0_GALPHA);
+		writel(0xff, vdp->base + HISTB_VDP_VP0_ALPHA);
+	}
+	for (i = 0; i < HISTB_VDP_VIDEO_COUNT; i++) {
+		if (vdp->video_enabled[i])
+			csc |= BIT(i + 1);
+		writel(1, vdp->base + HISTB_VDP_V0_UPD + i * HISTB_VDP_VIDEO_OFFSET);
+	}
+	writel(csc ? csc | BIT(0) : 0, vdp->base + HISTB_VDP_VDM_YUV2RGB_CTRL);
+	writel(1, vdp->base + HISTB_VDP_VP0_UPD);
+	writel(HISTB_VDP_HDR_REGUP, vdp->base + HISTB_VDP_HDR_UPD);
+	histb_vdp_latch_gfx(vdp);
+}
+
 
 static void histb_vdp_program_axi(struct histb_vdp *vdp)
 {
@@ -1495,7 +1693,8 @@ static int histb_vdp_resources_enable(struct histb_vdp *vdp)
 	udelay(10);
 
 	vdp->resources_enabled = true;
-	vdp->zme_valid = false;
+	vdp->zme[0].valid = false;
+	vdp->zme[1].valid = false;
 	/* Only CV200's BSP specifies this SRAM low-power value. */
 	if (!vdp->soc->mv310)
 		writel(HISTB_VDP_VOLOWPOWER_DEFAULT,
@@ -1524,17 +1723,18 @@ static void histb_vdp_resources_disable(struct histb_vdp *vdp)
 	vdp->resources_enabled = false;
 }
 
-static void histb_vdp_pipe_enable(struct drm_simple_display_pipe *pipe,
-				  struct drm_crtc_state *crtc_state,
-				  struct drm_plane_state *plane_state)
+static void histb_vdp_crtc_atomic_enable(struct drm_crtc *crtc,
+					struct drm_atomic_state *state)
 {
-	struct histb_vdp *vdp = to_histb_vdp(pipe->crtc.dev);
+	struct histb_vdp *vdp = to_histb_vdp(crtc->dev);
+	struct drm_simple_display_pipe *pipe = &vdp->pipe;
+	struct drm_crtc_state *crtc_state = drm_atomic_get_new_crtc_state(state, crtc);
 	unsigned long flags;
 	int ret;
 
 	vdp->display_width = crtc_state->adjusted_mode.hdisplay;
 	vdp->display_height = crtc_state->adjusted_mode.vdisplay;
-	vdp->v0_enabled = false;
+	memset(vdp->video_enabled, 0, sizeof(vdp->video_enabled));
 	ret = histb_vdp_resources_enable(vdp);
 	if (ret) {
 		drm_err(&vdp->drm, "failed to enable VDP resources: %pe\n",
@@ -1586,16 +1786,17 @@ static void histb_vdp_pipe_enable(struct drm_simple_display_pipe *pipe,
 			     HISTB_VDP_DHD0_CBAR_MASK);
 	histb_vdp_dhd0_update(vdp);
 program_plane:
-	ret = histb_vdp_program_plane(vdp, plane_state, NULL);
+	ret = histb_vdp_commit_inputs(vdp, state,
+				      to_histb_vdp_crtc_state(crtc_state));
 	if (ret) {
 		drm_err(&vdp->drm, "failed to program initial G0 plane: %pe\n",
 			 ERR_PTR(ret));
 		histb_vdp_resources_disable(vdp);
 		return;
 	}
+	histb_vdp_flush_inputs(vdp, &to_histb_vdp_crtc_state(crtc_state)->mixer);
 	if (vdp->soc->mv310) {
 		/* Latch G0/GP0 before the separate DHD interface-enable request. */
-		histb_vdp_latch_gfx(vdp);
 		histb_vdp_dhd0_stage(vdp, HISTB_VDP_DHD0_ENABLE, 0);
 		histb_vdp_dhd0_update(vdp);
 	}
@@ -1617,17 +1818,22 @@ static void histb_vdp_pipe_disable(struct drm_simple_display_pipe *pipe)
 	struct histb_vdp *vdp = to_histb_vdp(pipe->crtc.dev);
 	struct drm_crtc *crtc = &pipe->crtc;
 	unsigned long flags;
+	unsigned int i;
 
 	if (!vdp->powered)
 		return;
 	/* Stop the core from queueing vblank work before the pipe goes away. */
 	drm_crtc_vblank_off(crtc);
 
-	histb_vdp_v0_disable(vdp);
 	if (!vdp->soc->mv310) {
-		writel(1, vdp->base + HISTB_VDP_V0_UPD);
+		for (i = 0; i < HISTB_VDP_VIDEO_COUNT; i++) {
+			histb_vdp_video_disable(vdp, i);
+			writel(1, vdp->base + HISTB_VDP_V0_UPD + i * HISTB_VDP_VIDEO_OFFSET);
+		}
+		for (i = 0; i < HISTB_VDP_GFX_COUNT; i++)
+			histb_vdp_gfx_disable(vdp, i);
 		writel(1, vdp->base + HISTB_VDP_VP0_UPD);
-		writel(2, vdp->base + HISTB_VDP_CBM_MIX1);
+		writel(0, vdp->base + HISTB_VDP_CBM_MIX1);
 	}
 	spin_lock_irqsave(&vdp->irq_lock, flags);
 	writel(0, vdp->base + HISTB_VDP_VOINTMSK);
@@ -1775,59 +1981,125 @@ static int histb_vdp_pipe_check(struct drm_simple_display_pipe *pipe,
 	return 0;
 }
 
-static void histb_vdp_pipe_update(struct drm_simple_display_pipe *pipe,
-				  struct drm_plane_state *old_state)
-{
-	struct histb_vdp *vdp = to_histb_vdp(pipe->crtc.dev);
-	int ret;
-
-	/* Initial G0 was already staged by pipe_enable before interface enable. */
-	if (!vdp->powered || drm_atomic_crtc_needs_modeset(pipe->crtc.state))
-		return;
-	ret = histb_vdp_program_plane(vdp, pipe->plane.state, old_state);
-	if (ret)
-		drm_err(&vdp->drm, "failed to update G0 plane: %pe\n", ERR_PTR(ret));
-}
 
 static const struct drm_simple_display_pipe_funcs histb_vdp_pipe_funcs = {
 	.mode_valid = histb_vdp_pipe_mode_valid,
-	.enable = histb_vdp_pipe_enable,
 	.disable = histb_vdp_pipe_disable,
-	.check = histb_vdp_pipe_check,
 	.update = histb_vdp_pipe_update,
+	.check = histb_vdp_pipe_check,
 	.enable_vblank = histb_vdp_enable_vblank,
 	.disable_vblank = histb_vdp_disable_vblank,
+	.reset_crtc = histb_vdp_reset_crtc,
+	.duplicate_crtc_state = histb_vdp_duplicate_crtc_state,
+	.destroy_crtc_state = histb_vdp_destroy_crtc_state,
 	DRM_GEM_SIMPLE_DISPLAY_PIPE_SHADOW_PLANE_FUNCS,
 };
+
+static int histb_vdp_atomic_check(struct drm_device *drm,
+				  struct drm_atomic_state *state)
+{
+	struct histb_vdp *vdp = to_histb_vdp(drm);
+	struct drm_crtc *crtc = &vdp->pipe.crtc;
+	struct drm_crtc_state *cs;
+	struct histb_vdp_crtc_state *new;
+	struct drm_plane *plane;
+	struct drm_plane_state *ps;
+	struct drm_plane_state *planes[HISTB_VDP_PLANE_COUNT] = {};
+	unsigned int id, rank, g = 0, v = 0, changes = 0;
+	int i, group = -1, first = -1, ret;
+	u32 updates = 0;
+	u8 alpha = 0xff;
+
+	/* Capture caller-requested updates before adding the shared processing group. */
+	for_each_new_plane_in_state(state, plane, ps, i)
+		updates |= BIT(histb_vdp_plane_id(vdp, plane));
+	cs = drm_atomic_get_crtc_state(state, crtc);
+	if (IS_ERR(cs))
+		return PTR_ERR(cs);
+	new = to_histb_vdp_crtc_state(cs);
+	new->plane_updates = updates;
+	new->inputs_failed = false;
+	if (!vdp->soc->mv310) {
+		/* GP0/VP0 constraints need an atomic snapshot of all affected inputs. */
+		ret = drm_atomic_add_affected_planes(state, crtc);
+		if (ret)
+			return ret;
+	}
+	ret = drm_atomic_helper_check(drm, state);
+	if (ret)
+		return ret;
+	new->mixer = (struct histb_vdp_mixer) { .graphics_alpha = 0xff };
+	if (!cs->active)
+		return 0;
+	if (vdp->soc->mv310)
+		return 0;
+	for (id = 0; id < HISTB_VDP_PLANE_COUNT; id++) {
+		ps = drm_atomic_get_new_plane_state(state, histb_vdp_plane(vdp, id));
+		if (histb_vdp_plane_visible(ps))
+			planes[id] = ps;
+	}
+	/* Only group-contiguous order is representable by GP0/VP0 -> DHD0. */
+	for (rank = 0; rank < HISTB_VDP_PLANE_COUNT; rank++) {
+		for (id = 0; id < HISTB_VDP_PLANE_COUNT; id++) {
+			int next = id < HISTB_VDP_GFX_COUNT ? 0 : 1;
+
+			ps = planes[id];
+			if (!ps || ps->normalized_zpos != rank)
+				continue;
+			if (group != next) {
+				if (group >= 0 && ++changes > 1)
+					return -EINVAL;
+				group = next;
+				if (first < 0)
+					first = next;
+			}
+			if (!next) {
+				new->mixer.graphics |= (histb_vdp_gfx_ids[id] + 1) << (4 * g++);
+				alpha = ps->alpha >> 8;
+			} else {
+				new->mixer.video |= (id - HISTB_VDP_GFX_COUNT + 1) << (4 * v++);
+			}
+		}
+	}
+	new->mixer.graphics_count = g;
+	if (g == 1)
+		new->mixer.graphics_alpha = alpha;
+	if (g > 1) {
+		for (id = 0; id < HISTB_VDP_GFX_COUNT; id++) {
+			ps = planes[id];
+			if (ps && ps->fb->format->has_alpha &&
+			    ps->pixel_blend_mode == DRM_MODE_BLEND_PREMULTI && ps->alpha != 0xffff)
+				return -EINVAL;
+		}
+	}
+	new->mixer.output = g && v ? (first ? 1 | (2 << 4) : 2 | (1 << 4)) :
+			   g ? 2 : v ? 1 : 0;
+	return 0;
+}
 
 static struct drm_framebuffer *
 histb_vdp_fb_create(struct drm_device *drm, struct drm_file *file,
 		    const struct drm_mode_fb_cmd2 *mode_cmd)
 {
 	if (!IS_ALIGNED(mode_cmd->pitches[0], HISTB_VDP_G0_STRIDE_UNIT) ||
-	    mode_cmd->pitches[0] / HISTB_VDP_G0_STRIDE_UNIT >
-		FIELD_MAX(HISTB_VDP_G0_STRIDE_MASK) ||
-	    !IS_ALIGNED(mode_cmd->offsets[0], HISTB_VDP_G0_STRIDE_UNIT)) {
-		dev_err(drm->dev,
-			"fb_create rejected: %p4cc %ux%u pitch=%u offset=%u modifier=0x%llx flags=0x%x\n",
-			&mode_cmd->pixel_format, mode_cmd->width, mode_cmd->height,
-			mode_cmd->pitches[0], mode_cmd->offsets[0],
-			(unsigned long long)mode_cmd->modifier[0], mode_cmd->flags);
+	    mode_cmd->pitches[0] / HISTB_VDP_G0_STRIDE_UNIT > U16_MAX ||
+	    !IS_ALIGNED(mode_cmd->offsets[0], HISTB_VDP_G0_STRIDE_UNIT))
 		return ERR_PTR(-EINVAL);
-	}
 
 	return drm_gem_fb_create(drm, file, mode_cmd);
 }
 
 static const struct drm_mode_config_funcs histb_vdp_mode_config_funcs = {
 	.fb_create = histb_vdp_fb_create,
-	.atomic_check = drm_atomic_helper_check,
+	.atomic_check = histb_vdp_atomic_check,
 	.atomic_commit = drm_atomic_helper_commit,
 };
 
 /* Call only with live resources (atomic tail or the power-locked snapshot). */
 static void histb_vdp_print_regs(struct drm_printer *p, struct histb_vdp *vdp)
 {
+	unsigned int i;
+
 	drm_printf(p, "VDP g0=%08x dhd0=%08x irq=%08x mask=%08x\n",
 		   readl(vdp->base + vdp->soc->g0_ctrl),
 		   readl(vdp->base + vdp->soc->dhd0_ctrl),
@@ -1835,6 +2107,27 @@ static void histb_vdp_print_regs(struct drm_printer *p, struct histb_vdp *vdp)
 		   readl(vdp->base + HISTB_VDP_VOINTMSK));
 	if (vdp->soc->mv310)
 		return;
+	drm_printf(p, "VDP VO=%08x uf=%08x master=%08x/%08x mixg=%08x\n",
+		   readl(vdp->base + HISTB_VDP_VOCTRL),
+		   readl(vdp->base + 0x0050),
+		   readl(vdp->base + HISTB_VDP_VOMASTERSEL),
+		   readl(vdp->base + 0x003c),
+		   readl(vdp->base + HISTB_VDP_MIXG0_MIX));
+	for (i = 0; i < HISTB_VDP_GFX_COUNT; i++) {
+		u32 off = histb_vdp_gfx_ids[i] * HISTB_VDP_GFX_OFFSET;
+
+		drm_printf(p, "VDP G%u=%08x addr=%08x stride=%08x in=%08x src=%08x df=%08x/%08x vf=%08x/%08x\n",
+			   histb_vdp_gfx_ids[i],
+			   readl(vdp->base + HISTB_VDP_G0_CTRL + off),
+			   readl(vdp->base + HISTB_VDP_G0_ADDR + off),
+			   readl(vdp->base + HISTB_VDP_G0_STRIDE + off),
+			   readl(vdp->base + HISTB_VDP_G0_IRESO + off),
+			   readl(vdp->base + HISTB_VDP_G0_SFPOS + off),
+			   readl(vdp->base + HISTB_VDP_G0_DFPOS + off),
+			   readl(vdp->base + HISTB_VDP_G0_DLPOS + off),
+			   readl(vdp->base + HISTB_VDP_G0_VFPOS + off),
+			   readl(vdp->base + HISTB_VDP_G0_VLPOS + off));
+	}
 	drm_printf(p, "VDP V0=%08x in=%08x out=%08x y=%08x c=%08x stride=%08x region=%08x p0=%08x\n",
 		   readl(vdp->base + HISTB_VDP_V0_CTRL),
 		   readl(vdp->base + HISTB_VDP_V0_IRESO),
@@ -1887,20 +2180,12 @@ static void histb_vdp_atomic_commit_tail(struct drm_atomic_state *state)
 	/* Clocks and vblank must be ready before either plane is programmed. */
 	drm_atomic_helper_commit_modeset_enables(drm, state);
 	drm_atomic_helper_commit_planes(drm, state, DRM_PLANE_COMMIT_ACTIVE_ONLY);
-	if (new_state && new_state->active && vdp->powered) {
-		if (!vdp->soc->mv310) {
-			u32 mixer = 2;
+	if (new_state && new_state->active && vdp->powered &&
+	    !drm_atomic_crtc_needs_modeset(new_state)) {
+		struct histb_vdp_crtc_state *cs = to_histb_vdp_crtc_state(new_state);
 
-			if (vdp->v0_enabled)
-				mixer = vdp->v0_zpos > vdp->g0_zpos ? 2 | (1 << 4) :
-					1 | (2 << 4);
-			writel(vdp->v0_enabled, vdp->base + HISTB_VDP_MIXV0_MIX);
-			writel(mixer, vdp->base + HISTB_VDP_CBM_MIX1);
-			writel(1, vdp->base + HISTB_VDP_V0_UPD);
-			writel(1, vdp->base + HISTB_VDP_VP0_UPD);
-			writel(HISTB_VDP_HDR_REGUP, vdp->base + HISTB_VDP_HDR_UPD);
-		}
-		histb_vdp_latch_gfx(vdp);
+		if (!cs->inputs_failed)
+			histb_vdp_flush_inputs(vdp, &cs->mixer);
 	}
 	spin_lock_irqsave(&drm->event_lock, flags);
 	if (new_state && new_state->event) {
@@ -2005,12 +2290,36 @@ static irqreturn_t histb_vdp_irq(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
+static int histb_vdp_plane_properties(struct histb_vdp *vdp,
+				      struct drm_plane *plane, unsigned int id)
+{
+	u32 zpos = vdp->soc->mv310 ? 1 : id < HISTB_VDP_GFX_COUNT ? id + 2 : id - 3;
+	u32 max_zpos = vdp->soc->mv310 ? 1 : HISTB_VDP_PLANE_COUNT - 1;
+	int ret;
+
+	ret = drm_plane_create_alpha_property(plane);
+	if (ret)
+		return ret;
+	ret = drm_plane_create_zpos_property(plane, zpos, 0, max_zpos);
+	if (ret || vdp->soc->mv310)
+		return ret;
+	if (id < HISTB_VDP_GFX_COUNT)
+		return drm_plane_create_blend_mode_property(plane,
+			BIT(DRM_MODE_BLEND_PIXEL_NONE) | BIT(DRM_MODE_BLEND_PREMULTI) |
+			BIT(DRM_MODE_BLEND_COVERAGE));
+	return drm_plane_create_color_properties(plane,
+		BIT(DRM_COLOR_YCBCR_BT601) | BIT(DRM_COLOR_YCBCR_BT709),
+		BIT(DRM_COLOR_YCBCR_LIMITED_RANGE) | BIT(DRM_COLOR_YCBCR_FULL_RANGE),
+		DRM_COLOR_YCBCR_BT709, DRM_COLOR_YCBCR_LIMITED_RANGE);
+}
+
 static int histb_vdp_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct drm_bridge *bridge;
 	struct histb_vdp *vdp;
 	struct drm_device *drm;
+	unsigned int i;
 	int ret;
 
 	vdp = devm_drm_dev_alloc(dev, &histb_vdp_driver,
@@ -2040,21 +2349,15 @@ static int histb_vdp_probe(struct platform_device *pdev)
 	vdp->clks[3].id = "core";
 	vdp->clks[4].id = "video";
 	vdp->clks[5].id = "graphics";
-	vdp->num_clks = vdp->soc->mv310 ? 4 : 6;
+	vdp->clks[6].id = "bp";
+	vdp->clks[7].id = "graphics1";
+	vdp->clks[8].id = "graphics3";
+	vdp->clks[9].id = "video1";
+	vdp->num_clks = vdp->soc->mv310 ? 4 : ARRAY_SIZE(vdp->clks);
 	ret = devm_clk_bulk_get(dev, vdp->num_clks, vdp->clks);
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to get VDP clocks\n");
 
-	if (!vdp->soc->mv310) {
-		/* Older CV200 DTs omit the gate between DHD and HDMI. */
-		vdp->clks[6].id = "bp";
-		vdp->clks[6].clk = devm_clk_get_optional(dev, "bp");
-		if (IS_ERR(vdp->clks[6].clk))
-			return dev_err_probe(dev, PTR_ERR(vdp->clks[6].clk),
-					     "failed to get VDP output clock\n");
-		if (vdp->clks[6].clk)
-			vdp->num_clks++;
-	}
 
 	vdp->reset = devm_reset_control_get_exclusive(dev, "vdp");
 	if (IS_ERR(vdp->reset))
@@ -2066,10 +2369,16 @@ static int histb_vdp_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, ret, "failed to set DMA mask\n");
 
 	if (!vdp->soc->mv310) {
-		vdp->zme_coef = dmam_alloc_coherent(dev, 2 * HISTB_VDP_CV200_ZME_SIZE,
-						 &vdp->zme_coef_dma, GFP_KERNEL);
-		if (!vdp->zme_coef)
-			return -ENOMEM;
+		for (i = 0; i < HISTB_VDP_VIDEO_COUNT; i++) {
+			struct histb_vdp_zme *zme = &vdp->zme[i];
+			size_t size = (i ? 1 : 2) * HISTB_VDP_CV200_ZME_SIZE;
+
+			zme->cpu = dmam_alloc_coherent(dev, size, &zme->dma, GFP_KERNEL);
+			if (!zme->cpu)
+				return -ENOMEM;
+			if (i)
+				histb_vdp_cv200_build_zme(zme->cpu, 2, 2, 2, 2);
+		}
 	}
 
 	ret = drmm_mode_config_init(drm);
@@ -2092,41 +2401,37 @@ static int histb_vdp_probe(struct platform_device *pdev)
 					   NULL, NULL);
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to create display pipe\n");
+	/* The simple-pipe enable hook has no atomic-state argument after swap. */
+	vdp->crtc_helper_funcs = *vdp->pipe.crtc.helper_private;
+	vdp->crtc_helper_funcs.atomic_enable = histb_vdp_crtc_atomic_enable;
+	drm_crtc_helper_add(&vdp->pipe.crtc, &vdp->crtc_helper_funcs);
 	drm_encoder_helper_add(&vdp->pipe.encoder,
 			       &histb_vdp_encoder_helper_funcs);
 
-	ret = drm_plane_create_alpha_property(&vdp->pipe.plane);
-	if (ret)
-		return ret;
-	ret = drm_plane_create_zpos_property(&vdp->pipe.plane, 1, 0, 1);
+	ret = histb_vdp_plane_properties(vdp, &vdp->pipe.plane, 0);
 	if (ret)
 		return ret;
 	if (!vdp->soc->mv310) {
-		ret = drm_universal_plane_init(drm, &vdp->v0_plane, 1,
-					       &histb_vdp_v0_plane_funcs,
-					       histb_vdp_v0_formats,
-					       ARRAY_SIZE(histb_vdp_v0_formats),
-					       NULL, DRM_PLANE_TYPE_OVERLAY, "v0");
-		if (ret)
-			return ret;
-		drm_plane_helper_add(&vdp->v0_plane, &histb_vdp_v0_plane_helper_funcs);
-		ret = drm_plane_create_alpha_property(&vdp->v0_plane);
-		if (ret)
-			return ret;
-		ret = drm_plane_create_zpos_property(&vdp->v0_plane, 0, 0, 1);
-		if (ret)
-			return ret;
-		ret = drm_plane_create_color_properties(&vdp->v0_plane,
-				BIT(DRM_COLOR_YCBCR_BT601) | BIT(DRM_COLOR_YCBCR_BT709),
-				BIT(DRM_COLOR_YCBCR_LIMITED_RANGE) | BIT(DRM_COLOR_YCBCR_FULL_RANGE),
-				DRM_COLOR_YCBCR_BT709, DRM_COLOR_YCBCR_LIMITED_RANGE);
-		if (ret)
-			return ret;
-		ret = drm_plane_create_blend_mode_property(&vdp->pipe.plane,
-				BIT(DRM_MODE_BLEND_PIXEL_NONE) |
-				BIT(DRM_MODE_BLEND_PREMULTI) | BIT(DRM_MODE_BLEND_COVERAGE));
-		if (ret)
-			return ret;
+		static const char * const names[] = { "g1", "g3", "v0", "v1" };
+
+		for (i = 1; i < HISTB_VDP_PLANE_COUNT; i++) {
+			struct histb_vdp_overlay *overlay = &vdp->overlays[i - 1];
+			const u32 *formats = i < HISTB_VDP_GFX_COUNT ? histb_vdp_formats :
+				histb_vdp_v0_formats;
+			unsigned int count = i < HISTB_VDP_GFX_COUNT ? ARRAY_SIZE(histb_vdp_formats) :
+				ARRAY_SIZE(histb_vdp_v0_formats);
+
+			overlay->id = i;
+			ret = drm_universal_plane_init(drm, &overlay->plane, 1,
+					       &histb_vdp_overlay_funcs, formats, count,
+					       NULL, DRM_PLANE_TYPE_OVERLAY, "%s", names[i - 1]);
+			if (ret)
+				return ret;
+			drm_plane_helper_add(&overlay->plane, &histb_vdp_overlay_helper_funcs);
+			ret = histb_vdp_plane_properties(vdp, &overlay->plane, i);
+			if (ret)
+				return ret;
+		}
 	}
 
 	ret = drm_vblank_init(drm, 1);
@@ -2142,6 +2447,13 @@ static int histb_vdp_probe(struct platform_device *pdev)
 	if (IS_ERR(vdp->connector))
 		return dev_err_probe(dev, PTR_ERR(vdp->connector),
 				     "failed to create connector\n");
+#if IS_REACHABLE(CONFIG_DRM_HISI_HISTB_HDMI)
+	if (!vdp->soc->mv310) {
+		ret = histb_hdmi_connector_init(bridge, vdp->connector);
+		if (ret)
+			return ret;
+	}
+#endif
 
 	ret = drm_connector_attach_encoder(vdp->connector, &vdp->pipe.encoder);
 	if (ret)
