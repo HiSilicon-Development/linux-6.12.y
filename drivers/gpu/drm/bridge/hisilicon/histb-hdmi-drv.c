@@ -38,8 +38,11 @@
 #include <drm/drm_bridge.h>
 #include <drm/drm_connector.h>
 #include <drm/drm_edid.h>
+#include <drm/drm_managed.h>
 #include <drm/drm_modes.h>
 #include <drm/drm_print.h>
+#include <drm/drm_device.h>
+#include <drm/bridge/histb-hdmi.h>
 #include <drm/display/drm_hdmi_state_helper.h>
 #include <drm/display/drm_scdc_helper.h>
 
@@ -127,6 +130,29 @@
 #define HISTB_HDMI_TPI_AUD_CONFIG	HISTB_HDMI_REG(0xa, 0x62)
 #define HISTB_HDMI_TPI_AUD_FS		HISTB_HDMI_REG(0xa, 0x63)
 #define HISTB_HDMI_CEC_CONFIG_CPI	HISTB_HDMI_REG(0xf, 0x8e)
+#define HISTB_HDMI_CEC_DEBUG3		HISTB_HDMI_REG(0xf, 0x87)
+#define HISTB_HDMI_CEC_TX_INIT		HISTB_HDMI_REG(0xf, 0x88)
+#define HISTB_HDMI_CEC_TX_DEST		HISTB_HDMI_REG(0xf, 0x89)
+#define HISTB_HDMI_CEC_TX_COMMAND		HISTB_HDMI_REG(0xf, 0x8f)
+#define HISTB_HDMI_CEC_TX_OPERAND		HISTB_HDMI_REG(0xf, 0x90)
+#define HISTB_HDMI_CEC_TRANSMIT		HISTB_HDMI_REG(0xf, 0x9f)
+#define HISTB_HDMI_CEC_RETRY		HISTB_HDMI_REG(0xf, 0xa0)
+#define HISTB_HDMI_CEC_CAPTURE		HISTB_HDMI_REG(0xf, 0xa2)
+#define HISTB_HDMI_CEC_INT_ENABLE0	HISTB_HDMI_REG(0xf, 0xa4)
+#define HISTB_HDMI_CEC_INT_ENABLE1	HISTB_HDMI_REG(0xf, 0xa5)
+#define HISTB_HDMI_CEC_STATUS0		HISTB_HDMI_REG(0xf, 0xa6)
+#define HISTB_HDMI_CEC_STATUS1		HISTB_HDMI_REG(0xf, 0xa7)
+#define HISTB_HDMI_CEC_RX_CONTROL		HISTB_HDMI_REG(0xf, 0xac)
+#define HISTB_HDMI_CEC_RX_COUNT		HISTB_HDMI_REG(0xf, 0xad)
+#define HISTB_HDMI_CEC_RX_HEADER		HISTB_HDMI_REG(0xf, 0xae)
+#define HISTB_HDMI_CEC_RX_COMMAND		HISTB_HDMI_REG(0xf, 0xaf)
+#define HISTB_HDMI_CEC_RX_OPERAND		HISTB_HDMI_REG(0xf, 0xb0)
+#define HISTB_HDMI_CEC_OP_ABORT		HISTB_HDMI_REG(0xf, 0xc0)
+#define HISTB_HDMI_CEC_RESET		BIT(7)
+#define HISTB_HDMI_CEC_NACK_HEADER		BIT(1)
+#define HISTB_HDMI_CEC_FLUSH_TX		BIT(7)
+#define HISTB_HDMI_CEC_TX_DONE		BIT(5)
+#define HISTB_HDMI_CEC_TX_NACK		BIT(1)
 #define HISTB_HDMI_PATTERN_GEN_CTRL0	HISTB_HDMI_REG(0xe, 0x60)
 
 #define HISTB_HDMI_VP_INPUT_FORMAT	HISTB_HDMI_REG(0xb, 0x14)
@@ -205,7 +231,7 @@
 #define HISTB_HDMI_VP_CSC_OUT_RGB	BIT(5)
 #define HISTB_HDMI_VP_CSC_IN_BT601	BIT(6)
 #define HISTB_HDMI_VP_CSC_IN_PC		BIT(8)
-#define HISTB_HDMI_VP_CSC_IN_RGB		BIT(9)
+#define HISTB_HDMI_VP_CSC_IN_RGB	BIT(9)
 #define HISTB_HDMI_VP_CSC_CONFIG_MASK	GENMASK(11, 0)
 #define HISTB_HDMI_VP_DITHER_MODE	GENMASK(1, 0)
 #define HISTB_HDMI_VP_DITHER_10_TO_8	2
@@ -331,11 +357,14 @@ struct histb_hdmi {
 	u32 perictrl_offset;
 	struct mutex ddc_lock; /* Serializes access to the internal DDC master. */
 	struct mutex audio_lock; /* Serializes ACR/I2S updates with bridge state. */
+	struct mutex packet_lock; /* Shared indexed AVI/audio/DRM packet port. */
 	struct histb_hdmi_audio audio;
 	struct i2c_adapter ddc;
 	struct drm_bridge bridge;
 	struct drm_connector *active_connector;
+	struct drm_device *connector_dev;
 	struct delayed_work hpd_work;
+	bool removing;
 	int tx_irq;
 	int last_reported_status;
 	bool hpd_enabled;
@@ -352,6 +381,8 @@ struct histb_hdmi {
 	u16 cec_log_addr_mask;
 	bool cec_enabled;
 	bool cec_tx_pending;
+	bool cec_suspended;
+	bool cec_tx_failed;
 #endif
 };
 
@@ -392,34 +423,147 @@ static u16 histb_hdmi_readw(struct histb_hdmi *hdmi, u32 reg)
 }
 #if IS_ENABLED(CONFIG_CEC_CORE)
 
+/* All CEC MMIO is serialized with HDMI resets by audio_lock. Completion
+ * and receive callbacks run outside it: the CEC core takes adap->lock.
+ */
+static void histb_hdmi_cec_hw_config(struct histb_hdmi *hdmi)
+{
+	bool enable = hdmi->cec_enabled && !hdmi->cec_suspended;
+	unsigned int i;
+
+	if (hdmi->cec_tx_pending) {
+		hdmi->cec_tx_pending = false;
+		hdmi->cec_tx_failed = true;
+	}
+
+	if (!hdmi->aux_enabled)
+		return;
+	histb_hdmi_updateb(hdmi, HISTB_HDMI_REG(0, 0x12),
+			   HISTB_HDMI_CEC_RESET, enable ? 0 : HISTB_HDMI_CEC_RESET);
+	histb_hdmi_updateb(hdmi, HISTB_HDMI_CEC_CONFIG_CPI, BIT(4),
+			   enable ? 0 : BIT(4));
+	histb_hdmi_updateb(hdmi, HISTB_HDMI_CEC_DEBUG3,
+			   HISTB_HDMI_CEC_NACK_HEADER | HISTB_HDMI_CEC_FLUSH_TX,
+			   HISTB_HDMI_CEC_FLUSH_TX |
+			   (enable ? 0 : HISTB_HDMI_CEC_NACK_HEADER));
+	/* Use the BSP's process-context status polling, not an unserviced IRQ. */
+	histb_hdmi_writeb(hdmi, HISTB_HDMI_CEC_INT_ENABLE0, 0);
+	histb_hdmi_writeb(hdmi, HISTB_HDMI_CEC_INT_ENABLE1, 0);
+	histb_hdmi_writeb(hdmi, HISTB_HDMI_CEC_STATUS0, 0x66);
+	histb_hdmi_writeb(hdmi, HISTB_HDMI_CEC_STATUS1, 0x1f);
+	histb_hdmi_writeb(hdmi, HISTB_HDMI_CEC_RX_CONTROL, BIT(1));
+	if (!enable)
+		return;
+	/* Let the CEC framework implement replies, including Feature Abort. */
+	for (i = 0; i < 32; i++)
+		histb_hdmi_writeb(hdmi, HISTB_HDMI_CEC_OP_ABORT + i * 4, 0);
+	histb_hdmi_writeb(hdmi, HISTB_HDMI_CEC_RETRY, 0);
+	histb_hdmi_writeb(hdmi, HISTB_HDMI_CEC_CAPTURE,
+			  hdmi->cec_log_addr_mask);
+	histb_hdmi_writeb(hdmi, HISTB_HDMI_CEC_CAPTURE + 4,
+			  hdmi->cec_log_addr_mask >> 8);
+	mod_delayed_work(system_wq, &hdmi->cec_work, msecs_to_jiffies(10));
+}
+
+static void histb_hdmi_cec_work(struct work_struct *work)
+{
+	struct histb_hdmi *hdmi = container_of(to_delayed_work(work),
+					      struct histb_hdmi, cec_work);
+	struct cec_msg received[3] = {};
+	unsigned int count = 0, i, operands;
+	u8 status0, status1, tx_status = 0, rx_count;
+
+	mutex_lock(&hdmi->audio_lock);
+	if (!hdmi->cec_enabled || hdmi->cec_suspended || !hdmi->aux_enabled)
+		goto unlock;
+	status0 = histb_hdmi_readb(hdmi, HISTB_HDMI_CEC_STATUS0);
+	status1 = histb_hdmi_readb(hdmi, HISTB_HDMI_CEC_STATUS1);
+	if (status1 & HISTB_HDMI_CEC_TX_NACK)
+		histb_hdmi_updateb(hdmi, HISTB_HDMI_CEC_DEBUG3,
+				   HISTB_HDMI_CEC_FLUSH_TX, HISTB_HDMI_CEC_FLUSH_TX);
+	if (hdmi->cec_tx_failed) {
+		tx_status = CEC_TX_STATUS_ERROR;
+		hdmi->cec_tx_failed = false;
+	}
+	histb_hdmi_writeb(hdmi, HISTB_HDMI_CEC_STATUS0, status0 & 0x66);
+	histb_hdmi_writeb(hdmi, HISTB_HDMI_CEC_STATUS1, status1 & 0x1f);
+	if (hdmi->cec_tx_pending) {
+		if (status1 & HISTB_HDMI_CEC_TX_NACK)
+			tx_status = CEC_TX_STATUS_NACK;
+		else if (status0 & HISTB_HDMI_CEC_TX_DONE)
+			tx_status = CEC_TX_STATUS_OK;
+		else if (time_after_eq(jiffies, hdmi->cec_tx_deadline)) {
+			histb_hdmi_updateb(hdmi, HISTB_HDMI_CEC_DEBUG3,
+				HISTB_HDMI_CEC_FLUSH_TX, HISTB_HDMI_CEC_FLUSH_TX);
+			tx_status = CEC_TX_STATUS_ERROR;
+		}
+		if (tx_status)
+			hdmi->cec_tx_pending = false;
+	}
+	while (count < ARRAY_SIZE(received)) {
+		rx_count = histb_hdmi_readb(hdmi, HISTB_HDMI_CEC_RX_COUNT);
+		if (!(rx_count & GENMASK(5, 4)))
+			break;
+		operands = rx_count & 0xf;
+		if (!(rx_count & BIT(7)) && operands <= CEC_MAX_MSG_SIZE - 2) {
+			struct cec_msg *msg = &received[count++];
+
+			msg->len = operands + 2;
+			msg->msg[0] = histb_hdmi_readb(hdmi, HISTB_HDMI_CEC_RX_HEADER);
+			msg->msg[1] = histb_hdmi_readb(hdmi, HISTB_HDMI_CEC_RX_COMMAND);
+			for (i = 0; i < operands; i++)
+				msg->msg[i + 2] = histb_hdmi_readb(hdmi,
+					HISTB_HDMI_CEC_RX_OPERAND + i * 4);
+		} else {
+			dev_warn_ratelimited(hdmi->dev, "invalid CEC RX frame: %02x\n",
+					     rx_count);
+			/* Bound invalid-frame draining to this hardware FIFO. */
+			histb_hdmi_writeb(hdmi, HISTB_HDMI_CEC_RX_CONTROL, BIT(1));
+			break;
+		}
+		histb_hdmi_writeb(hdmi, HISTB_HDMI_CEC_RX_CONTROL, BIT(0));
+	}
+	mod_delayed_work(system_wq, &hdmi->cec_work, msecs_to_jiffies(10));
+unlock:
+	mutex_unlock(&hdmi->audio_lock);
+	if (tx_status)
+		cec_transmit_attempt_done(hdmi->cec_adap, tx_status);
+	for (i = 0; i < count; i++)
+		cec_received_msg(hdmi->cec_adap, &received[i]);
+}
+
 static int histb_hdmi_cec_adap_enable(struct cec_adapter *adap, bool enable)
 {
 	struct histb_hdmi *hdmi = cec_get_drvdata(adap);
+	guard(mutex)(&hdmi->audio_lock);
 
-	if (enable) {
-		histb_hdmi_writeb(hdmi, HISTB_HDMI_REG(0xf, 0x8e), 0x00);
-		histb_hdmi_writeb(hdmi, HISTB_HDMI_REG(0xf, 0xa4), 0x34);
-	} else {
-		histb_hdmi_writeb(hdmi, HISTB_HDMI_REG(0xf, 0x8e), 0x10);
-		histb_hdmi_writeb(hdmi, HISTB_HDMI_REG(0xf, 0xa4), 0x00);
-	}
+	if (enable && (!hdmi->aux_enabled || hdmi->cec_suspended || hdmi->removing))
+		return -EHOSTDOWN;
+	hdmi->cec_enabled = enable;
+	hdmi->cec_tx_pending = false;
+	hdmi->cec_tx_failed = false;
+	hdmi->cec_log_addr_mask = 0;
+	histb_hdmi_cec_hw_config(hdmi);
+	if (!enable)
+		/* adap->lock is held: never wait on a worker notifying the core. */
+		cancel_delayed_work(&hdmi->cec_work);
 	return 0;
 }
 
 static int histb_hdmi_cec_adap_log_addr(struct cec_adapter *adap, u8 logical_addr)
 {
 	struct histb_hdmi *hdmi = cec_get_drvdata(adap);
+	guard(mutex)(&hdmi->audio_lock);
 
-	if (logical_addr == CEC_LOG_ADDR_INVALID) {
-		histb_hdmi_writeb(hdmi, HISTB_HDMI_REG(0xf, 0xa2), 0x00);
-		histb_hdmi_writeb(hdmi, HISTB_HDMI_REG(0xf, 0xa3), 0x00);
-	} else {
-		u16 mask = BIT(logical_addr);
-
-		histb_hdmi_writeb(hdmi, HISTB_HDMI_REG(0xf, 0xa2), mask & 0xff);
-		histb_hdmi_writeb(hdmi, HISTB_HDMI_REG(0xf, 0xa3), (mask >> 8) & 0xff);
-		histb_hdmi_writeb(hdmi, HISTB_HDMI_REG(0xf, 0x88), logical_addr & 0x0f);
-	}
+	hdmi->cec_log_addr_mask = logical_addr == CEC_LOG_ADDR_INVALID ? 0 :
+		BIT(logical_addr);
+	if (!hdmi->aux_enabled || hdmi->cec_suspended)
+		return 0;
+	histb_hdmi_writeb(hdmi, HISTB_HDMI_CEC_CAPTURE, hdmi->cec_log_addr_mask);
+	histb_hdmi_writeb(hdmi, HISTB_HDMI_CEC_CAPTURE + 4,
+			  hdmi->cec_log_addr_mask >> 8);
+	histb_hdmi_writeb(hdmi, HISTB_HDMI_CEC_TX_INIT,
+		logical_addr == CEC_LOG_ADDR_INVALID ? CEC_LOG_ADDR_UNREGISTERED : logical_addr);
 	return 0;
 }
 
@@ -427,23 +571,62 @@ static int histb_hdmi_cec_adap_transmit(struct cec_adapter *adap, u8 attempts,
 					u32 signal_free_time, struct cec_msg *msg)
 {
 	struct histb_hdmi *hdmi = cec_get_drvdata(adap);
-	unsigned int i;
+	unsigned int i, free_us = CEC_FREE_TIME_TO_USEC(signal_free_time);
 
-	if (!msg->len)
+	if (!msg->len || msg->len > CEC_MAX_MSG_SIZE)
 		return -EINVAL;
-
-	histb_hdmi_writeb(hdmi, HISTB_HDMI_REG(0xf, 0x88), cec_msg_initiator(msg));
-	histb_hdmi_writeb(hdmi, HISTB_HDMI_REG(0xf, 0x89), cec_msg_destination(msg));
-
-	if (msg->len > 1) {
-		histb_hdmi_writeb(hdmi, HISTB_HDMI_REG(0xf, 0x8f), msg->msg[1]);
-		for (i = 0; i < msg->len - 2 && i < 15; i++)
-			histb_hdmi_writeb(hdmi, HISTB_HDMI_REG(0xf, 0x90 + i), msg->msg[2 + i]);
+	usleep_range(free_us, free_us + 1000);
+	guard(mutex)(&hdmi->audio_lock);
+	if (!hdmi->cec_enabled || hdmi->cec_suspended || !hdmi->aux_enabled)
+		return -EHOSTDOWN;
+	if (hdmi->cec_tx_pending)
+		return -EBUSY;
+	histb_hdmi_writeb(hdmi, HISTB_HDMI_CEC_STATUS0, 0x64);
+	histb_hdmi_writeb(hdmi, HISTB_HDMI_CEC_STATUS1, HISTB_HDMI_CEC_TX_NACK);
+	/* One hardware attempt; the CEC framework accounts for retries. */
+	histb_hdmi_writeb(hdmi, HISTB_HDMI_CEC_RETRY, 0);
+	histb_hdmi_writeb(hdmi, HISTB_HDMI_CEC_TX_INIT, cec_msg_initiator(msg));
+	hdmi->cec_tx_pending = true;
+	hdmi->cec_tx_deadline = jiffies + msecs_to_jiffies(1000);
+	if (msg->len == 1) {
+		histb_hdmi_writeb(hdmi, HISTB_HDMI_CEC_TX_DEST,
+				  BIT(7) | cec_msg_destination(msg));
+	} else {
+		histb_hdmi_writeb(hdmi, HISTB_HDMI_CEC_TX_DEST, cec_msg_destination(msg));
+		histb_hdmi_writeb(hdmi, HISTB_HDMI_CEC_TX_COMMAND, msg->msg[1]);
+		for (i = 0; i < msg->len - 2; i++)
+			histb_hdmi_writeb(hdmi, HISTB_HDMI_CEC_TX_OPERAND + i * 4,
+					  msg->msg[i + 2]);
+		histb_hdmi_writeb(hdmi, HISTB_HDMI_CEC_TRANSMIT,
+				  BIT(4) | (msg->len - 2));
 	}
-
-	histb_hdmi_writeb(hdmi, HISTB_HDMI_REG(0xf, 0x9f), 0x30 | (msg->len & 0x0f));
-	cec_transmit_attempt_done(adap, CEC_TX_STATUS_OK);
+	mod_delayed_work(system_wq, &hdmi->cec_work, msecs_to_jiffies(10));
 	return 0;
+}
+
+static void histb_hdmi_cec_pause(struct histb_hdmi *hdmi)
+{
+	bool pending;
+
+	mutex_lock(&hdmi->audio_lock);
+	hdmi->cec_suspended = true;
+	pending = hdmi->cec_tx_pending || hdmi->cec_tx_failed;
+	hdmi->cec_tx_pending = false;
+	hdmi->cec_tx_failed = false;
+	histb_hdmi_cec_hw_config(hdmi);
+	mutex_unlock(&hdmi->audio_lock);
+	cancel_delayed_work_sync(&hdmi->cec_work);
+	if (pending && !IS_ERR_OR_NULL(hdmi->cec_adap))
+		cec_transmit_attempt_done(hdmi->cec_adap, CEC_TX_STATUS_ERROR);
+}
+
+static void histb_hdmi_cec_release(void *data)
+{
+	struct histb_hdmi *hdmi = data;
+
+	histb_hdmi_cec_pause(hdmi);
+	cec_unregister_adapter(hdmi->cec_adap);
+	hdmi->cec_adap = NULL;
 }
 
 static const struct cec_adap_ops histb_hdmi_cec_ops = {
@@ -695,11 +878,17 @@ static void histb_hdmi_validate_link(struct histb_hdmi *hdmi)
 static void histb_hdmi_infoframe_enable(struct histb_hdmi *hdmi,
 					bool enable)
 {
+	/* imagev200 requires clearing repeat before the send request. */
+	if (!enable) {
+		histb_hdmi_updateb(hdmi, HISTB_HDMI_INFOFRAME_CTRL,
+				   HISTB_HDMI_INFOFRAME_REPEAT, 0);
+		histb_hdmi_updateb(hdmi, HISTB_HDMI_INFOFRAME_CTRL,
+				   HISTB_HDMI_INFOFRAME_ENABLE, 0);
+		return;
+	}
 	histb_hdmi_updateb(hdmi, HISTB_HDMI_INFOFRAME_CTRL,
-			   HISTB_HDMI_INFOFRAME_ENABLE |
-			   HISTB_HDMI_INFOFRAME_REPEAT,
-			   enable ? HISTB_HDMI_INFOFRAME_ENABLE |
-			   HISTB_HDMI_INFOFRAME_REPEAT : 0);
+			   HISTB_HDMI_INFOFRAME_ENABLE | HISTB_HDMI_INFOFRAME_REPEAT,
+			   HISTB_HDMI_INFOFRAME_ENABLE | HISTB_HDMI_INFOFRAME_REPEAT);
 }
 
 static int histb_hdmi_infoframe_wait(struct histb_hdmi *hdmi, bool active)
@@ -737,7 +926,8 @@ static int histb_hdmi_infoframe_select(struct histb_hdmi *hdmi,
 		selector = 5;
 		break;
 	case HDMI_INFOFRAME_TYPE_DRM:
-		selector = 9;
+		/* CV200 sInfoframesSet() uses GEN3, not the generic GEN4 comment. */
+		selector = 8;
 		break;
 	default:
 		return -EINVAL;
@@ -751,8 +941,9 @@ static int histb_hdmi_infoframe_select(struct histb_hdmi *hdmi,
 
 static void histb_hdmi_disable_infoframes(struct histb_hdmi *hdmi)
 {
-	static const u8 selectors[] = { 0, 2, 3, 5, 9 };
+	static const u8 selectors[] = { 0, 2, 3, 5, 8 };
 	unsigned int i;
+	guard(mutex)(&hdmi->packet_lock);
 
 	for (i = 0; i < ARRAY_SIZE(selectors); i++) {
 		histb_hdmi_updateb(hdmi, HISTB_HDMI_INFOFRAME_SELECT,
@@ -850,8 +1041,10 @@ static void histb_hdmi_audio_stop(void *data)
 	histb_hdmi_updateb(hdmi, HISTB_HDMI_AUD_EN, HISTB_HDMI_AUD_IN_EN, 0);
 	histb_hdmi_updateb(hdmi, HISTB_HDMI_PKT_FILTER1,
 			   HISTB_HDMI_AUDIO_PKT_ENABLE, 0);
+	guard(mutex)(&hdmi->packet_lock);
 	histb_hdmi_infoframe_select(hdmi, HDMI_INFOFRAME_TYPE_AUDIO);
 	histb_hdmi_infoframe_enable(hdmi, false);
+	histb_hdmi_infoframe_select(hdmi, HDMI_INFOFRAME_TYPE_AVI);
 }
 
 /* Values from the CV200 vendor sHardwareInit() sequence. */
@@ -953,6 +1146,9 @@ static int histb_hdmi_hw_init(struct histb_hdmi *hdmi)
 	histb_hdmi_video_path_hw_init(hdmi);
 	histb_hdmi_tmds_enable(hdmi, false);
 	histb_hdmi_disable_infoframes(hdmi);
+#if IS_ENABLED(CONFIG_CEC_CORE)
+	histb_hdmi_cec_hw_config(hdmi);
+#endif
 
 	return 0;
 }
@@ -973,6 +1169,10 @@ static void histb_hdmi_configure_mode(struct histb_hdmi *hdmi,
 	if (mode->flags & DRM_MODE_FLAG_PHSYNC)
 		sync |= HISTB_HDMI_VP_SYNC_HPOS;
 	histb_hdmi_pwd_srst(hdmi);
+#if IS_ENABLED(CONFIG_CEC_CORE)
+	/* PWD_SRST resets CPI too: restore it after the last mode reset. */
+	histb_hdmi_cec_hw_config(hdmi);
+#endif
 	histb_hdmi_configure_output_depth(hdmi, bpc);
 	histb_hdmi_writeb(hdmi, HISTB_HDMI_VP_OUTPUT_SYNC, sync);
 
@@ -994,8 +1194,8 @@ static void histb_hdmi_configure_mode(struct histb_hdmi *hdmi,
 			   HISTB_HDMI_MODE,
 			   is_hdmi ? HISTB_HDMI_MODE : 0);
 	histb_hdmi_disable_infoframes(hdmi);
-	dev_dbg(hdmi->dev,
-		 "CV200 HDMI mode %ux%u@%u %s %u bpc tmds=%llu sync=%02x in=%04x in_map=%04x out=%04x out_map=%04x ratio=%02x\n",
+	drm_dbg_kms(hdmi->bridge.dev,
+		 "CV200 HDMI mode %ux%u@%u %s %u bpc tmds=%llu sync=%02x in=%04x in_map=%04x out=%04x out_map=%04x ratio=%02x csc=%04x dither=%02x pack=%02x phy_depth=%02x\n",
 		 mode->hdisplay, mode->vdisplay, drm_mode_vrefresh(mode),
 		 drm_hdmi_connector_get_output_format_name(format), bpc,
 		 tmds_rate, histb_hdmi_readb(hdmi, HISTB_HDMI_VP_OUTPUT_SYNC),
@@ -1003,7 +1203,11 @@ static void histb_hdmi_configure_mode(struct histb_hdmi *hdmi,
 		 histb_hdmi_readw(hdmi, HISTB_HDMI_VP_INPUT_MAPPING),
 		 histb_hdmi_readw(hdmi, HISTB_HDMI_VP_OUTPUT_FORMAT),
 		 histb_hdmi_readw(hdmi, HISTB_HDMI_VP_OUTPUT_MAPPING),
-		 histb_hdmi_readb(hdmi, HISTB_HDMI_CLK_RATIO));
+		 histb_hdmi_readb(hdmi, HISTB_HDMI_CLK_RATIO),
+		 histb_hdmi_readw(hdmi, HISTB_HDMI_VP_CSC1_CONFIG),
+		 histb_hdmi_readb(hdmi, HISTB_HDMI_VP_CSC1_DITHER),
+		 histb_hdmi_readb(hdmi, HISTB_HDMI_P2T_CTRL),
+		 histb_hdmi_readb(hdmi, HISTB_HDMI_PHY_TOP_CTRL1));
 }
 
 static int histb_hdmi_ddc_enable(struct histb_hdmi *hdmi)
@@ -1245,7 +1449,7 @@ static int histb_hdmi_ddc_master_xfer(struct i2c_adapter *adapter,
 		return -EHOSTDOWN;
 
 	if (num == 1 && msgs[0].addr == HISTB_HDMI_SCDC_I2C_ADDR &&
-	    !msgs[0].flags && msgs[0].len >= 2) {
+	    !(msgs[0].flags & ~I2C_M_DMA_SAFE) && msgs[0].len >= 2) {
 		ret = histb_hdmi_scdc_transfer(hdmi, msgs[0].buf[0],
 					       msgs[0].buf + 1,
 					       msgs[0].len - 1, false);
@@ -1254,8 +1458,8 @@ static int histb_hdmi_ddc_master_xfer(struct i2c_adapter *adapter,
 
 	if (num == 2 && msgs[0].addr == HISTB_HDMI_SCDC_I2C_ADDR &&
 	    msgs[1].addr == HISTB_HDMI_SCDC_I2C_ADDR &&
-	    !msgs[0].flags && msgs[0].len == 1 &&
-	    msgs[1].flags == I2C_M_RD && msgs[1].len) {
+	    !(msgs[0].flags & ~I2C_M_DMA_SAFE) && msgs[0].len == 1 &&
+	    (msgs[1].flags & ~I2C_M_DMA_SAFE) == I2C_M_RD && msgs[1].len) {
 		ret = histb_hdmi_scdc_transfer(hdmi, msgs[0].buf[0],
 					       msgs[1].buf, msgs[1].len, true);
 		return ret ? ret : num;
@@ -1287,6 +1491,33 @@ static enum drm_connector_status histb_hdmi_bridge_detect(struct drm_bridge *bri
 		       connector_status_connected : connector_status_disconnected;
 }
 
+/* Registered after the managed connector, so it runs before its cleanup. */
+static void histb_hdmi_connector_release(struct drm_device *drm, void *data);
+
+int histb_hdmi_connector_init(struct drm_bridge *bridge,
+			      struct drm_connector *connector)
+{
+	struct histb_hdmi *hdmi;
+
+	if (!of_device_is_compatible(bridge->of_node, "hisilicon,hi3798cv200-hdmi"))
+		return 0;
+	hdmi = bridge_to_histb_hdmi(bridge);
+	mutex_lock(&hdmi->audio_lock);
+	hdmi->connector_dev = connector->dev;
+	mutex_unlock(&hdmi->audio_lock);
+#if IS_ENABLED(CONFIG_CEC_CORE)
+	{
+		struct cec_connector_info info;
+
+		cec_fill_conn_info_from_drm(&info, connector);
+		cec_s_conn_info(hdmi->cec_adap, &info);
+	}
+#endif
+	return drmm_add_action_or_reset(connector->dev,
+					histb_hdmi_connector_release, hdmi);
+}
+EXPORT_SYMBOL_GPL(histb_hdmi_connector_init);
+
 static void histb_hdmi_hpd_work(struct work_struct *work)
 {
 	struct histb_hdmi *hdmi = container_of(to_delayed_work(work),
@@ -1313,6 +1544,10 @@ static void histb_hdmi_hpd_work(struct work_struct *work)
 		histb_audio_disable(&hdmi->audio);
 		mutex_unlock(&hdmi->audio_lock);
 	}
+#if IS_ENABLED(CONFIG_CEC_CORE)
+	if (status != connector_status_connected)
+		cec_phys_addr_invalidate(hdmi->cec_adap);
+#endif
 	if (READ_ONCE(hdmi->last_reported_status) != status) {
 		WRITE_ONCE(hdmi->last_reported_status, status);
 		drm_bridge_hpd_notify(&hdmi->bridge, status);
@@ -1350,6 +1585,10 @@ static void histb_hdmi_bridge_hpd_enable(struct drm_bridge *bridge)
 {
 	struct histb_hdmi *hdmi = bridge_to_histb_hdmi(bridge);
 
+	guard(mutex)(&hdmi->audio_lock);
+
+	if (!hdmi->aux_enabled)
+		return;
 	WRITE_ONCE(hdmi->hpd_enabled, true);
 	WRITE_ONCE(hdmi->last_reported_status, -1);
 	histb_hdmi_writeb(hdmi, HISTB_HDMI_INTR1,
@@ -1373,8 +1612,21 @@ static void histb_hdmi_bridge_hpd_disable(struct drm_bridge *bridge)
 	struct histb_hdmi *hdmi = bridge_to_histb_hdmi(bridge);
 
 	WRITE_ONCE(hdmi->hpd_enabled, false);
-	histb_hdmi_writeb(hdmi, HISTB_HDMI_INTR1_MASK, 0);
+	if (hdmi->aux_enabled)
+		histb_hdmi_writeb(hdmi, HISTB_HDMI_INTR1_MASK, 0);
+	/* The core holds hpd_mutex, which hpd_work needs for notification. */
 	cancel_delayed_work(&hdmi->hpd_work);
+}
+
+static void histb_hdmi_connector_release(struct drm_device *drm, void *data)
+{
+	struct histb_hdmi *hdmi = data;
+
+	hdmi->connector_dev = NULL;
+#if IS_ENABLED(CONFIG_CEC_CORE)
+	cec_phys_addr_invalidate(hdmi->cec_adap);
+	cec_s_conn_info(hdmi->cec_adap, NULL);
+#endif
 }
 
 static const struct drm_edid *
@@ -1384,10 +1636,16 @@ histb_hdmi_bridge_edid_read(struct drm_bridge *bridge,
 	struct histb_hdmi *hdmi = bridge_to_histb_hdmi(bridge);
 	const struct drm_edid *edid;
 
-	guard(mutex)(&hdmi->ddc_lock);
-	if (!READ_ONCE(hdmi->aux_enabled))
-		return NULL;
-	edid = drm_edid_read_custom(connector, histb_hdmi_read_edid_block, hdmi);
+	{
+		guard(mutex)(&hdmi->ddc_lock);
+
+		if (!READ_ONCE(hdmi->aux_enabled))
+			return NULL;
+		edid = drm_edid_read_custom(connector, histb_hdmi_read_edid_block, hdmi);
+	}
+#if IS_ENABLED(CONFIG_CEC_CORE)
+	cec_s_phys_addr_from_edid(hdmi->cec_adap, edid ? drm_edid_raw(edid) : NULL);
+#endif
 
 	return edid;
 }
@@ -1452,13 +1710,16 @@ static int histb_hdmi_clear_infoframe(struct drm_bridge *bridge,
 {
 	struct histb_hdmi *hdmi = bridge_to_histb_hdmi(bridge);
 	int ret;
+	guard(mutex)(&hdmi->packet_lock);
 
 	ret = histb_hdmi_infoframe_select(hdmi, type);
 	if (ret)
 		return ret;
 
 	histb_hdmi_infoframe_enable(hdmi, false);
-	return histb_hdmi_infoframe_wait(hdmi, false);
+	ret = histb_hdmi_infoframe_wait(hdmi, false);
+	histb_hdmi_infoframe_select(hdmi, HDMI_INFOFRAME_TYPE_AVI);
+	return ret;
 }
 
 static int histb_hdmi_write_infoframe(struct drm_bridge *bridge,
@@ -1468,6 +1729,7 @@ static int histb_hdmi_write_infoframe(struct drm_bridge *bridge,
 	struct histb_hdmi *hdmi = bridge_to_histb_hdmi(bridge);
 	unsigned int i;
 	int ret;
+	guard(mutex)(&hdmi->packet_lock);
 
 	if (!buffer || !len || len > HISTB_HDMI_INFOFRAME_BYTES)
 		return -EINVAL;
@@ -1479,7 +1741,7 @@ static int histb_hdmi_write_infoframe(struct drm_bridge *bridge,
 	histb_hdmi_infoframe_enable(hdmi, false);
 	ret = histb_hdmi_infoframe_wait(hdmi, false);
 	if (ret)
-		return ret;
+		goto restore_selector;
 	for (i = 0; i < HISTB_HDMI_INFOFRAME_BYTES; i++)
 		histb_hdmi_writeb(hdmi, HISTB_HDMI_INFOFRAME_DATA +
 				  i * sizeof(u32), i < len ? buffer[i] : 0);
@@ -1487,6 +1749,8 @@ static int histb_hdmi_write_infoframe(struct drm_bridge *bridge,
 	ret = histb_hdmi_infoframe_wait(hdmi, true);
 	if (ret)
 		histb_hdmi_infoframe_enable(hdmi, false);
+restore_selector:
+	histb_hdmi_infoframe_select(hdmi, HDMI_INFOFRAME_TYPE_AVI);
 	return ret;
 }
 static int histb_hdmi_audio_program(void *data,
@@ -1613,8 +1877,12 @@ static void histb_hdmi_abort_mode(struct histb_hdmi *hdmi)
 		dev_warn(hdmi->dev,
 			 "failed to release HDMI resets after modeset error: %pe\n",
 			 ERR_PTR(ret));
-	else
+	else {
 		usleep_range(1000, 2000);
+#if IS_ENABLED(CONFIG_CEC_CORE)
+		histb_hdmi_cec_hw_config(hdmi);
+#endif
+	}
 }
 
 static int histb_hdmi_bridge_atomic_check(struct drm_bridge *bridge,
@@ -1805,6 +2073,8 @@ histb_hdmi_bridge_atomic_enable(struct drm_bridge *bridge,
 			drm_err(bridge->dev,
 				"failed to program HDMI infoframes: %pe\n",
 				ERR_PTR(ret));
+			histb_hdmi_tmds_enable(hdmi, false);
+			return;
 		}
 		ret = histb_audio_enable(&hdmi->audio, connector);
 		if (ret)
@@ -1893,6 +2163,9 @@ static int __maybe_unused histb_hdmi_suspend(struct device *dev)
 	struct clk *pixel_clk;
 	int ret = 0;
 
+#if IS_ENABLED(CONFIG_CEC_CORE)
+	histb_hdmi_cec_pause(hdmi);
+#endif
 	WRITE_ONCE(hdmi->hpd_enabled, false);
 	if (hdmi->aux_enabled)
 		histb_hdmi_writeb(hdmi, HISTB_HDMI_INTR1_MASK, 0);
@@ -1954,6 +2227,10 @@ static int __maybe_unused histb_hdmi_resume(struct device *dev)
 	ret = histb_hdmi_hw_init(hdmi);
 	if (ret)
 		goto disable_aux;
+#if IS_ENABLED(CONFIG_CEC_CORE)
+	hdmi->cec_suspended = false;
+	histb_hdmi_cec_hw_config(hdmi);
+#endif
 
 	dev_dbg(dev, "HDMI transmitter resumed with vendor reset/init sequence\n");
 	return 0;
@@ -1981,11 +2258,16 @@ static int histb_hdmi_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	hdmi->dev = dev;
 	mutex_init(&hdmi->audio_lock);
+	mutex_init(&hdmi->packet_lock);
+	mutex_init(&hdmi->ddc_lock);
 	hdmi->audio.lock = &hdmi->audio_lock;
 	hdmi->audio.data = hdmi;
 	hdmi->audio.program = histb_hdmi_audio_program;
 	hdmi->audio.stop = histb_hdmi_audio_stop;
 	INIT_DELAYED_WORK(&hdmi->hpd_work, histb_hdmi_hpd_work);
+#if IS_ENABLED(CONFIG_CEC_CORE)
+	INIT_DELAYED_WORK(&hdmi->cec_work, histb_hdmi_cec_work);
+#endif
 	hdmi->last_reported_status = -1;
 	hdmi->hpd_polling = device_property_read_bool(dev, "hisilicon,hpd-poll");
 	hdmi->tx_irq = platform_get_irq_byname_optional(pdev, "tx");
@@ -2071,7 +2353,6 @@ static int histb_hdmi_probe(struct platform_device *pdev)
 	} else if (hdmi->hpd_polling) {
 		dev_dbg(dev, "HDMI HPD uses R002 150ms/10ms register polling\n");
 	}
-	mutex_init(&hdmi->ddc_lock);
 	hdmi->ddc.owner = THIS_MODULE;
 	hdmi->ddc.algo = &histb_hdmi_ddc_algorithm;
 	hdmi->ddc.dev.parent = dev;
@@ -2102,11 +2383,6 @@ static int histb_hdmi_probe(struct platform_device *pdev)
 	hdmi->bridge.color_format_property = true;
 	hdmi->bridge.max_bpc = 12;
 
-	ret = devm_drm_bridge_add(dev, &hdmi->bridge);
-	if (ret) {
-		histb_hdmi_disable_resources(hdmi);
-		return ret;
-	}
 
 	ret = histb_audio_register(dev, &hdmi->audio);
 	if (ret) {
@@ -2116,14 +2392,34 @@ static int histb_hdmi_probe(struct platform_device *pdev)
 #if IS_ENABLED(CONFIG_CEC_CORE)
 	hdmi->cec_adap = cec_allocate_adapter(&histb_hdmi_cec_ops, hdmi,
 					      dev_name(dev),
-					      CEC_CAP_DEFAULTS | CEC_CAP_CONNECTOR_INFO,
+					      CEC_CAP_DEFAULTS | CEC_CAP_CONNECTOR_INFO |
+					      CEC_CAP_NEEDS_HPD,
 					      1);
-	if (!IS_ERR(hdmi->cec_adap)) {
+	if (IS_ERR(hdmi->cec_adap)) {
+		ret = PTR_ERR(hdmi->cec_adap);
+		hdmi->cec_adap = NULL;
+		dev_warn(dev, "CEC adapter allocation failed: %d\n", ret);
+	} else {
 		ret = cec_register_adapter(hdmi->cec_adap, dev);
-		if (!ret)
-			dev_info(dev, "registered /dev/cec0 for HDMI-CEC\n");
+		if (ret) {
+			cec_delete_adapter(hdmi->cec_adap);
+			hdmi->cec_adap = NULL;
+			dev_warn(dev, "CEC adapter registration failed: %d\n", ret);
+		} else {
+			dev_info(dev, "registered HDMI-CEC adapter\n");
+			ret = devm_add_action_or_reset(dev, histb_hdmi_cec_release, hdmi);
+			if (ret) {
+				histb_hdmi_disable_resources(hdmi);
+				return ret;
+			}
+		}
 	}
 #endif
+	ret = devm_drm_bridge_add(dev, &hdmi->bridge);
+	if (ret) {
+		histb_hdmi_disable_resources(hdmi);
+		return ret;
+	}
 	platform_set_drvdata(pdev, hdmi);
 	dev_info(dev, "registered HDMI bridge with HPD, DDC and TMDS output\n");
 
@@ -2134,6 +2430,9 @@ static void histb_hdmi_remove(struct platform_device *pdev)
 {
 	struct histb_hdmi *hdmi = platform_get_drvdata(pdev);
 
+	mutex_lock(&hdmi->audio_lock);
+	hdmi->removing = true;
+	mutex_unlock(&hdmi->audio_lock);
 	histb_audio_unregister(&hdmi->audio);
 	WRITE_ONCE(hdmi->hpd_enabled, false);
 	if (hdmi->aux_enabled)
@@ -2143,7 +2442,7 @@ static void histb_hdmi_remove(struct platform_device *pdev)
 	cancel_delayed_work_sync(&hdmi->hpd_work);
 #if IS_ENABLED(CONFIG_CEC_CORE)
 	if (hdmi->cec_adap)
-		cec_unregister_adapter(hdmi->cec_adap);
+		devm_release_action(&pdev->dev, histb_hdmi_cec_release, hdmi);
 #endif
 	histb_hdmi_disable_resources(hdmi);
 }
