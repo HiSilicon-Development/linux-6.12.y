@@ -1,4 +1,4 @@
 # SPDX-License-Identifier: GPL-2.0-only
 
 obj-$(CONFIG_DRM_HISI_HISTB) += histb-vdp.o
-histb-vdp-y := histb-vdp-drv.o histb-vdp-zme.o
+histb-vdp-y := histb-vdp-drv.o histb-vdp-zme.o histb-vdp-hdr.o
