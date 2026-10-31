@@ -66,6 +66,20 @@
 		};
 	};
 
+	sound {
+		compatible = "simple-audio-card";
+		simple-audio-card,name = "EC6110T-HDMI";
+		simple-audio-card,format = "i2s";
+		simple-audio-card,bitclock-master = <&hdmi_sound_cpu>;
+		simple-audio-card,frame-master = <&hdmi_sound_cpu>;
+		hdmi_sound_cpu: simple-audio-card,cpu {
+			sound-dai = <&aiao 1>;
+		};
+		simple-audio-card,codec {
+			sound-dai = <&hdmi>;
+		};
+	};
+
 	sd_io: regulator-sd-io {
 		compatible = "hisilicon,hi3798mv310-sd-io-regulator";
 		hisilicon,peripheral-syscon = <&peri_ctrl>;
@@ -73,6 +87,10 @@
 		regulator-min-microvolt = <3300000>;
 		regulator-max-microvolt = <3300000>;
 	};
+};
+
+&aiao {
+	status = "okay";
 };
 
 /* The bundled EL3 handoff owns this mailbox; do not claim vendor PSCI. */

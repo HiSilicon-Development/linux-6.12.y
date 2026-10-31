@@ -349,8 +349,20 @@
 			};
 		};
 
+		aiao: audio-controller@f8cd0000 {
+			compatible = "hisilicon,hi3798mv310-aiao";
+			reg = <0xf8cd0000 0x10000>;
+			interrupts = <GIC_SPI 84 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&crg HI3798MV310_AIAO_CLK>, <&crg HI3798MV310_AIAO_MCLK>;
+			clock-names = "bus", "mclk";
+			resets = <&crg 0x118 4>;
+			#sound-dai-cells = <1>;
+			status = "disabled";
+		};
+
 		hdmi: hdmi@f8ce0000 {
 			compatible = "hisilicon,hi3798mv310-hdmi";
+			#sound-dai-cells = <0>;
 			reg = <0xf8ce0000 0x10000>, <0xf8d30000 0x1000>;
 			reg-names = "core", "phy";
 			clocks = <&crg HI3798MV310_HDMI_SSC>,
@@ -366,6 +378,7 @@
 				 <&crg 0x110 4>, <&crg 0x110 5>;
 			reset-names = "bus", "core", "ssc", "phy", "tmds";
 			hisilicon,sysctrl = <&sysctrl>;
+			hisilicon,perictrl = <&peri_ctrl>;
 			status = "disabled";
 			ports {
 				#address-cells = <1>;
