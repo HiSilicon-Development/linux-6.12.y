@@ -11,6 +11,7 @@
  * bridge helpers.
  */
 
+#include <linux/bitfield.h>
 #include <linux/clk.h>
 #include <linux/delay.h>
 #include <linux/hdmi.h>
@@ -41,6 +42,7 @@
 #include <drm/drm_managed.h>
 #include <drm/drm_modes.h>
 #include <drm/drm_print.h>
+#include <drm/drm_property.h>
 #include <drm/drm_device.h>
 #include <drm/bridge/histb-hdmi.h>
 #include <drm/display/drm_hdmi_state_helper.h>
@@ -226,12 +228,13 @@
 #define HISTB_HDMI_VP_FILTER_DISABLE	BIT(2)
 #define HISTB_HDMI_VP_CSC_MODE_MASK	GENMASK(1, 0)
 #define HISTB_HDMI_VP_CSC_ENABLE	BIT(0)
-#define HISTB_HDMI_VP_CSC_OUT_BT601	BIT(2)
+#define HISTB_HDMI_VP_CSC_OUT_STD	GENMASK(3, 2)
 #define HISTB_HDMI_VP_CSC_OUT_PC	BIT(4)
 #define HISTB_HDMI_VP_CSC_OUT_RGB	BIT(5)
-#define HISTB_HDMI_VP_CSC_IN_BT601	BIT(6)
+#define HISTB_HDMI_VP_CSC_IN_STD	GENMASK(7, 6)
 #define HISTB_HDMI_VP_CSC_IN_PC		BIT(8)
-#define HISTB_HDMI_VP_CSC_IN_RGB	BIT(9)
+#define HISTB_HDMI_VP_CSC_IN_RGB		BIT(9)
+#define HISTB_HDMI_VP_CSC_SAT_DISABLE	BIT(11)
 #define HISTB_HDMI_VP_CSC_CONFIG_MASK	GENMASK(11, 0)
 #define HISTB_HDMI_VP_DITHER_MODE	GENMASK(1, 0)
 #define HISTB_HDMI_VP_DITHER_10_TO_8	2
@@ -751,20 +754,25 @@ histb_hdmi_colorimetry(const struct drm_display_mode *mode)
 static void histb_hdmi_configure_video_path(struct histb_hdmi *hdmi,
 					    const struct drm_display_mode *mode,
 					    enum hdmi_colorspace format,
-					    unsigned int bpc)
+					    unsigned int bpc, bool bt2020)
 {
 	u16 output_mapping = HISTB_HDMI_VP_OUTPUT_MAP_444;
 	u16 csc_config = HISTB_HDMI_VP_CSC_ENABLE |
-			 HISTB_HDMI_VP_CSC_IN_PC | HISTB_HDMI_VP_CSC_IN_RGB;
+			 HISTB_HDMI_VP_CSC_IN_PC | HISTB_HDMI_VP_CSC_IN_RGB |
+			 HISTB_HDMI_VP_CSC_SAT_DISABLE;
+	u8 standard = bt2020 ? 2 :
+		histb_hdmi_colorimetry(mode) == HDMI_COLORIMETRY_ITU_601 ? 1 : 0;
 	u8 dither = bpc == 8 ? HISTB_HDMI_VP_DITHER_10_TO_8 :
 				     HISTB_HDMI_VP_DITHER_NO_CHANGE;
 
 	histb_hdmi_reset_video_path(hdmi);
 
-	/* VDP supplies full-range RGB; match the YUV matrix to the AVI. */
-	if (histb_hdmi_colorimetry(mode) == HDMI_COLORIMETRY_ITU_601)
-		csc_config |= HISTB_HDMI_VP_CSC_IN_BT601 |
-			      HISTB_HDMI_VP_CSC_OUT_BT601;
+	/* imagev200 sVideoPathCscConfig(): 709=0, 601=1, 2020 NCL=2.
+	 * The VDP supplies nonlinear full-range RGB; both standard selectors
+	 * must match the AVI colourimetry, without changing its PQ/HLG transfer.
+	 */
+	csc_config |= FIELD_PREP(HISTB_HDMI_VP_CSC_IN_STD, standard) |
+		      FIELD_PREP(HISTB_HDMI_VP_CSC_OUT_STD, standard);
 	if (format != HDMI_COLORSPACE_RGB)
 		histb_hdmi_updatew(hdmi, HISTB_HDMI_VP_CSC1_CONFIG,
 				   HISTB_HDMI_VP_CSC_CONFIG_MASK, csc_config);
@@ -1157,7 +1165,7 @@ static void histb_hdmi_configure_mode(struct histb_hdmi *hdmi,
 				      const struct drm_display_mode *mode,
 				      u64 tmds_rate, bool is_hdmi,
 				      enum hdmi_colorspace format,
-				      unsigned int bpc)
+				      unsigned int bpc, bool bt2020)
 {
 	u8 sync = 0;
 
@@ -1181,7 +1189,7 @@ static void histb_hdmi_configure_mode(struct histb_hdmi *hdmi,
 			  HISTB_HDMI_VP_AUTO_ADJ_DISABLE);
 	histb_hdmi_writew(hdmi, HISTB_HDMI_VP_INPUT_MAPPING,
 			  HISTB_HDMI_VP_INPUT_MAP_RGB);
-	histb_hdmi_configure_video_path(hdmi, mode, format, bpc);
+	histb_hdmi_configure_video_path(hdmi, mode, format, bpc, bt2020);
 	histb_hdmi_writeb(hdmi, HISTB_HDMI_VP_OUTPUT_MUTE, 0);
 
 	/* Source scrambling is enabled only after the sink accepts SCDC. */
@@ -1498,10 +1506,22 @@ int histb_hdmi_connector_init(struct drm_bridge *bridge,
 			      struct drm_connector *connector)
 {
 	struct histb_hdmi *hdmi;
+	int ret;
 
 	if (!of_device_is_compatible(bridge->of_node, "hisilicon,hi3798cv200-hdmi"))
 		return 0;
 	hdmi = bridge_to_histb_hdmi(bridge);
+	ret = drm_mode_create_hdmi_colorspace_property(connector,
+					BIT(DRM_MODE_COLORIMETRY_BT2020_RGB) |
+					BIT(DRM_MODE_COLORIMETRY_BT2020_YCC));
+	if (ret)
+		return ret;
+	ret = drm_connector_attach_colorspace_property(connector);
+	if (ret)
+		return ret;
+	ret = drm_connector_attach_hdr_output_metadata_property(connector);
+	if (ret)
+		return ret;
 	mutex_lock(&hdmi->audio_lock);
 	hdmi->connector_dev = connector->dev;
 	mutex_unlock(&hdmi->audio_lock);
@@ -1885,6 +1905,39 @@ static void histb_hdmi_abort_mode(struct histb_hdmi *hdmi)
 	}
 }
 
+/* drm_display_info in this kernel does not retain CTA Colorimetry DB bits.
+ * Read the immutable connector EDID blob while the modeset lock is held.
+ */
+static bool histb_hdmi_sink_bt2020(struct drm_connector *connector, bool rgb)
+{
+	const struct drm_property_blob *blob = connector->edid_blob_ptr;
+	const u8 *edid, *cta;
+	size_t block, pos, end, length;
+
+	if (!blob || blob->length < EDID_LENGTH)
+		return false;
+	edid = blob->data;
+	for (block = 1; block <= edid[126] &&
+	     block < blob->length / EDID_LENGTH; block++) {
+		cta = edid + block * EDID_LENGTH;
+		if (cta[0] != 0x02 || cta[1] < 3)
+			continue;
+		end = cta[2] ? cta[2] : 127;
+		if (end < 4 || end > 127)
+			continue;
+		for (pos = 4; pos < end; pos += length + 1) {
+			length = cta[pos] & 0x1f;
+			if (pos + length + 1 > end)
+				break;
+			/* CTA extended tag 5: BT.2020 RGB bit 7, NCL YCC bit 6. */
+			if ((cta[pos] >> 5) == 7 && length >= 3 &&
+			    cta[pos + 1] == 5 && (cta[pos + 2] & BIT(rgb ? 7 : 6)))
+				return true;
+		}
+	}
+	return false;
+}
+
 static int histb_hdmi_bridge_atomic_check(struct drm_bridge *bridge,
 					  struct drm_bridge_state *bridge_state,
 					  struct drm_crtc_state *crtc_state,
@@ -1892,6 +1945,46 @@ static int histb_hdmi_bridge_atomic_check(struct drm_bridge *bridge,
 {
 	struct hdmi_avi_infoframe *avi;
 	int ret;
+	struct drm_connector_state *old_state =
+		drm_atomic_get_old_connector_state(bridge_state->base.state,
+						   conn_state->connector);
+	const struct hdr_output_metadata *metadata;
+	const struct hdr_metadata_infoframe *type1;
+	const struct hdr_static_metadata *sink =
+		&conn_state->connector->hdr_sink_metadata.hdmi_type1;
+	unsigned int i;
+
+	/* The VDP supplies nonlinear BT.2020 RGB. TX either bypasses CSC for
+	 * RGB or uses its native BT.2020 NCL RGB-to-limited-YCbCr conversion.
+	 */
+	if (conn_state->hdr_output_metadata) {
+		if (conn_state->hdr_output_metadata->length != sizeof(*metadata))
+			return -EINVAL;
+		metadata = conn_state->hdr_output_metadata->data;
+		type1 = &metadata->hdmi_metadata_type1;
+		if (metadata->metadata_type || type1->metadata_type ||
+		    (type1->eotf != HDMI_EOTF_SMPTE_ST2084 &&
+		     type1->eotf != HDMI_EOTF_BT_2100_HLG) ||
+		    !(sink->eotf & BIT(type1->eotf)) ||
+		    !(sink->metadata_type & BIT(0)) ||
+		    !conn_state->connector->display_info.is_hdmi ||
+		    (conn_state->colorspace != DRM_MODE_COLORIMETRY_BT2020_RGB &&
+		     conn_state->colorspace != DRM_MODE_COLORIMETRY_BT2020_YCC))
+			return -EINVAL;
+		for (i = 0; i < ARRAY_SIZE(type1->display_primaries); i++)
+			if (type1->display_primaries[i].x > 50000 ||
+			    type1->display_primaries[i].y > 50000)
+				return -EINVAL;
+		if (type1->white_point.x > 50000 || type1->white_point.y > 50000 ||
+		    (type1->max_display_mastering_luminance &&
+		     type1->min_display_mastering_luminance >
+		     (u32)type1->max_display_mastering_luminance * 10000) ||
+		    (type1->max_cll && type1->max_fall > type1->max_cll))
+			return -EINVAL;
+	} else if (conn_state->colorspace != DRM_MODE_COLORIMETRY_DEFAULT) {
+		/* No wide-gamut SDR conversion exists in this VDP/TX route. */
+		return -EINVAL;
+	}
 
 	ret = drm_atomic_helper_connector_hdmi_check(conn_state->connector,
 						     bridge_state->base.state);
@@ -1901,6 +1994,21 @@ static int histb_hdmi_bridge_atomic_check(struct drm_bridge *bridge,
 	    (!conn_state->connector->display_info.hdmi.scdc.supported ||
 	     !conn_state->connector->display_info.hdmi.scdc.scrambling.supported))
 		return -EINVAL;
+	if (conn_state->hdr_output_metadata) {
+		bool rgb = conn_state->hdmi.output_format == HDMI_COLORSPACE_RGB;
+
+		if (conn_state->hdmi.output_bpc < 10 ||
+		    rgb != (conn_state->colorspace == DRM_MODE_COLORIMETRY_BT2020_RGB) ||
+		    !histb_hdmi_sink_bt2020(conn_state->connector, rgb))
+			return -EINVAL;
+	}
+	/* Bridge packets are programmed during enable. Metadata-only updates
+	 * must therefore traverse disable/enable too, including HDR -> SDR.
+	 */
+	if (old_state &&
+	    (!drm_connector_atomic_hdr_metadata_equal(old_state, conn_state) ||
+	     old_state->colorspace != conn_state->colorspace))
+		crtc_state->mode_changed = true;
 
 	avi = &conn_state->hdmi.infoframes.avi.data.avi;
 	if (conn_state->hdmi.output_format == HDMI_COLORSPACE_RGB) {
@@ -1912,7 +2020,11 @@ static int histb_hdmi_bridge_atomic_check(struct drm_bridge *bridge,
 		avi->quantization_range = HDMI_QUANTIZATION_RANGE_FULL;
 	} else {
 		conn_state->hdmi.is_limited_range = true;
-		avi->colorimetry = histb_hdmi_colorimetry(&crtc_state->adjusted_mode);
+		avi->colorimetry = conn_state->hdr_output_metadata ?
+			HDMI_COLORIMETRY_EXTENDED :
+			histb_hdmi_colorimetry(&crtc_state->adjusted_mode);
+		if (conn_state->hdr_output_metadata)
+			avi->extended_colorimetry = HDMI_EXTENDED_COLORIMETRY_BT2020;
 		avi->quantization_range = HDMI_QUANTIZATION_RANGE_DEFAULT;
 		avi->ycc_quantization_range =
 			HDMI_YCC_QUANTIZATION_RANGE_LIMITED;
@@ -2025,7 +2137,8 @@ histb_hdmi_bridge_atomic_pre_enable(struct drm_bridge *bridge,
 				  conn_state->hdmi.tmds_char_rate ?: pixel_rate,
 				  connector->display_info.is_hdmi,
 				  conn_state->hdmi.output_format,
-				  conn_state->hdmi.output_bpc);
+				  conn_state->hdmi.output_bpc,
+				  !!conn_state->hdr_output_metadata);
 	hdmi->mode_ready = true;
 	return;
 
