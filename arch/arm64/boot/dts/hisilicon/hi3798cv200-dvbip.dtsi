@@ -190,20 +190,38 @@
 	dvbip_sound: sound {
 		compatible = "simple-audio-card";
 		simple-audio-card,name = "DVBIP-CV200";
-		simple-audio-card,format = "i2s";
-		simple-audio-card,bitclock-master = <&sound_cpu>;
-		simple-audio-card,frame-master = <&sound_cpu>;
+		#address-cells = <1>;
+		#size-cells = <0>;
 		simple-audio-card,widgets = "Line", "Line Out";
 		simple-audio-card,routing =
 			"Line Out", "LOUT",
 			"Line Out", "ROUT";
 
-		sound_cpu: simple-audio-card,cpu {
-			sound-dai = <&aiao>;
+		/* Both links share one AIAO DMA engine and are mutually exclusive. */
+		simple-audio-card,dai-link@0 {
+			reg = <0>;
+			format = "i2s";
+			bitclock-master = <&sound_cpu>;
+			frame-master = <&sound_cpu>;
+			sound_cpu: cpu {
+				sound-dai = <&aiao 0>;
+			};
+			codec {
+				sound-dai = <&tianlai>;
+			};
 		};
 
-		simple-audio-card,codec {
-			sound-dai = <&tianlai>;
+		simple-audio-card,dai-link@1 {
+			reg = <1>;
+			format = "i2s";
+			bitclock-master = <&hdmi_sound_cpu>;
+			frame-master = <&hdmi_sound_cpu>;
+			hdmi_sound_cpu: cpu {
+				sound-dai = <&aiao 1>;
+			};
+			codec {
+				sound-dai = <&hdmi>;
+			};
 		};
 	};
 
