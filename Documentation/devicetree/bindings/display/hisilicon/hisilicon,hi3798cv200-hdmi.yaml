@@ -15,6 +15,12 @@ description:
   Stereo PCM audio uses the AIAO I2S output and the HDMI codec DAI. It
   supports 32/44.1/48/88.2/96/176.4/192 kHz, 16 or 24 significant bits.
   AIAO's 24-bit samples occupy the most significant bits of S32_LE words.
+  Optional HDCP resources reserve cipher channel-zero registers for loading
+  an authentic encrypted board key package and the native HDCP MCU code-check
+  register. The 0x20000-byte core aperture includes MCU PRAM at +0x10000;
+  PRAM must not be requested again as an overlapping resource. No raw key
+  provisioning or OTP writes are performed. The cipher engine has a reset
+  but no software-controlled clock gate in the CV200-specific BSP.
 
 properties:
   compatible:
@@ -24,7 +30,18 @@ properties:
     const: 0
 
   reg:
-    maxItems: 1
+    minItems: 1
+    items:
+      - description: HDMI core and HDCP MCU PRAM aperture
+      - description: Exclusively owned cipher engine register window
+      - description: PERI_HDMITX_AVCTTPT native MCU code-check register
+
+  reg-names:
+    minItems: 1
+    items:
+      - const: core
+      - const: cipher
+      - const: hdcp-ctrl
 
   interrupts:
     items:
@@ -61,16 +78,20 @@ properties:
       - const: pixel
 
   resets:
+    minItems: 3
     items:
       - description: HDMI bus reset
       - description: HDMI transmitter reset
       - description: HDMI PHY reset
+      - description: Optional cipher engine reset for HDCP key loading
 
   reset-names:
+    minItems: 3
     items:
       - const: bus
       - const: core
       - const: phy
+      - const: cipher
 
   hisilicon,perictrl:
     $ref: /schemas/types.yaml#/definitions/phandle-array
