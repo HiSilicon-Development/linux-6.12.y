@@ -16,6 +16,8 @@ description:
   RGB graphics plane up to 4096x2160 without scaling, with progressive
   display timings up to 594 MHz and 60 Hz. Its VOU reset is distinct from
   the pixel clock divider reset owned by the clock provider.
+  CV200 routes G0, G1 and physical G3 through GP0, and V0/V1 through VP0.
+  The final mixer orders these two groups; an independent VP1 is not used.
 
 properties:
   compatible:
@@ -39,6 +41,9 @@ properties:
       - description: Primary video plane clock
       - description: Primary graphics plane clock
       - description: Video output pixel bypass clock feeding the HDMI interface
+      - description: Second HD graphics fetch clock (physical G1)
+      - description: Third HD graphics fetch clock (physical G3)
+      - description: Secondary video fetch clock (V1)
   clock-names:
     minItems: 4
     items:
@@ -49,6 +54,9 @@ properties:
       - const: video
       - const: graphics
       - const: bp
+      - const: graphics1
+      - const: graphics3
+      - const: video1
   resets:
     maxItems: 1
 
@@ -99,9 +107,9 @@ allOf:
     else:
       properties:
         clocks:
-          minItems: 6
+          minItems: 10
         clock-names:
-          minItems: 6
+          minItems: 10
 
 additionalProperties: false
 
@@ -120,8 +128,12 @@ examples:
                  <&crg HISTB_VDP_HD_CLK>,
                  <&crg HISTB_VDP_V0_CLK>,
                  <&crg HISTB_VDP_G0_CLK>,
-                 <&crg HISTB_VO_BP_CLK>;
-        clock-names = "bus", "hd", "config", "core", "video", "graphics", "bp";
+                 <&crg HISTB_VO_BP_CLK>,
+                 <&crg HISTB_VDP_G1_CLK>,
+                 <&crg HISTB_VDP_G3_CLK>,
+                 <&crg HISTB_VDP_V1_CLK>;
+        clock-names = "bus", "hd", "config", "core", "video", "graphics", "bp",
+                      "graphics1", "graphics3", "video1";
         resets = <&crg 0xd8 30>;
         reset-names = "vdp";
 
