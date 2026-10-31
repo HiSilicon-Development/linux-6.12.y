@@ -476,9 +476,12 @@
 		 <&crg HISTB_VDP_HD_CLK>,
 		 <&crg HISTB_VDP_V0_CLK>,
 		 <&crg HISTB_VDP_G0_CLK>,
-		 <&crg HISTB_VO_BP_CLK>;
+		 <&crg HISTB_VO_BP_CLK>,
+		 <&crg HISTB_VDP_G1_CLK>,
+		 <&crg HISTB_VDP_G3_CLK>,
+		 <&crg HISTB_VDP_V1_CLK>;
 	clock-names = "bus", "hd", "config", "core", "video",
-		      "graphics", "bp";
+		      "graphics", "bp", "graphics1", "graphics3", "video1";
 	status = "okay";
 };
 
