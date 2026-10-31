@@ -6,7 +6,7 @@
  * and an external PHY. Register fields and sequences follow SPC060
  * hdmi_2_0/hal/ctrl/hisiv100, hal/phy/hisiv100 and product/hisiv100.
  * Progressive SDR RGB, 8 bpc, including HDMI 2.0 SCDC/scrambling.
- * Deep colour, HDCP, CEC and audio are not advertised.
+ * Deep colour, HDCP and CEC are not advertised. PCM uses the native AIP.
  */
 #include <linux/clk.h>
 #include <linux/delay.h>
@@ -24,6 +24,7 @@
 #include <linux/regmap.h>
 #include <linux/reset.h>
 #include <linux/workqueue.h>
+#include "histb-hdmi-audio.h"
 
 #include <drm/display/drm_hdmi_state_helper.h>
 #include <drm/display/drm_scdc.h>
@@ -54,6 +55,13 @@
 #define MV310_DATA_ALIGN		0x098c
 #define MV310_VIDEO_DMUX		0x09a8
 #define MV310_AUDIO_CTRL		0x1000
+#define MV310_AUDIO_I2S		0x1004
+#define MV310_AUDIO_CHST0	0x100c
+#define MV310_AUDIO_CHST1	0x1010
+#define MV310_AUDIO_FIFO		0x1018
+#define MV310_AUDIO_ACR		0x1040
+#define MV310_AUDIO_N		0x1048
+#define MV310_AUDIO_HEADER	0x183c
 #define MV310_PACK_FIFO		0x1800
 #define MV310_PACK_FIFO_ST	0x1804
 #define MV310_AVI_HEADER		0x1818
@@ -107,6 +115,8 @@
 #define MV310_SYS_GATES		(BIT(19) | BIT(21) | BIT(22))
 #define MV310_SYS_RESETS		(BIT(20) | BIT(23) | BIT(24))
 #define MV310_PIXEL		6
+#define MV310_PERI_AUDIO_MUX	0x8b0
+#define MV310_PERI_AUDIO_MASK	GENMASK(4, 0)
 
 static const char * const mv310_clock_names[] = {
 	"ssc", "ssc-bypass", "osc", "os", "as", "tmds", "pixel",
@@ -120,14 +130,17 @@ struct mv310_hdmi {
 	void __iomem *core;
 	void __iomem *phy;
 	struct regmap *sysctrl;
+	struct regmap *perictrl;
 	struct clk_bulk_data clocks[ARRAY_SIZE(mv310_clock_names)];
 	struct reset_control_bulk_data resets[ARRAY_SIZE(mv310_reset_names)];
 	struct drm_bridge bridge;
 	/* Serializes DDC with suspend/remove and transmitter reinitialization. */
 	struct mutex lock;
+	struct histb_hdmi_audio audio;
 	struct delayed_work hpd_work;
 	u32 saved_mux;
 	u32 saved_sysctrl;
+	u32 saved_audio_mux;
 	int irq;
 	int last_status;
 	bool powered;
@@ -151,11 +164,22 @@ static bool mv310_connected(struct mv310_hdmi *hdmi)
 	return readl(hdmi->core + MV310_AON_STATE) & MV310_HPD;
 }
 
+static void mv310_audio_stop(void *data)
+{
+	struct mv310_hdmi *hdmi = data;
+
+	if (!hdmi->powered)
+		return;
+	writel(BIT(1), hdmi->core + MV310_AUDIO_CTRL);
+	writel(0, hdmi->core + MV310_AUDIO_CFG);
+}
+
 static void mv310_phy_off(struct mv310_hdmi *hdmi)
 {
 	mv310_update(hdmi->phy, MV310_PHY_POWER,
 		     MV310_PHY_OUTPUT_PD | MV310_PHY_DE_PD | MV310_PHY_SUPPLY_PD,
 		     MV310_PHY_OUTPUT_PD | MV310_PHY_DE_PD | MV310_PHY_SUPPLY_PD);
+	histb_audio_disable(&hdmi->audio);
 	hdmi->mode_ready = false;
 }
 
@@ -191,11 +215,16 @@ static void mv310_hw_init(struct mv310_hdmi *hdmi)
 static int mv310_power_on(struct mv310_hdmi *hdmi)
 {
 	int ret, cleanup_ret;
+	/* hisiv100 hdmi_platform.h:55-60: I2S is bit1, not the CV200 AIP. */
+	ret = regmap_update_bits(hdmi->perictrl, MV310_PERI_AUDIO_MUX,
+				 MV310_PERI_AUDIO_MASK, BIT(1));
+	if (ret)
+		return ret;
 
 	ret = regmap_update_bits(hdmi->sysctrl, MV310_SYS_MUX,
 				 MV310_SYS_MUX_MASK, 0);
 	if (ret)
-		return ret;
+		goto restore_sysctrl;
 	ret = regmap_update_bits(hdmi->sysctrl, MV310_SYS_CTRL,
 				 MV310_SYS_GATES | MV310_SYS_RESETS,
 				 MV310_SYS_GATES | MV310_SYS_RESETS);
@@ -236,6 +265,10 @@ restore_sysctrl:
 					 MV310_SYS_MUX_MASK, hdmi->saved_mux);
 	if (cleanup_ret)
 		dev_warn(hdmi->dev, "HDMI pinmux unwind failed: %d\n", cleanup_ret);
+	cleanup_ret = regmap_update_bits(hdmi->perictrl, MV310_PERI_AUDIO_MUX,
+					 MV310_PERI_AUDIO_MASK, hdmi->saved_audio_mux);
+	if (cleanup_ret)
+		dev_warn(hdmi->dev, "HDMI audio mux unwind failed: %d\n", cleanup_ret);
 	return ret;
 }
 
@@ -288,6 +321,11 @@ static void mv310_hpd_work(struct work_struct *work)
 	if (!READ_ONCE(hdmi->hpd_enabled) || !READ_ONCE(hdmi->powered))
 		return;
 	status = mv310_detect(&hdmi->bridge);
+	if (status != connector_status_connected) {
+		mutex_lock(&hdmi->lock);
+		histb_audio_disable(&hdmi->audio);
+		mutex_unlock(&hdmi->lock);
+	}
 	if (status != hdmi->last_status) {
 		hdmi->last_status = status;
 		drm_bridge_hpd_notify(&hdmi->bridge, status);
@@ -549,6 +587,10 @@ static int mv310_packet_registers(enum hdmi_infoframe_type type,
 				  u32 *header, u32 *config)
 {
 	switch (type) {
+	case HDMI_INFOFRAME_TYPE_AUDIO:
+		*header = MV310_AUDIO_HEADER;
+		*config = MV310_AUDIO_CFG;
+		return 0;
 	case HDMI_INFOFRAME_TYPE_AVI:
 		*header = MV310_AVI_HEADER;
 		*config = MV310_AVI_CFG;
@@ -606,6 +648,37 @@ static int mv310_write_infoframe(struct drm_bridge *bridge,
 		writel(word, hdmi->core + header + 4 + sub * 4);
 	}
 	writel(3, hdmi->core + config);
+	return 0;
+}
+
+static int mv310_audio_program(void *data, const struct hdmi_codec_params *params)
+{
+	struct mv310_hdmi *hdmi = data;
+	const u8 *status = params->iec.status;
+	u8 buffer[HDMI_INFOFRAME_SIZE(AUDIO)];
+	int ret;
+
+	ret = hdmi_audio_infoframe_pack_only(&params->cea, buffer, sizeof(buffer));
+	if (ret < 0)
+		return ret;
+	ret = mv310_write_infoframe(&hdmi->bridge, HDMI_INFOFRAME_TYPE_AUDIO,
+				    buffer, ret);
+	if (ret)
+		return ret;
+	/* hisiv100 hdmi_hal_ctrl.c:2980-3031, hdmi_reg_audio_path.h.
+	 * I2S, stereo layout 0, SD0; automatic CTS follows the AIAO clock.
+	 */
+	writel((status[4] & 0xf) << 8, hdmi->core + MV310_AUDIO_I2S);
+	writel(status[0] | status[1] << 8 | status[2] << 16 | status[3] << 24,
+	       hdmi->core + MV310_AUDIO_CHST0);
+	writel(status[4], hdmi->core + MV310_AUDIO_CHST1);
+	writel(0xf00, hdmi->core + MV310_AUDIO_FIFO);
+	writel(histb_audio_n(params->sample_rate), hdmi->core + MV310_AUDIO_N);
+	writel(BIT(0) | BIT(2), hdmi->core + MV310_AUDIO_ACR);
+	mv310_update(hdmi->core, MV310_PWD_RESET, BIT(7) | BIT(8), BIT(7) | BIT(8));
+	udelay(5);
+	mv310_update(hdmi->core, MV310_PWD_RESET, BIT(7) | BIT(8), 0);
+	writel(0xe4000 | BIT(4) | BIT(0), hdmi->core + MV310_AUDIO_CTRL);
 	return 0;
 }
 
@@ -770,6 +843,9 @@ static void mv310_enable(struct drm_bridge *bridge,
 		     MV310_PHY_OUTPUT_PD | MV310_PHY_DE_PD,
 		     readl(hdmi->phy + MV310_PHY_PRE) & GENMASK(17, 0) ? BIT(5) :
 		     MV310_PHY_DE_PD);
+	ret = histb_audio_enable(&hdmi->audio, connector);
+	if (ret)
+		dev_err(hdmi->dev, "HDMI PCM restore failed: %d\n", ret);
 out:
 	mutex_unlock(&hdmi->lock);
 }
@@ -837,6 +913,10 @@ static void mv310_release(void *data)
 				 MV310_SYS_MUX_MASK, hdmi->saved_mux);
 	if (ret)
 		dev_warn(hdmi->dev, "HDMI pinmux restore failed: %d\n", ret);
+	ret = regmap_update_bits(hdmi->perictrl, MV310_PERI_AUDIO_MUX,
+				 MV310_PERI_AUDIO_MASK, hdmi->saved_audio_mux);
+	if (ret)
+		dev_warn(hdmi->dev, "HDMI audio mux restore failed: %d\n", ret);
 	mutex_unlock(&hdmi->lock);
 }
 
@@ -882,6 +962,10 @@ static int mv310_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	hdmi->dev = dev;
 	mutex_init(&hdmi->lock);
+	hdmi->audio.lock = &hdmi->lock;
+	hdmi->audio.data = hdmi;
+	hdmi->audio.program = mv310_audio_program;
+	hdmi->audio.stop = mv310_audio_stop;
 	INIT_DELAYED_WORK(&hdmi->hpd_work, mv310_hpd_work);
 	hdmi->last_status = -1;
 	hdmi->irq = platform_get_irq_byname_optional(pdev, "aon");
@@ -908,6 +992,13 @@ static int mv310_probe(struct platform_device *pdev)
 						       "hisilicon,sysctrl");
 	if (IS_ERR(hdmi->sysctrl))
 		return dev_err_probe(dev, PTR_ERR(hdmi->sysctrl), "missing HDMI sysctrl\n");
+	hdmi->perictrl = syscon_regmap_lookup_by_phandle(dev->of_node,
+						       "hisilicon,perictrl");
+	if (IS_ERR(hdmi->perictrl))
+		return dev_err_probe(dev, PTR_ERR(hdmi->perictrl), "missing peripheral syscon\n");
+	ret = regmap_read(hdmi->perictrl, MV310_PERI_AUDIO_MUX, &hdmi->saved_audio_mux);
+	if (ret)
+		return ret;
 	ret = regmap_read(hdmi->sysctrl, MV310_SYS_MUX, &hdmi->saved_mux);
 	if (ret)
 		return ret;
@@ -939,6 +1030,9 @@ static int mv310_probe(struct platform_device *pdev)
 	ret = devm_drm_bridge_add(dev, &hdmi->bridge);
 	if (ret)
 		return ret;
+	ret = histb_audio_register(dev, &hdmi->audio);
+	if (ret)
+		return dev_err_probe(dev, ret, "failed to register HDMI codec\n");
 	dev_info(dev, "registered hisiv100 HDMI RGB8 bridge (%s HPD), sink %s\n",
 		 hdmi->irq >= 0 ? "AON IRQ" : "polled",
 		 mv310_connected(hdmi) ? "connected" : "disconnected");
@@ -949,6 +1043,7 @@ static void mv310_remove(struct platform_device *pdev)
 {
 	struct mv310_hdmi *hdmi = platform_get_drvdata(pdev);
 
+	histb_audio_unregister(&hdmi->audio);
 	mv310_hpd_disable(&hdmi->bridge);
 	cancel_delayed_work_sync(&hdmi->hpd_work);
 }

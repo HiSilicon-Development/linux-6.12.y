@@ -12,10 +12,16 @@ maintainers:
 description:
   The Hi3798CV200 integrates an HDMI 2.0 transmitter with an internal DDC
   controller, hot-plug detection, CEC controller and TMDS PHY.
+  Stereo PCM audio uses the AIAO I2S output and the HDMI codec DAI. It
+  supports 32/44.1/48/88.2/96/176.4/192 kHz, 16 or 24 significant bits.
+  AIAO's 24-bit samples occupy the most significant bits of S32_LE words.
 
 properties:
   compatible:
     const: hisilicon,hi3798cv200-hdmi
+
+  '#sound-dai-cells':
+    const: 0
 
   reg:
     maxItems: 1

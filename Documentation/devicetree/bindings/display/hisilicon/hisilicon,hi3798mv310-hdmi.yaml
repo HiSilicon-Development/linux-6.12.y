@@ -15,7 +15,9 @@ description: |
   The driver supports progressive SDR RGB video at 8 bits per component,
   with a 25 to 594 MHz TMDS character clock. Rates above 340 MHz require
   HDMI 2.0 SCDC scrambling and the 1:40 clock ratio on a capable sink.
-  Audio, HDCP and CEC are not implemented.
+  Stereo I2S PCM audio supports 32/44.1/48/88.2/96/176.4/192 kHz and
+  16 or 24 significant bits, constrained by the HDMI sink's ELD. AIAO's
+  24-bit DMA samples use S32_LE containers. HDCP and CEC are not implemented.
   HPD is always read from the physical AON status bit; when
   the optional AON interrupt is absent it is polled at 100 ms intervals.
   No connected display or EDID is required for bridge registration.
@@ -23,6 +25,9 @@ description: |
 properties:
   compatible:
     const: hisilicon,hi3798mv310-hdmi
+
+  '#sound-dai-cells':
+    const: 0
 
   reg:
     items:
@@ -85,6 +90,10 @@ properties:
       (bits 24 to 21) and AON APB/oscillator/CEC gates and resets at
       offset 0x48 (bits 19 to 24). These fields are managed by the bridge.
 
+  hisilicon,perictrl:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: Peripheral controller containing the HDMI audio source mux at 0x8b0.
+
   ports:
     $ref: /schemas/graph.yaml#/properties/ports
     properties:
@@ -112,6 +121,7 @@ required:
   - resets
   - reset-names
   - hisilicon,sysctrl
+  - hisilicon,perictrl
   - ports
 
 additionalProperties: false

@@ -28,6 +28,7 @@
 #include <linux/regmap.h>
 #include <linux/reset.h>
 #include <linux/workqueue.h>
+#include "histb-hdmi-audio.h"
 #if IS_ENABLED(CONFIG_CEC_CORE)
 #include <media/cec.h>
 #endif
@@ -114,6 +115,7 @@
 #define  HISTB_HDMI_AIP_RST_AUDIO		BIT(0)
 #define  HISTB_HDMI_AIP_RST_FIFO		BIT(1)
 #define HISTB_HDMI_ACR_CTRL		HISTB_HDMI_REG(0xa, 0x01)
+#define HISTB_HDMI_N_SVAL		HISTB_HDMI_REG(0xa, 0x03)
 #define HISTB_HDMI_AUD_MODE		HISTB_HDMI_REG(0xa, 0x14)
 #define HISTB_HDMI_I2S_IN_CTRL		HISTB_HDMI_REG(0xa, 0x1d)
 #define HISTB_HDMI_I2S_CHST3		HISTB_HDMI_REG(0xa, 0x21)
@@ -328,6 +330,8 @@ struct histb_hdmi {
 	struct regmap *perictrl;
 	u32 perictrl_offset;
 	struct mutex ddc_lock; /* Serializes access to the internal DDC master. */
+	struct mutex audio_lock; /* Serializes ACR/I2S updates with bridge state. */
+	struct histb_hdmi_audio audio;
 	struct i2c_adapter ddc;
 	struct drm_bridge bridge;
 	struct drm_connector *active_connector;
@@ -350,6 +354,7 @@ struct histb_hdmi {
 	bool cec_tx_pending;
 #endif
 };
+
 
 static inline struct histb_hdmi *bridge_to_histb_hdmi(struct drm_bridge *bridge)
 {
@@ -697,7 +702,7 @@ static void histb_hdmi_infoframe_enable(struct histb_hdmi *hdmi,
 			   HISTB_HDMI_INFOFRAME_REPEAT : 0);
 }
 
-static void histb_hdmi_infoframe_wait(struct histb_hdmi *hdmi, bool active)
+static int histb_hdmi_infoframe_wait(struct histb_hdmi *hdmi, bool active)
 {
 	u8 ctrl;
 	int ret;
@@ -710,6 +715,7 @@ static void histb_hdmi_infoframe_wait(struct histb_hdmi *hdmi, bool active)
 		dev_warn(hdmi->dev,
 			 "infoframe failed to become %s (ctrl=0x%02x)\n",
 			 active ? "active" : "inactive", ctrl);
+	return ret;
 }
 
 static int histb_hdmi_infoframe_select(struct histb_hdmi *hdmi,
@@ -834,6 +840,20 @@ static void histb_hdmi_phy_configure(struct histb_hdmi *hdmi, u64 tmds_rate)
 	histb_hdmi_writeb(hdmi, HISTB_HDMI_PHY_FALL_TIME, config->fall_time);
 }
 
+static void histb_hdmi_audio_stop(void *data)
+{
+	struct histb_hdmi *hdmi = data;
+
+	if (!hdmi->aux_enabled)
+		return;
+	histb_hdmi_updateb(hdmi, HISTB_HDMI_AUDP_TXCTRL, BIT(7), BIT(7));
+	histb_hdmi_updateb(hdmi, HISTB_HDMI_AUD_EN, HISTB_HDMI_AUD_IN_EN, 0);
+	histb_hdmi_updateb(hdmi, HISTB_HDMI_PKT_FILTER1,
+			   HISTB_HDMI_AUDIO_PKT_ENABLE, 0);
+	histb_hdmi_infoframe_select(hdmi, HDMI_INFOFRAME_TYPE_AUDIO);
+	histb_hdmi_infoframe_enable(hdmi, false);
+}
+
 /* Values from the CV200 vendor sHardwareInit() sequence. */
 static void histb_hdmi_tx_hw_init(struct histb_hdmi *hdmi)
 {
@@ -850,32 +870,7 @@ static void histb_hdmi_tx_hw_init(struct histb_hdmi *hdmi)
 	histb_hdmi_writeb(hdmi, HISTB_HDMI_DDC_FIFO_COUNT, ddc_count);
 	histb_hdmi_writeb(hdmi, HISTB_HDMI_DDC_DELAY_CNT, 0x15);
 
-	/* CV200 I2S input: 48 kHz, 24-bit slots, SD0 enabled. */
-	histb_hdmi_writeb(hdmi, HISTB_HDMI_I2S_CHST3, 0x02);
-	histb_hdmi_writeb(hdmi, HISTB_HDMI_I2S_CHST4, 0x0b);
-	histb_hdmi_writeb(hdmi, HISTB_HDMI_ACR_CTRL, 0x0e);
-	histb_hdmi_writeb(hdmi, HISTB_HDMI_I2S_IN_SIZE, 0x0b);
-	histb_hdmi_writeb(hdmi, HISTB_HDMI_I2S_IN_CTRL, 0x60);
-	histb_hdmi_updateb(hdmi, HISTB_HDMI_AUD_MODE, BIT(4), BIT(4));
-	histb_hdmi_updateb(hdmi, HISTB_HDMI_AUDP_TXCTRL, BIT(1), 0x00);
-	/* AUD_EN is separate from AUD_MODE: without it the I2S pins are
-	 * configured but the audio input FIFO remains disabled. */
-	histb_hdmi_updateb(hdmi, HISTB_HDMI_AUD_EN, HISTB_HDMI_AUD_IN_EN,
-			   HISTB_HDMI_AUD_IN_EN);
-	histb_hdmi_writeb(hdmi, HISTB_HDMI_AIP_HDMI2MHL, 0x00);
-	histb_hdmi_updateb(hdmi, HISTB_HDMI_TPI_DOWN_SMPL_CTRL,
-			   BIT(2), 0x00);
-	histb_hdmi_writeb(hdmi, HISTB_HDMI_TPI_AUD_CONFIG, 0x00);
-	histb_hdmi_writeb(hdmi, HISTB_HDMI_TPI_AUD_FS, 0x82);
-	/* AUDP_TXCTRL[7] is AUD_MUTE_EN; clear it for normal playback. */
-	histb_hdmi_updateb(hdmi, HISTB_HDMI_AUDP_TXCTRL, BIT(7), 0x00);
-	/* Clear stale AIP/FIFO state after programming the input format. */
-	histb_hdmi_writeb(hdmi, HISTB_HDMI_AIP_RST,
-			   HISTB_HDMI_AIP_RST_AUDIO | HISTB_HDMI_AIP_RST_FIFO);
-	histb_hdmi_writeb(hdmi, HISTB_HDMI_AIP_RST, 0x00);
-	/* Audio has a separate pass-through gate from the input FIFO and ACR. */
-	histb_hdmi_updateb(hdmi, HISTB_HDMI_PKT_FILTER1,
-			   HISTB_HDMI_AUDIO_PKT_ENABLE, HISTB_HDMI_AUDIO_PKT_ENABLE);
+	histb_hdmi_audio_stop(hdmi);
 
 	/* Normal scanout must come from VDP, never the internal test generator. */
 	histb_hdmi_updateb(hdmi, HISTB_HDMI_PATTERN_GEN_CTRL0,
@@ -1313,6 +1308,11 @@ static void histb_hdmi_hpd_work(struct work_struct *work)
 	}
 
 	status = histb_hdmi_bridge_detect(&hdmi->bridge);
+	if (status != connector_status_connected) {
+		mutex_lock(&hdmi->audio_lock);
+		histb_audio_disable(&hdmi->audio);
+		mutex_unlock(&hdmi->audio_lock);
+	}
 	if (READ_ONCE(hdmi->last_reported_status) != status) {
 		WRITE_ONCE(hdmi->last_reported_status, status);
 		drm_bridge_hpd_notify(&hdmi->bridge, status);
@@ -1458,9 +1458,7 @@ static int histb_hdmi_clear_infoframe(struct drm_bridge *bridge,
 		return ret;
 
 	histb_hdmi_infoframe_enable(hdmi, false);
-	histb_hdmi_infoframe_wait(hdmi, false);
-
-	return 0;
+	return histb_hdmi_infoframe_wait(hdmi, false);
 }
 
 static int histb_hdmi_write_infoframe(struct drm_bridge *bridge,
@@ -1479,34 +1477,62 @@ static int histb_hdmi_write_infoframe(struct drm_bridge *bridge,
 		return ret;
 
 	histb_hdmi_infoframe_enable(hdmi, false);
-	histb_hdmi_infoframe_wait(hdmi, false);
+	ret = histb_hdmi_infoframe_wait(hdmi, false);
+	if (ret)
+		return ret;
 	for (i = 0; i < HISTB_HDMI_INFOFRAME_BYTES; i++)
 		histb_hdmi_writeb(hdmi, HISTB_HDMI_INFOFRAME_DATA +
 				  i * sizeof(u32), i < len ? buffer[i] : 0);
 	histb_hdmi_infoframe_enable(hdmi, true);
-	histb_hdmi_infoframe_wait(hdmi, true);
-
-	return 0;
+	ret = histb_hdmi_infoframe_wait(hdmi, true);
+	if (ret)
+		histb_hdmi_infoframe_enable(hdmi, false);
+	return ret;
 }
-static int histb_hdmi_write_pcm_audio_infoframe(struct histb_hdmi *hdmi)
+static int histb_hdmi_audio_program(void *data,
+				    const struct hdmi_codec_params *params)
 {
-	struct hdmi_audio_infoframe frame;
+	struct histb_hdmi *hdmi = data;
 	u8 buffer[HDMI_INFOFRAME_SIZE(AUDIO)];
-	ssize_t len;
-	int ret;
+	u32 n = histb_audio_n(params->sample_rate);
+	u8 len = params->iec.status[4] & 0x0f;
+	int i, ret;
 
-	ret = hdmi_audio_infoframe_init(&frame);
+	ret = hdmi_audio_infoframe_pack_only(&params->cea, buffer, sizeof(buffer));
+	if (ret < 0)
+		return ret;
+	ret = histb_hdmi_write_infoframe(&hdmi->bridge, HDMI_INFOFRAME_TYPE_AUDIO,
+					 buffer, ret);
 	if (ret)
 		return ret;
-	frame.channels = 2;
-	frame.coding_type = HDMI_AUDIO_CODING_TYPE_PCM;
-	frame.sample_size = HDMI_AUDIO_SAMPLE_SIZE_24;
-	frame.sample_frequency = HDMI_AUDIO_SAMPLE_FREQUENCY_48000;
-	len = hdmi_audio_infoframe_pack(&frame, buffer, sizeof(buffer));
-	if (len < 0)
-		return len;
-	return histb_hdmi_write_infoframe(&hdmi->bridge, HDMI_INFOFRAME_TYPE_AUDIO,
-					 buffer, len);
+	/* imagev200 si_mod_tx_hdmi.c:324-340, 1890-2002. CTS is generated
+	 * from the actual I2S clock; N is the HDMI-recommended integer value.
+	 */
+	histb_hdmi_writeb(hdmi, HISTB_HDMI_AUD_MODE, 0);
+	histb_hdmi_writeb(hdmi, HISTB_HDMI_ACR_CTRL, 0x0e);
+	for (i = 0; i < 5; i++)
+		histb_hdmi_writeb(hdmi, HISTB_HDMI_REG(0xa, 0x1e + i),
+				   params->iec.status[i]);
+	histb_hdmi_writeb(hdmi, HISTB_HDMI_I2S_IN_SIZE, len);
+	histb_hdmi_writeb(hdmi, HISTB_HDMI_I2S_IN_CTRL, 0x60);
+	for (i = 0; i < 3; i++)
+		histb_hdmi_writeb(hdmi, HISTB_HDMI_N_SVAL + i * 4, n >> (i * 8));
+	histb_hdmi_writeb(hdmi, HISTB_HDMI_AUD_MODE, BIT(4));
+	histb_hdmi_updateb(hdmi, HISTB_HDMI_AUDP_TXCTRL, BIT(1), 0);
+	histb_hdmi_writeb(hdmi, HISTB_HDMI_AIP_HDMI2MHL, 0);
+	histb_hdmi_updateb(hdmi, HISTB_HDMI_TPI_DOWN_SMPL_CTRL, BIT(2), 0);
+	histb_hdmi_writeb(hdmi, HISTB_HDMI_TPI_AUD_CONFIG, 0);
+	histb_hdmi_writeb(hdmi, HISTB_HDMI_TPI_AUD_FS,
+			   0x80 | (params->iec.status[3] & 0x0f));
+	histb_hdmi_writeb(hdmi, HISTB_HDMI_AIP_RST,
+			   HISTB_HDMI_AIP_RST_AUDIO | HISTB_HDMI_AIP_RST_FIFO);
+	histb_hdmi_writeb(hdmi, HISTB_HDMI_AIP_RST, 0);
+	histb_hdmi_updateb(hdmi, HISTB_HDMI_AUD_EN,
+			   HISTB_HDMI_AUD_IN_EN, HISTB_HDMI_AUD_IN_EN);
+	histb_hdmi_updateb(hdmi, HISTB_HDMI_PKT_FILTER1,
+			   HISTB_HDMI_AUDIO_PKT_ENABLE, HISTB_HDMI_AUDIO_PKT_ENABLE);
+	histb_hdmi_updateb(hdmi, HISTB_HDMI_AUDP_TXCTRL, BIT(7), 0);
+	return 0;
 }
 
 static void histb_hdmi_source_scrambling_set(struct histb_hdmi *hdmi,
@@ -1641,6 +1667,7 @@ histb_hdmi_bridge_atomic_pre_enable(struct drm_bridge *bridge,
 	long rounded_rate;
 	int ret;
 
+	guard(mutex)(&hdmi->audio_lock);
 	connector = drm_atomic_get_new_connector_for_encoder(state,
 							     bridge->encoder);
 	if (!connector) {
@@ -1750,6 +1777,7 @@ histb_hdmi_bridge_atomic_enable(struct drm_bridge *bridge,
 	struct drm_atomic_state *state = old_bridge_state->base.state;
 	struct drm_connector *connector;
 	int ret;
+	guard(mutex)(&hdmi->audio_lock);
 
 	if (!hdmi->mode_ready)
 		return;
@@ -1778,11 +1806,9 @@ histb_hdmi_bridge_atomic_enable(struct drm_bridge *bridge,
 				"failed to program HDMI infoframes: %pe\n",
 				ERR_PTR(ret));
 		}
-		ret = histb_hdmi_write_pcm_audio_infoframe(hdmi);
+		ret = histb_audio_enable(&hdmi->audio, connector);
 		if (ret)
-			drm_err(bridge->dev,
-				"failed to program HDMI audio infoframe: %pe\n",
-				ERR_PTR(ret));
+			dev_err(hdmi->dev, "HDMI PCM restore failed: %d\n", ret);
 	}
 }
 
@@ -1792,6 +1818,8 @@ histb_hdmi_bridge_atomic_disable(struct drm_bridge *bridge,
 {
 	struct histb_hdmi *hdmi = bridge_to_histb_hdmi(bridge);
 
+	guard(mutex)(&hdmi->audio_lock);
+	histb_audio_disable(&hdmi->audio);
 	histb_hdmi_tmds_enable(hdmi, false);
 	histb_hdmi_scdc_disable(hdmi);
 	histb_hdmi_disable_infoframes(hdmi);
@@ -1805,6 +1833,7 @@ histb_hdmi_bridge_atomic_post_disable(struct drm_bridge *bridge,
 	struct histb_hdmi *hdmi = bridge_to_histb_hdmi(bridge);
 	struct clk *pixel_clk = hdmi->clks[HISTB_HDMI_PIXEL_CLK_INDEX].clk;
 
+	guard(mutex)(&hdmi->audio_lock);
 	if (hdmi->pixel_enabled) {
 		clk_disable_unprepare(pixel_clk);
 		hdmi->pixel_enabled = false;
@@ -1834,6 +1863,8 @@ static const struct drm_bridge_funcs histb_hdmi_bridge_funcs = {
 
 static void histb_hdmi_disable_resources(struct histb_hdmi *hdmi)
 {
+	guard(mutex)(&hdmi->audio_lock);
+	histb_audio_disable(&hdmi->audio);
 	if (hdmi->aux_enabled) {
 		histb_hdmi_tmds_enable(hdmi, false);
 		histb_hdmi_scdc_disable(hdmi);
@@ -1869,6 +1900,8 @@ static int __maybe_unused histb_hdmi_suspend(struct device *dev)
 		synchronize_irq(hdmi->tx_irq);
 	cancel_delayed_work_sync(&hdmi->hpd_work);
 
+	guard(mutex)(&hdmi->audio_lock);
+	histb_audio_disable(&hdmi->audio);
 	if (!hdmi->aux_enabled)
 		return 0;
 
@@ -1900,6 +1933,7 @@ static int __maybe_unused histb_hdmi_resume(struct device *dev)
 	struct histb_hdmi *hdmi = dev_get_drvdata(dev);
 	int ret;
 
+	guard(mutex)(&hdmi->audio_lock);
 	if (hdmi->aux_enabled)
 		return 0;
 
@@ -1946,6 +1980,11 @@ static int histb_hdmi_probe(struct platform_device *pdev)
 	if (!hdmi)
 		return -ENOMEM;
 	hdmi->dev = dev;
+	mutex_init(&hdmi->audio_lock);
+	hdmi->audio.lock = &hdmi->audio_lock;
+	hdmi->audio.data = hdmi;
+	hdmi->audio.program = histb_hdmi_audio_program;
+	hdmi->audio.stop = histb_hdmi_audio_stop;
 	INIT_DELAYED_WORK(&hdmi->hpd_work, histb_hdmi_hpd_work);
 	hdmi->last_reported_status = -1;
 	hdmi->hpd_polling = device_property_read_bool(dev, "hisilicon,hpd-poll");
@@ -2069,6 +2108,11 @@ static int histb_hdmi_probe(struct platform_device *pdev)
 		return ret;
 	}
 
+	ret = histb_audio_register(dev, &hdmi->audio);
+	if (ret) {
+		histb_hdmi_disable_resources(hdmi);
+		return dev_err_probe(dev, ret, "failed to register HDMI codec\n");
+	}
 #if IS_ENABLED(CONFIG_CEC_CORE)
 	hdmi->cec_adap = cec_allocate_adapter(&histb_hdmi_cec_ops, hdmi,
 					      dev_name(dev),
@@ -2090,6 +2134,7 @@ static void histb_hdmi_remove(struct platform_device *pdev)
 {
 	struct histb_hdmi *hdmi = platform_get_drvdata(pdev);
 
+	histb_audio_unregister(&hdmi->audio);
 	WRITE_ONCE(hdmi->hpd_enabled, false);
 	if (hdmi->aux_enabled)
 		histb_hdmi_writeb(hdmi, HISTB_HDMI_INTR1_MASK, 0);
