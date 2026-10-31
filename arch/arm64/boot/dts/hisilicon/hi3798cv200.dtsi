@@ -826,9 +826,13 @@ gpu: gpu@f9200000 {
 				 <&crg HISTB_VDP_CFG_CLK>,
 				 <&crg HISTB_VDP_HD_CLK>,
 				 <&crg HISTB_VDP_V0_CLK>,
-				 <&crg HISTB_VDP_G0_CLK>;
+				 <&crg HISTB_VDP_G0_CLK>,
+				 <&crg HISTB_VO_BP_CLK>,
+				 <&crg HISTB_VDP_G1_CLK>,
+				 <&crg HISTB_VDP_G3_CLK>,
+				 <&crg HISTB_VDP_V1_CLK>;
 			clock-names = "bus", "hd", "config", "core", "video",
-				      "graphics";
+				      "graphics", "bp", "graphics1", "graphics3", "video1";
 			resets = <&crg 0xd8 30>;
 			reset-names = "vdp";
 			status = "disabled";
@@ -868,7 +872,8 @@ gpu: gpu@f9200000 {
 		hdmi: hdmi@8ce0000 {
 			compatible = "hisilicon,hi3798cv200-hdmi";
 			#sound-dai-cells = <0>;
-			reg = <0x8ce0000 0x20000>;
+			reg = <0x8ce0000 0x20000>, <0x9a00000 0x4000>, <0x8a80038 0x4>;
+			reg-names = "core", "cipher", "hdcp-ctrl";
 			interrupts = <GIC_SPI 88 IRQ_TYPE_LEVEL_HIGH>,
 				     <GIC_SPI 147 IRQ_TYPE_LEVEL_HIGH>;
 			interrupt-names = "tx", "cec";
@@ -883,8 +888,9 @@ gpu: gpu@f9200000 {
 				 <&crg HISTB_HDMI_PIXEL_CLK>;
 			clock-names = "bus", "cec", "id", "mhl", "os", "as", "x",
 				      "pixel-nx", "pixel";
-			resets = <&crg 0x10c 8>, <&crg 0x10c 9>, <&crg 0x110 4>;
-			reset-names = "bus", "core", "phy";
+			resets = <&crg 0x10c 8>, <&crg 0x10c 9>, <&crg 0x110 4>,
+				 <&crg 0xc0 9>;
+			reset-names = "bus", "core", "phy", "cipher";
 			hisilicon,perictrl = <&perictrl 0x8b0>;
 			status = "disabled";
 
