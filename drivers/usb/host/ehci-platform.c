@@ -39,7 +39,7 @@
 #include "ehci.h"
 
 #define DRIVER_DESC "EHCI generic platform driver"
-#define EHCI_MAX_CLKS 4
+#define EHCI_MAX_CLKS 6
 #define hcd_to_ehci_priv(h) ((struct ehci_platform_priv *)hcd_to_ehci(h)->priv)
 
 #define BCM_USB_FIFO_THRESHOLD	0x00800040
@@ -303,7 +303,8 @@ static int ehci_platform_probe(struct platform_device *dev)
 		if (soc_device_match(quirk_poll_match))
 			priv->quirk_poll = true;
 
-		for (clk = 0; clk < EHCI_MAX_CLKS; clk++) {
+		for (clk = 0; clk < (of_device_is_compatible(dev->dev.of_node,
+				    "hisilicon,hi3798cv200-ehci") ? EHCI_MAX_CLKS : 4); clk++) {
 			priv->clks[clk] = of_clk_get(dev->dev.of_node, clk);
 			if (IS_ERR(priv->clks[clk])) {
 				err = PTR_ERR(priv->clks[clk]);
@@ -454,6 +455,13 @@ static int __maybe_unused ehci_platform_resume(struct device *dev)
 	struct platform_device *pdev = to_platform_device(dev);
 	struct ehci_platform_priv *priv = hcd_to_ehci_priv(hcd);
 	struct device *companion_dev;
+
+	if (of_device_is_compatible(dev->of_node, "hisilicon,hi3798cv200-ehci")) {
+		int err = usb_hcd_check_phy_ready(hcd);
+
+		if (err)
+			return err;
+	}
 
 	if (pdata->power_on) {
 		int err = pdata->power_on(pdev);

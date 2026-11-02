@@ -462,6 +462,7 @@ extern int usb_hcd_is_primary_hcd(struct usb_hcd *hcd);
 extern int usb_add_hcd(struct usb_hcd *hcd,
 		unsigned int irqnum, unsigned long irqflags);
 extern void usb_remove_hcd(struct usb_hcd *hcd);
+extern int usb_hcd_check_phy_ready(struct usb_hcd *hcd);
 extern int usb_hcd_find_raw_port_number(struct usb_hcd *hcd, int port1);
 int usb_hcd_setup_local_mem(struct usb_hcd *hcd, phys_addr_t phys_addr,
 			    dma_addr_t dma, size_t size);

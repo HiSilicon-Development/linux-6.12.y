@@ -147,7 +147,15 @@ struct usb_phy_roothub *usb_phy_roothub_alloc_usb3_phy(struct device *dev)
 }
 EXPORT_SYMBOL_GPL(usb_phy_roothub_alloc_usb3_phy);
 
-int usb_phy_roothub_init(struct usb_phy_roothub *phy_roothub)
+/* CV200 restores analog state before host MMIO in provider resume_early. */
+static bool usb_phy_roothub_keep_init(struct usb_phy_roothub *entry)
+{
+	return of_device_is_compatible(entry->phy->dev.parent->of_node,
+				      "hisilicon,hi3798cv200-usb2-phy");
+}
+
+static int usb_phy_roothub_init_state(struct usb_phy_roothub *phy_roothub,
+				      bool resume)
 {
 	struct usb_phy_roothub *roothub_entry;
 	struct list_head *head;
@@ -159,6 +167,8 @@ int usb_phy_roothub_init(struct usb_phy_roothub *phy_roothub)
 	head = &phy_roothub->list;
 
 	list_for_each_entry(roothub_entry, head, list) {
+		if (resume && usb_phy_roothub_keep_init(roothub_entry))
+			continue;
 		err = phy_init(roothub_entry->phy);
 		if (err)
 			goto err_exit_phys;
@@ -167,14 +177,22 @@ int usb_phy_roothub_init(struct usb_phy_roothub *phy_roothub)
 	return 0;
 
 err_exit_phys:
-	list_for_each_entry_continue_reverse(roothub_entry, head, list)
-		phy_exit(roothub_entry->phy);
+	list_for_each_entry_continue_reverse(roothub_entry, head, list) {
+		if (!resume || !usb_phy_roothub_keep_init(roothub_entry))
+			phy_exit(roothub_entry->phy);
+	}
 
 	return err;
 }
+
+int usb_phy_roothub_init(struct usb_phy_roothub *phy_roothub)
+{
+	return usb_phy_roothub_init_state(phy_roothub, false);
+}
 EXPORT_SYMBOL_GPL(usb_phy_roothub_init);
 
-int usb_phy_roothub_exit(struct usb_phy_roothub *phy_roothub)
+static int usb_phy_roothub_exit_state(struct usb_phy_roothub *phy_roothub,
+				      bool suspend)
 {
 	struct usb_phy_roothub *roothub_entry;
 	struct list_head *head;
@@ -186,12 +204,19 @@ int usb_phy_roothub_exit(struct usb_phy_roothub *phy_roothub)
 	head = &phy_roothub->list;
 
 	list_for_each_entry(roothub_entry, head, list) {
+		if (suspend && usb_phy_roothub_keep_init(roothub_entry))
+			continue;
 		err = phy_exit(roothub_entry->phy);
 		if (err)
 			ret = err;
 	}
 
 	return ret;
+}
+
+int usb_phy_roothub_exit(struct usb_phy_roothub *phy_roothub)
+{
+	return usb_phy_roothub_exit_state(phy_roothub, false);
 }
 EXPORT_SYMBOL_GPL(usb_phy_roothub_exit);
 
@@ -344,7 +369,7 @@ int usb_phy_roothub_suspend(struct device *controller_dev,
 	if (device_may_wakeup(controller_dev))
 		return 0;
 
-	return usb_phy_roothub_exit(phy_roothub);
+	return usb_phy_roothub_exit_state(phy_roothub, true);
 }
 EXPORT_SYMBOL_GPL(usb_phy_roothub_suspend);
 
@@ -353,18 +378,18 @@ int usb_phy_roothub_resume(struct device *controller_dev,
 {
 	int err;
 
-	/* if the device can't wake up the system _exit was called */
+	/* Reacquire only the init references actually dropped during suspend. */
 	if (!device_may_wakeup(controller_dev)) {
-		err = usb_phy_roothub_init(phy_roothub);
+		err = usb_phy_roothub_init_state(phy_roothub, true);
 		if (err)
 			return err;
 	}
 
 	err = usb_phy_roothub_power_on(phy_roothub);
 
-	/* undo _init if _power_on failed */
+	/* Undo only newly acquired references; retained CV200 refs stay owned. */
 	if (err && !device_may_wakeup(controller_dev))
-		usb_phy_roothub_exit(phy_roothub);
+		usb_phy_roothub_exit_state(phy_roothub, true);
 
 	return err;
 }

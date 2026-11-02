@@ -14,10 +14,13 @@
 #include <linux/delay.h>
 #include <linux/io.h>
 #include <linux/module.h>
+#include <linux/mfd/syscon.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
+#include <linux/pm.h>
+#include <linux/regmap.h>
 #include <linux/reset.h>
 
 #define INNO_PHY_PORT_NUM	2
@@ -48,20 +51,28 @@
 
 #define PHY_CLK_ENABLE		BIT(2)
 
+#define CV200_USB2_MODE		0x12c
+#define CV200_USB2_WORDINTERFACE	BIT(0)
+#define CV200_USB2_ULPI_BYPASS	BIT(3)
+#define CV200_USB2_BURST16		BIT(9)
+
 struct hisi_inno_phy_port {
 	struct reset_control *utmi_rst;
 	struct hisi_inno_phy_priv *priv;
 	u8 index;
+	bool initialized;
 };
 
 struct hisi_inno_phy_priv {
 	void __iomem *mmio;
+	struct regmap *perictrl;
 	struct clk *ref_clk;
 	struct reset_control *por_rst;
 	unsigned int type;
 	unsigned int port_count;
 	unsigned int active_ports;
 	bool is_hi3798cv200;
+	bool ready;
 	struct mutex lock;
 	struct hisi_inno_phy_port ports[INNO_PHY_PORT_NUM];
 };
@@ -97,10 +108,6 @@ static void hisi_inno_phy_write_reg(struct hisi_inno_phy_priv *priv,
 
 static void hisi_inno_phy_setup_2p_port0(struct hisi_inno_phy_priv *priv)
 {
-	/* The vendor host-0 path enables the shared PHY clock first. */
-	hisi_inno_phy_write_reg(priv, 0, 0x06, PHY_CLK_ENABLE);
-	usleep_range(1000, 1100);
-
 	hisi_inno_phy_write_reg(priv, 0, 0x00, 0x1c);
 	udelay(20);
 
@@ -113,10 +120,6 @@ static void hisi_inno_phy_setup_2p_port0(struct hisi_inno_phy_priv *priv)
 
 static void hisi_inno_phy_setup_2p_port1(struct hisi_inno_phy_priv *priv)
 {
-	/* The PHY clock is controlled by the port 0 register 0x06. */
-	hisi_inno_phy_write_reg(priv, 0, 0x06, PHY_CLK_ENABLE);
-	usleep_range(1000, 1100);
-
 	hisi_inno_phy_write_reg(priv, 1, 0x00, 0x1c);
 	udelay(20);
 
@@ -204,64 +207,91 @@ err_disable_ref_clk:
 	return ret;
 }
 
+/* Caller holds lock; shared POR is only reset with every host quiesced. */
+static int hisi_inno_phy_restore_cv200(struct hisi_inno_phy_priv *priv,
+				     unsigned long ports, bool reset_por,
+				     bool enable_ref)
+{
+	unsigned int i;
+	int ret;
+
+	for_each_set_bit(i, &ports, priv->port_count) {
+		ret = reset_control_assert(priv->ports[i].utmi_rst);
+		if (ret)
+			return ret;
+	}
+	udelay(200);
+	if (reset_por) {
+		ret = reset_control_assert(priv->por_rst);
+		if (ret)
+			return ret;
+		udelay(200);
+	}
+
+	for_each_set_bit(i, &ports, priv->port_count) {
+		if (priv->port_count != 2 || priv->ports[i].index != 1)
+			continue;
+		ret = regmap_update_bits(priv->perictrl, CV200_USB2_MODE,
+			CV200_USB2_WORDINTERFACE | CV200_USB2_ULPI_BYPASS |
+			CV200_USB2_BURST16, CV200_USB2_ULPI_BYPASS);
+		if (ret)
+			return ret;
+		udelay(100);
+	}
+
+	if (enable_ref) {
+		ret = clk_prepare_enable(priv->ref_clk);
+		if (ret)
+			return ret;
+	}
+	udelay(300);
+	if (reset_por) {
+		ret = reset_control_deassert(priv->por_rst);
+		if (ret)
+			goto err_ref;
+		udelay(500);
+	}
+
+	/* Never overwrite port 1's shared Rcomp tuning when port 0 joins. */
+	if (reset_por && priv->port_count == 2) {
+		hisi_inno_phy_write_reg(priv, 0, 0x06, PHY_CLK_ENABLE);
+		usleep_range(1000, 1100);
+	}
+
+	for_each_set_bit(i, &ports, priv->port_count) {
+		hisi_inno_phy_setup_cv200(&priv->ports[i]);
+		ret = reset_control_deassert(priv->ports[i].utmi_rst);
+		if (ret)
+			goto err_ports;
+		usleep_range(2000, 2100);
+	}
+	return 0;
+
+err_ports:
+	for_each_set_bit(i, &ports, priv->port_count)
+		reset_control_assert(priv->ports[i].utmi_rst);
+	if (reset_por)
+		reset_control_assert(priv->por_rst);
+err_ref:
+	if (enable_ref)
+		clk_disable_unprepare(priv->ref_clk);
+	return ret;
+}
+
 static int hisi_inno_phy_init_cv200(struct phy *phy)
 {
 	struct hisi_inno_phy_port *port = phy_get_drvdata(phy);
 	struct hisi_inno_phy_priv *priv = port->priv;
-	bool first_port;
 	int ret;
 
 	mutex_lock(&priv->lock);
-	first_port = !priv->active_ports;
-
-	if (first_port) {
-		ret = clk_prepare_enable(priv->ref_clk);
-		if (ret)
-			goto out_unlock;
-		udelay(REF_CLK_STABLE_TIME);
+	ret = hisi_inno_phy_restore_cv200(priv, BIT(port - priv->ports),
+					 !priv->active_ports, !priv->active_ports);
+	if (!ret) {
+		port->initialized = true;
+		priv->active_ports++;
+		priv->ready = true;
 	}
-
-	ret = reset_control_assert(port->utmi_rst);
-	if (ret)
-		goto err_disable_ref_clk;
-	usleep_range(UTMI_RST_COMPLETE_TIME * 1000,
-		     UTMI_RST_COMPLETE_TIME * 1000 + 100);
-
-	if (first_port) {
-		/* POR and ref_clk are shared by every port in this provider. */
-		ret = reset_control_assert(priv->por_rst);
-		if (ret)
-			goto err_disable_ref_clk;
-		udelay(POR_RST_COMPLETE_TIME);
-
-		ret = reset_control_deassert(priv->por_rst);
-		if (ret)
-			goto err_assert_por;
-		udelay(POR_RST_COMPLETE_TIME);
-	}
-
-	/* Set up phy registers */
-	hisi_inno_phy_setup_cv200(port);
-
-	ret = reset_control_deassert(port->utmi_rst);
-	if (ret)
-		goto err_assert_utmi;
-	usleep_range(UTMI_RST_COMPLETE_TIME * 1000,
-		     UTMI_RST_COMPLETE_TIME * 1000 + 100);
-
-	priv->active_ports++;
-	mutex_unlock(&priv->lock);
-	return 0;
-
-err_assert_utmi:
-	reset_control_assert(port->utmi_rst);
-err_assert_por:
-	if (first_port)
-		reset_control_assert(priv->por_rst);
-err_disable_ref_clk:
-	if (first_port)
-		clk_disable_unprepare(priv->ref_clk);
-out_unlock:
 	mutex_unlock(&priv->lock);
 	return ret;
 }
@@ -318,6 +348,7 @@ static int hisi_inno_phy_exit_cv200(struct phy *phy)
 		clk_disable_unprepare(priv->ref_clk);
 	}
 	priv->active_ports--;
+	port->initialized = false;
 
 out_unlock:
 	mutex_unlock(&priv->lock);
@@ -344,9 +375,60 @@ static int hisi_inno_phy_exit(struct phy *phy)
 	return hisi_inno_phy_exit_cv200(phy);
 }
 
+static int hisi_inno_phy_calibrate(struct phy *phy)
+{
+	struct hisi_inno_phy_port *port = phy_get_drvdata(phy);
+	struct hisi_inno_phy_priv *priv = port->priv;
+	int ret = 0;
+
+	if (!priv->is_hi3798cv200)
+		return 0;
+	mutex_lock(&priv->lock);
+	if (!priv->ready || !port->initialized)
+		ret = -EIO;
+	mutex_unlock(&priv->lock);
+	return ret;
+}
+
+static int hisi_inno_phy_suspend_late(struct device *dev)
+{
+	struct hisi_inno_phy_priv *priv = dev_get_drvdata(dev);
+
+	if (priv->is_hi3798cv200)
+		priv->ready = false;
+	return 0;
+}
+
+static int hisi_inno_phy_resume_early(struct device *dev)
+{
+	struct hisi_inno_phy_priv *priv = dev_get_drvdata(dev);
+	unsigned long ports = 0;
+	unsigned int i;
+	int ret = 0;
+
+	if (!priv->is_hi3798cv200)
+		return 0;
+	mutex_lock(&priv->lock);
+	for (i = 0; i < priv->port_count; i++)
+		if (priv->ports[i].initialized)
+			ports |= BIT(i);
+	/* CRG syscore restores the retained CCF reference and selectors first. */
+	if (ports)
+		ret = hisi_inno_phy_restore_cv200(priv, ports, true, false);
+	priv->ready = !ret;
+	mutex_unlock(&priv->lock);
+	return ret;
+}
+
+static const struct dev_pm_ops hisi_inno_phy_pm_ops = {
+	SET_LATE_SYSTEM_SLEEP_PM_OPS(hisi_inno_phy_suspend_late,
+				    hisi_inno_phy_resume_early)
+};
+
 static const struct phy_ops hisi_inno_phy_ops = {
 	.init = hisi_inno_phy_init,
 	.exit = hisi_inno_phy_exit,
+	.calibrate = hisi_inno_phy_calibrate,
 	.owner = THIS_MODULE,
 };
 
@@ -386,6 +468,12 @@ static int hisi_inno_phy_probe(struct platform_device *pdev)
 	priv->is_hi3798cv200 =
 		of_device_is_compatible(np, "hisilicon,hi3798cv200-usb2-phy");
 	mutex_init(&priv->lock);
+	platform_set_drvdata(pdev, priv);
+	if (priv->is_hi3798cv200) {
+		priv->perictrl = syscon_node_to_regmap(np->parent);
+		if (IS_ERR(priv->perictrl))
+			return PTR_ERR(priv->perictrl);
+	}
 
 	for_each_child_of_node_scoped(np, child) {
 		struct reset_control *rst;
@@ -446,6 +534,7 @@ static struct platform_driver hisi_inno_phy_driver = {
 	.driver = {
 		.name	= "hisi-inno-phy",
 		.of_match_table	= hisi_inno_phy_of_match,
+		.pm = pm_ptr(&hisi_inno_phy_pm_ops),
 	}
 };
 module_platform_driver(hisi_inno_phy_driver);

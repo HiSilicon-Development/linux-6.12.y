@@ -33,7 +33,7 @@
 #include "ohci.h"
 
 #define DRIVER_DESC "OHCI generic platform driver"
-#define OHCI_MAX_CLKS 4
+#define OHCI_MAX_CLKS 6
 #define hcd_to_ohci_priv(h) ((struct ohci_platform_priv *)hcd_to_ohci(h)->priv)
 
 struct ohci_platform_priv {
@@ -143,7 +143,8 @@ static int ohci_platform_probe(struct platform_device *dev)
 		of_property_read_u32(dev->dev.of_node, "num-ports",
 				     &ohci->num_ports);
 
-		for (clk = 0; clk < OHCI_MAX_CLKS; clk++) {
+		for (clk = 0; clk < (of_device_is_compatible(dev->dev.of_node,
+				    "hisilicon,hi3798cv200-ohci") ? OHCI_MAX_CLKS : 4); clk++) {
 			priv->clks[clk] = of_clk_get(dev->dev.of_node, clk);
 			if (IS_ERR(priv->clks[clk])) {
 				err = PTR_ERR(priv->clks[clk]);
@@ -289,6 +290,14 @@ static int ohci_platform_resume_common(struct device *dev, bool hibernated)
 	struct usb_hcd *hcd = dev_get_drvdata(dev);
 	struct usb_ohci_pdata *pdata = dev_get_platdata(dev);
 	struct platform_device *pdev = to_platform_device(dev);
+
+	/* CV200's provider restores the retained analog state in resume_early. */
+	if (of_device_is_compatible(dev->of_node, "hisilicon,hi3798cv200-ohci")) {
+		int err = usb_hcd_check_phy_ready(hcd);
+
+		if (err)
+			return err;
+	}
 
 	if (pdata->power_on) {
 		int err = pdata->power_on(pdev);

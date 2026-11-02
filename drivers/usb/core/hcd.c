@@ -1053,6 +1053,19 @@ void usb_hcd_end_port_resume(struct usb_bus *bus, int portnum)
 }
 EXPORT_SYMBOL_GPL(usb_hcd_end_port_resume);
 
+/**
+ * usb_hcd_check_phy_ready - check restored PHYs before controller MMIO
+ * @hcd: host controller whose PHY provider restores state during early resume
+ *
+ * Does not acquire init or power references. A provider's calibration callback
+ * may reject access when its early-resume restoration failed.
+ */
+int usb_hcd_check_phy_ready(struct usb_hcd *hcd)
+{
+	return usb_phy_roothub_calibrate(hcd->phy_roothub);
+}
+EXPORT_SYMBOL_GPL(usb_hcd_check_phy_ready);
+
 /*-------------------------------------------------------------------------*/
 
 /**

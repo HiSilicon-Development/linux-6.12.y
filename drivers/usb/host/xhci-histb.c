@@ -408,6 +408,10 @@ static int __maybe_unused xhci_histb_resume(struct device *dev)
 	struct xhci_hcd *xhci = hcd_to_xhci(hcd);
 	int ret;
 
+	ret = usb_hcd_check_phy_ready(hcd);
+	if (ret)
+		return ret;
+
 	ret = xhci_histb_host_enable(histb);
 	if (ret)
 		return ret;
