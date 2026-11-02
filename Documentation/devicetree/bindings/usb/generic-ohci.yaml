@@ -42,6 +42,7 @@ properties:
               - brcm,bcm7420-ohci
               - brcm,bcm7425-ohci
               - brcm,bcm7435-ohci
+              - hisilicon,hi3798cv200-ohci
               - hpe,gxp-ohci
               - ibm,476gtr-ohci
               - ingenic,jz4740-ohci
@@ -67,16 +68,20 @@ properties:
 
   resets:
     minItems: 1
-    maxItems: 2
+    maxItems: 4
 
   clocks:
     minItems: 1
-    maxItems: 4
+    maxItems: 6
     description: |
       In case the Renesas R-Car Gen3 SoCs:
         - if a host only channel: first clock should be host.
         - if a USB DRD channel: first clock should be host and second
           one should be peripheral
+
+  clock-names: true
+
+  reset-names: true
 
   power-domains:
     maxItems: 1
@@ -153,7 +158,9 @@ allOf:
       properties:
         compatible:
           contains:
-            const: rockchip,rk3588-ohci
+            enum:
+              - rockchip,rk3588-ohci
+              - hisilicon,hi3798cv200-ohci
     then:
       properties:
         clocks:
@@ -163,6 +170,38 @@ allOf:
         clocks:
           minItems: 1
           maxItems: 3
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: hisilicon,hi3798cv200-ohci
+    then:
+      properties:
+        clocks:
+          minItems: 6
+        clock-names:
+          items:
+            - const: bus
+            - const: clk12
+            - const: clk48
+            - const: otg-utmi
+            - const: phy
+            - const: utmi
+        resets:
+          minItems: 4
+        reset-names:
+          items:
+            - const: bus
+            - const: utmi
+            - const: phy
+            - const: otg-phy
+    else:
+      properties:
+        clocks:
+          maxItems: 4
+        resets:
+          maxItems: 2
+
 
 unevaluatedProperties: false
 

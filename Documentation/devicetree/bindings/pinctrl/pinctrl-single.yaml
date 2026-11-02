@@ -33,6 +33,9 @@ properties:
               - ti,omap5-padconf
               - ti,j7200-padconf
           - const: pinctrl-single
+      - items:
+          - const: hisilicon,hi3798cv200-pinconf
+          - const: pinconf-single
 
   reg:
     maxItems: 1

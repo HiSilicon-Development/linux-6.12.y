@@ -11,8 +11,6 @@
 / {
 	model = "DVBIP 1001 ARM64";
 	compatible = "dvbip,1001", "hisilicon,hi3798cv200";
-
-
 	chosen {
 		bootargs = "console=tty0 console=ttyAMA0,115200n8 earlycon=pl011,mmio32,0xf8b00000,115200n8 root=/dev/mmcblk0p5 rootfstype=ext4 rootwait rw blkdevparts=mmcblk0:4M(fastboot),4M(bootargs),212M(deviceinfo),10M(trustedcore),-(rootfs) mem=2G loglevel=7 clk_ignore_unused fw_devlink=off dvbip.model=1001";
 		stdout-path = "serial0:115200n8";
@@ -36,7 +34,6 @@
 		};
 	};
 };
-
 
 &dvbip_sound {
 	simple-audio-card,name = "DVBIP-1001";

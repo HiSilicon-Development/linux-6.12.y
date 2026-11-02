@@ -302,7 +302,7 @@ gpu: gpu@f9200000 {
 		};
 
 		pmx0: pinconf@8a21000 {
-			compatible = "pinconf-single";
+			compatible = "hisilicon,hi3798cv200-pinconf", "pinconf-single";
 			reg = <0x8a21000 0x180>;
 			#pinctrl-cells = <1>;
 			pinctrl-single,register-width = <32>;
@@ -955,32 +955,38 @@ gpu: gpu@f9200000 {
 		};
 
 		ohci: usb@9880000 {
-			compatible = "generic-ohci";
+			compatible = "hisilicon,hi3798cv200-ohci", "generic-ohci";
 			reg = <0x9880000 0x10000>;
 			interrupts = <GIC_SPI 67 IRQ_TYPE_LEVEL_HIGH>;
 			clocks = <&crg HISTB_USB2_BUS_CLK>,
 				 <&crg HISTB_USB2_12M_CLK>,
-				 <&crg HISTB_USB2_48M_CLK>;
-			clock-names = "bus", "clk12", "clk48";
-			resets = <&crg 0xb8 12>;
-			reset-names = "bus";
+				 <&crg HISTB_USB2_48M_CLK>,
+				 <&crg HISTB_USB2_OTG_UTMI_CLK>,
+				 <&crg HISTB_USB2_PHY_CLK>,
+				 <&crg HISTB_USB2_UTMI_CLK>;
+			clock-names = "bus", "clk12", "clk48", "otg-utmi", "phy", "utmi";
+			resets = <&crg 0xb8 12>, <&crg 0xb8 13>,
+				 <&crg 0xb8 16>, <&crg 0xb8 17>;
+			reset-names = "bus", "utmi", "phy", "otg-phy";
 			phys = <&usb2_phy1_port1>;
 			phy-names = "usb";
 			status = "disabled";
 		};
 
 		ehci: usb@9890000 {
-			compatible = "generic-ehci";
+			compatible = "hisilicon,hi3798cv200-ehci", "generic-ehci";
 			reg = <0x9890000 0x10000>;
 			interrupts = <GIC_SPI 66 IRQ_TYPE_LEVEL_HIGH>;
 			clocks = <&crg HISTB_USB2_BUS_CLK>,
+				 <&crg HISTB_USB2_12M_CLK>,
+				 <&crg HISTB_USB2_48M_CLK>,
+				 <&crg HISTB_USB2_OTG_UTMI_CLK>,
 				 <&crg HISTB_USB2_PHY_CLK>,
 				 <&crg HISTB_USB2_UTMI_CLK>;
-			clock-names = "bus", "phy", "utmi";
-			resets = <&crg 0xb8 12>,
-				 <&crg 0xb8 16>,
-				 <&crg 0xb8 13>;
-			reset-names = "bus", "phy", "utmi";
+			clock-names = "bus", "clk12", "clk48", "otg-utmi", "phy", "utmi";
+			resets = <&crg 0xb8 12>, <&crg 0xb8 13>,
+				 <&crg 0xb8 16>, <&crg 0xb8 17>;
+			reset-names = "bus", "utmi", "phy", "otg-phy";
 			phys = <&usb2_phy1_port1>;
 			phy-names = "usb";
 			status = "disabled";
