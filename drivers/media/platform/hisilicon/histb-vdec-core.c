@@ -785,6 +785,8 @@ struct histb_vdec_dev {
 	spinlock_t irqlock;
 	/* Serializes the final cancellation check with hardware doorbells. */
 	struct mutex launch_lock;
+	/* Joins device_run after M2M has released its scheduling ownership. */
+	struct mutex run_lock;
 	struct histb_vdec_ctx *curr_ctx;
 	enum histb_vdec_job_phase phase;
 	bool job_cancelled;
@@ -12981,7 +12983,7 @@ finish:
 	v4l2_m2m_job_finish(vdec->m2m_dev, m2m);
 }
 
-static void histb_vdec_device_run(void *priv)
+static void histb_vdec_run(void *priv)
 {
 	struct histb_vdec_ctx *ctx = priv;
 	struct histb_vdec_dev *vdec = ctx->vdec;
@@ -13712,6 +13714,16 @@ finish_request:
 		histb_vdec_fail_mpeg4_state(ctx);
 	histb_vdec_complete_request(ctx, request);
 	histb_vdec_finish_job_no_pm(ctx, VB2_BUF_STATE_ERROR);
+}
+
+static void histb_vdec_device_run(void *priv)
+{
+	struct histb_vdec_ctx *ctx = priv;
+	struct histb_vdec_dev *vdec = ctx->vdec;
+
+	mutex_lock(&vdec->run_lock);
+	histb_vdec_run(priv);
+	mutex_unlock(&vdec->run_lock);
 }
 
 static void histb_vdec_job_abort(void *priv)
@@ -15544,6 +15556,7 @@ static int histb_vdec_runtime_resume(struct device *dev)
 static int histb_vdec_runtime_suspend(struct device *dev)
 {
 	struct histb_vdec_dev *vdec = dev_get_drvdata(dev);
+	int ret;
 
 	vdec->avsp_loaded = false;
 	if (histb_media_smmu_ready(&vdec->smmu))
@@ -15556,7 +15569,9 @@ static int histb_vdec_runtime_suspend(struct device *dev)
 	writel(~0U, vdec->regs + HISTB_VDEC_INT_STATE);
 	if (vdec->mv310)
 		return vdec->backend->reset_vdh(vdec);
-	reset_control_bulk_assert(ARRAY_SIZE(vdec->resets), vdec->resets);
+	ret = reset_control_bulk_assert(ARRAY_SIZE(vdec->resets), vdec->resets);
+	if (ret)
+		return ret;
 	clk_bulk_disable_unprepare(ARRAY_SIZE(vdec->clocks), vdec->clocks);
 	return 0;
 }
@@ -15566,10 +15581,21 @@ static int __maybe_unused histb_vdec_suspend(struct device *dev)
 	struct histb_vdec_dev *vdec = dev_get_drvdata(dev);
 	int ret;
 
+	/* Neither run_lock nor launch_lock may be held across this wait: the
+	 * active launcher/IRQ/postprocessor must still be able to finish.
+	 */
 	v4l2_m2m_suspend(vdec->m2m_dev);
+	mutex_lock(&vdec->run_lock);
+	mutex_unlock(&vdec->run_lock);
+	/* HEVC returns the M2M job before its detached buffers leave VPSS.
+	 * Join IRQ publication first, then watchdog and the actual buffer owner;
+	 * cancelling the worker would strand those detached buffers.
+	 */
+	synchronize_irq(vdec->irq);
+	cancel_delayed_work_sync(&vdec->watchdog_work);
+	flush_work(&vdec->postprocess_work);
 	ret = pm_runtime_force_suspend(dev);
-	if (ret)
-		v4l2_m2m_resume(vdec->m2m_dev);
+	/* A failed reset leaves the engine unavailable, not a runnable queue. */
 
 	return ret;
 }
@@ -15893,6 +15919,7 @@ static int histb_vdec_probe(struct platform_device *pdev)
 
 	mutex_init(&vdec->lock);
 	mutex_init(&vdec->launch_lock);
+	mutex_init(&vdec->run_lock);
 	spin_lock_init(&vdec->irqlock);
 	INIT_DELAYED_WORK(&vdec->watchdog_work, histb_vdec_watchdog);
 	INIT_WORK(&vdec->postprocess_work, histb_vdec_postprocess);
@@ -15933,9 +15960,11 @@ static void histb_vdec_remove(struct platform_device *pdev)
 	struct histb_vdec_dev *vdec = platform_get_drvdata(pdev);
 
 	v4l2_m2m_suspend(vdec->m2m_dev);
+	mutex_lock(&vdec->run_lock);
+	mutex_unlock(&vdec->run_lock);
 	synchronize_irq(vdec->irq);
 	cancel_delayed_work_sync(&vdec->watchdog_work);
-	cancel_work_sync(&vdec->postprocess_work);
+	flush_work(&vdec->postprocess_work);
 	histb_vdec_unregister_video(vdec);
 	pm_runtime_disable(vdec->dev);
 	if (!pm_runtime_status_suspended(vdec->dev))

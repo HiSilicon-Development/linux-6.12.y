@@ -371,6 +371,8 @@ struct histb_vpss {
 	u32 irq_state;
 	bool clock_enabled;
 	bool engine_faulted;
+	/* Protected by lock; excludes both internal callers and the video node. */
+	bool quiescing;
 	struct v4l2_device v4l2_dev;
 	struct v4l2_m2m_dev *m2m_dev;
 	struct video_device vfd;
@@ -1472,6 +1474,10 @@ static int histb_vpss_mv310_detile(struct histb_vpss *vpss,
 	}
 
 	mutex_lock(&vpss->lock);
+	if (vpss->quiescing) {
+		ret = -EBUSY;
+		goto unlock;
+	}
 	if (direct) {
 		output = frame->output_dma;
 		stride = frame->output_stride;
@@ -1933,6 +1939,10 @@ int histb_vpss_dei(struct histb_vpss *vpss,
 	chroma_off = stride * frame->height * 2;
 
 	mutex_lock(&vpss->lock);
+	if (vpss->quiescing) {
+		ret = -EBUSY;
+		goto unlock;
+	}
 
 	ret = pm_runtime_resume_and_get(vpss->dev);
 	if (ret < 0)
@@ -2460,6 +2470,10 @@ int histb_vpss_detile(struct histb_vpss *vpss,
 		return -ERANGE;
 
 	mutex_lock(&vpss->lock);
+	if (vpss->quiescing) {
+		ret = -EBUSY;
+		goto unlock;
+	}
 	if (direct_output) {
 		output_dma = frame->output_dma;
 		output_stride = frame->output_stride;
@@ -2622,11 +2636,45 @@ static int histb_vpss_runtime_suspend(struct device *dev)
 	return 0;
 }
 
+static int __maybe_unused histb_vpss_suspend(struct device *dev)
+{
+	struct histb_vpss *vpss = dev_get_drvdata(dev);
+	int ret;
+
+	/* Do not hold lock while M2M waits: device_run itself takes it. */
+	mutex_lock(&vpss->dev_mutex);
+	v4l2_m2m_suspend(vpss->m2m_dev);
+	/* Internal decoder calls are not M2M jobs. Join their DMA/completion
+	 * owner, then reject further calls before runtime PM can reset VPSS.
+	 */
+	mutex_lock(&vpss->lock);
+	vpss->quiescing = true;
+	ret = pm_runtime_force_suspend(dev);
+	mutex_unlock(&vpss->lock);
+	mutex_unlock(&vpss->dev_mutex);
+	return ret;
+}
+
+static int __maybe_unused histb_vpss_resume(struct device *dev)
+{
+	struct histb_vpss *vpss = dev_get_drvdata(dev);
+	int ret;
+
+	mutex_lock(&vpss->lock);
+	ret = pm_runtime_force_resume(dev);
+	if (!ret)
+		vpss->quiescing = false;
+	mutex_unlock(&vpss->lock);
+	/* resume may synchronously enter device_run, which needs lock. */
+	if (!ret)
+		v4l2_m2m_resume(vpss->m2m_dev);
+	return ret;
+}
+
 static const struct dev_pm_ops histb_vpss_pm_ops = {
 	SET_RUNTIME_PM_OPS(histb_vpss_runtime_suspend,
 			   histb_vpss_runtime_resume, NULL)
-	SET_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend,
-				pm_runtime_force_resume)
+	SET_SYSTEM_SLEEP_PM_OPS(histb_vpss_suspend, histb_vpss_resume)
 };
 struct histb_vpss_ctx {
 	struct v4l2_fh fh;
