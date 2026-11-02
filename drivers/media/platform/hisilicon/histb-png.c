@@ -46,6 +46,7 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/pm_runtime.h>
 #include <linux/reset.h>
 #include <linux/sizes.h>
 #include <linux/unaligned.h>
@@ -133,6 +134,7 @@ struct histb_png_dev {
 	wait_queue_head_t wait;
 	atomic_t status;
 	bool removing;
+	bool clock_enabled;
 	void *segment;
 	dma_addr_t segment_dma;
 	void *dictionary;
@@ -352,13 +354,15 @@ static int png_decode(struct histb_png_ctx *ctx, const u8 *data,
 	u32 offset = im->idat_offset, remaining = im->idat_length;
 	unsigned long deadline = jiffies + msecs_to_jiffies(PNG_TIMEOUT_MS);
 	u32 length, status;
-	int ret;
+	int ret, reset_ret;
 
 	if (!target || !IS_ALIGNED(target, 16) ||
 	    target > U32_MAX || ctx->capture.sizeimage - 1 > U32_MAX - target)
 		return -EINVAL;
 	if (png_cancelled(ctx))
 		return -ECANCELED;
+	if (!png->clock_enabled)
+		return -EIO;
 	ret = reset_control_deassert(png->core_reset);
 	if (ret)
 		return ret;
@@ -445,13 +449,22 @@ static int png_decode(struct histb_png_ctx *ctx, const u8 *data,
 	}
 	/* Stop DMA before returning buffers, including error/abort/timeout paths. */
 	writel(0, png->regs + PNG_INT_MASK);
-	reset_control_assert(png->core_reset);
-	if (readl_poll_timeout(png->regs + PNG_RESET_BUSY, status,
-			       !(status & BIT(0)), 10, 20000)) {
-		dev_err(png->dev, "PNG reset did not complete\n");
-		ret = -ETIMEDOUT;
+	reset_ret = reset_control_assert(png->core_reset);
+	if (!reset_ret)
+		reset_ret = readl_poll_timeout(png->regs + PNG_RESET_BUSY, status,
+					     !(status & BIT(0)), 10, 20000);
+	if (reset_ret) {
+		dev_err(png->dev, "PNG reset failed: %d; engine stopped\n", reset_ret);
+		/* Join the hard IRQ before removing its register clock. An engine
+		 * with an unconfirmed reset must not DMA into returned buffers.
+		 */
+		disable_irq(png->irq);
+		clk_bulk_disable_unprepare(ARRAY_SIZE(png->clocks), png->clocks);
+		png->clock_enabled = false;
+		ret = reset_ret;
+	} else {
+		synchronize_irq(png->irq);
 	}
-	synchronize_irq(png->irq);
 	return ret;
 }
 
@@ -822,6 +835,104 @@ static void png_device_release(struct v4l2_device *v4l2)
 	kfree(png);
 }
 
+static int png_power_on(struct histb_png_dev *png)
+{
+	int ret;
+
+	ret = clk_bulk_prepare_enable(ARRAY_SIZE(png->clocks), png->clocks);
+	if (ret)
+		return ret;
+	png->clock_enabled = true;
+	ret = reset_control_assert(png->core_reset);
+	if (ret)
+		goto off;
+	ret = reset_control_assert(png->smmu_reset);
+	if (ret)
+		goto off;
+	udelay(2);
+	ret = reset_control_deassert(png->smmu_reset);
+	if (!ret)
+		/* Idle baseline: core remains reset. Each job restores the BSP
+		 * AXI/timeout/bypass and complete image state before PNG_START.
+		 */
+		return 0;
+off:
+	reset_control_assert(png->core_reset);
+	reset_control_assert(png->smmu_reset);
+	clk_bulk_disable_unprepare(ARRAY_SIZE(png->clocks), png->clocks);
+	png->clock_enabled = false;
+	return ret;
+}
+
+static int png_runtime_resume(struct device *dev)
+{
+	struct histb_png_dev *png = dev_get_drvdata(dev);
+	int ret;
+
+	ret = png_power_on(png);
+	if (!ret)
+		enable_irq(png->irq);
+	return ret;
+}
+
+static int png_runtime_suspend(struct device *dev)
+{
+	struct histb_png_dev *png = dev_get_drvdata(dev);
+	u32 status;
+	int ret;
+
+	if (!png->clock_enabled)
+		return 0;
+	disable_irq(png->irq);
+	writel(0, png->regs + PNG_INT_MASK);
+	ret = reset_control_assert(png->core_reset);
+	if (ret)
+		return ret;
+	ret = readl_poll_timeout(png->regs + PNG_RESET_BUSY, status,
+				 !(status & BIT(0)), 10, 20000);
+	if (ret)
+		return ret;
+	ret = reset_control_assert(png->smmu_reset);
+	if (ret)
+		return ret;
+	clk_bulk_disable_unprepare(ARRAY_SIZE(png->clocks), png->clocks);
+	png->clock_enabled = false;
+	return 0;
+}
+
+static int __maybe_unused png_suspend(struct device *dev)
+{
+	struct histb_png_dev *png = dev_get_drvdata(dev);
+	int ret;
+
+	/* Workers and IRQ completion do not take the ioctl mutex. Drain an
+	 * image (or its explicit timeout/error), not just the M2M scheduling bit.
+	 */
+	mutex_lock(&png->mutex);
+	v4l2_m2m_suspend(png->m2m);
+	flush_workqueue(png->workqueue);
+	synchronize_irq(png->irq);
+	ret = pm_runtime_force_suspend(dev);
+	mutex_unlock(&png->mutex);
+	return ret;
+}
+
+static int __maybe_unused png_resume(struct device *dev)
+{
+	struct histb_png_dev *png = dev_get_drvdata(dev);
+	int ret;
+
+	ret = pm_runtime_force_resume(dev);
+	if (!ret)
+		v4l2_m2m_resume(png->m2m);
+	return ret;
+}
+
+static const struct dev_pm_ops png_pm_ops = {
+	SET_RUNTIME_PM_OPS(png_runtime_suspend, png_runtime_resume, NULL)
+	SET_SYSTEM_SLEEP_PM_OPS(png_suspend, png_resume)
+};
+
 static int histb_png_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -868,19 +979,9 @@ static int histb_png_probe(struct platform_device *pdev)
 		ret = PTR_ERR(png->smmu_reset);
 		goto free_png;
 	}
-	ret = clk_bulk_prepare_enable(ARRAY_SIZE(png->clocks), png->clocks);
+	ret = png_power_on(png);
 	if (ret)
 		goto free_png;
-	ret = reset_control_assert(png->core_reset);
-	if (ret)
-		goto clocks_off;
-	ret = reset_control_assert(png->smmu_reset);
-	if (ret)
-		goto clocks_off;
-	udelay(2);
-	ret = reset_control_deassert(png->smmu_reset);
-	if (ret)
-		goto clocks_off;
 	png->irq = platform_get_irq(pdev, 0);
 	if (png->irq < 0) {
 		ret = png->irq;
@@ -929,6 +1030,10 @@ static int histb_png_probe(struct platform_device *pdev)
 		goto unregister_v4l2;
 	}
 	platform_set_drvdata(pdev, png);
+	/* Preserve binding-time power ownership; system sleep forces it off. */
+	pm_runtime_set_active(dev);
+	pm_runtime_get_noresume(dev);
+	pm_runtime_enable(dev);
 	dev_info(dev, "MV310 PNG hardware decoder registered as /dev/video%d\n",
 		 png->video.num);
 	return 0;
@@ -940,9 +1045,11 @@ destroy_queue:
 free_irq:
 	devm_free_irq(dev, png->irq, png);
 clocks_off:
-	reset_control_assert(png->core_reset);
-	reset_control_assert(png->smmu_reset);
-	clk_bulk_disable_unprepare(ARRAY_SIZE(png->clocks), png->clocks);
+	if (png->clock_enabled) {
+		reset_control_assert(png->core_reset);
+		reset_control_assert(png->smmu_reset);
+		clk_bulk_disable_unprepare(ARRAY_SIZE(png->clocks), png->clocks);
+	}
 free_png:
 	put_device(png->dev);
 	kfree(png);
@@ -959,10 +1066,15 @@ static void histb_png_remove(struct platform_device *pdev)
 	wake_up(&png->wait);
 	v4l2_m2m_suspend(png->m2m);
 	flush_workqueue(png->workqueue);
-	reset_control_assert(png->core_reset);
-	reset_control_assert(png->smmu_reset);
+	pm_runtime_disable(&pdev->dev);
+	pm_runtime_put_noidle(&pdev->dev);
+	if (png->clock_enabled) {
+		reset_control_assert(png->core_reset);
+		reset_control_assert(png->smmu_reset);
+	}
 	devm_free_irq(png->dev, png->irq, png);
-	clk_bulk_disable_unprepare(ARRAY_SIZE(png->clocks), png->clocks);
+	if (png->clock_enabled)
+		clk_bulk_disable_unprepare(ARRAY_SIZE(png->clocks), png->clocks);
 	mutex_unlock(&png->mutex);
 	video_unregister_device(&png->video);
 	v4l2_device_unregister(&png->v4l2);
@@ -981,6 +1093,7 @@ static struct platform_driver histb_png_driver = {
 	.driver = {
 		.name = "histb-png",
 		.of_match_table = histb_png_of_match,
+		.pm = &png_pm_ops,
 	},
 };
 module_platform_driver(histb_png_driver);

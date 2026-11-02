@@ -15,6 +15,7 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/pm_runtime.h>
 #include <linux/reset.h>
 #include <linux/workqueue.h>
 
@@ -128,6 +129,8 @@ struct histb_jpgd_dev {
 	unsigned long deadline;
 	struct mutex launch_lock;
 	bool removing;
+	bool clock_enabled;
+	struct workqueue_struct *workqueue;
 
 	struct delayed_work watchdog_work;
 };
@@ -159,15 +162,38 @@ histb_jpgd_get_q_data(struct histb_jpgd_ctx *ctx, enum v4l2_buf_type type)
 	return &ctx->dst;
 }
 
-static void histb_jpgd_reset_engine(struct histb_jpgd_dev *jpgd)
+static int histb_jpgd_reset_engine(struct histb_jpgd_dev *jpgd)
 {
+	int ret;
+
 	writel(0x7f, jpgd->regs + HISTB_JPGD_REG_INTMASK);
-	reset_control_assert(jpgd->core_reset);
+	ret = reset_control_assert(jpgd->core_reset);
+	if (ret)
+		return ret;
 	udelay(5);
-	reset_control_deassert(jpgd->core_reset);
+	ret = reset_control_deassert(jpgd->core_reset);
+	if (ret)
+		return ret;
 	udelay(10);
 	writel(0x7f, jpgd->regs + HISTB_JPGD_REG_INTMASK);
 	writel(0x7f, jpgd->regs + HISTB_JPGD_REG_INT);
+	return 0;
+}
+
+/* launch_lock excludes other register users, including the threaded IRQ.
+ * If reset fails, clock gating is the final DMA stop before buffers return.
+ */
+static int histb_jpgd_recover_engine(struct histb_jpgd_dev *jpgd)
+{
+	int ret = histb_jpgd_reset_engine(jpgd);
+
+	if (ret) {
+		dev_err(jpgd->dev, "JPEG reset failed: %d; engine stopped\n", ret);
+		disable_irq_nosync(jpgd->irq);
+		clk_bulk_disable_unprepare(ARRAY_SIZE(jpgd->clocks), jpgd->clocks);
+		jpgd->clock_enabled = false;
+	}
+	return ret;
 }
 
 /* Queue every completion source, including immediate launch errors, so close
@@ -199,7 +225,7 @@ static void histb_jpgd_finish_job(struct histb_jpgd_ctx *ctx,
 				  enum vb2_buffer_state state)
 {
 	ctx->finish_state = state;
-	queue_work(system_wq, &ctx->finish_work);
+	queue_work(ctx->jpgd->workqueue, &ctx->finish_work);
 }
 
 static void histb_jpgd_watchdog(struct work_struct *work)
@@ -219,7 +245,7 @@ static void histb_jpgd_watchdog(struct work_struct *work)
 		ctx = NULL;
 	} else if (ctx) {
 		jpgd->active = NULL;
-		histb_jpgd_reset_engine(jpgd);
+		histb_jpgd_recover_engine(jpgd);
 		dev_err(jpgd->dev, "JPEG decode timed out\n");
 	}
 	mutex_unlock(&jpgd->launch_lock);
@@ -235,6 +261,10 @@ static irqreturn_t histb_jpgd_irq(int irq, void *data)
 	u32 status;
 
 	mutex_lock(&jpgd->launch_lock);
+	if (!jpgd->clock_enabled) {
+		mutex_unlock(&jpgd->launch_lock);
+		return IRQ_NONE;
+	}
 	status = readl(jpgd->regs + HISTB_JPGD_REG_INT) & HISTB_JPGD_INT_ALL;
 	if (!status) {
 		mutex_unlock(&jpgd->launch_lock);
@@ -248,7 +278,7 @@ static irqreturn_t histb_jpgd_irq(int irq, void *data)
 	state = status & (HISTB_JPGD_INT_ERROR | HISTB_JPGD_INT_STREAM_ERR |
 			  HISTB_JPGD_INT_CONTINUE) ? VB2_BUF_STATE_ERROR : VB2_BUF_STATE_DONE;
 	if (state == VB2_BUF_STATE_ERROR)
-		histb_jpgd_reset_engine(jpgd);
+		histb_jpgd_recover_engine(jpgd);
 	else
 		writel(0x7f, jpgd->regs + HISTB_JPGD_REG_INTMASK);
 	mutex_unlock(&jpgd->launch_lock);
@@ -269,7 +299,7 @@ static void histb_jpgd_job_abort(void *priv)
 	if (active) {
 		jpgd->active = NULL;
 		cancel_delayed_work(&jpgd->watchdog_work);
-		histb_jpgd_reset_engine(jpgd);
+		histb_jpgd_recover_engine(jpgd);
 	}
 	mutex_unlock(&jpgd->launch_lock);
 	if (active)
@@ -297,7 +327,7 @@ static void histb_jpgd_device_run(void *priv)
 	u32 y_size = stride * ALIGN(ctx->dst.pix.height, 16);
 
 	mutex_lock(&jpgd->launch_lock);
-	if (jpgd->removing || ctx->aborting)
+	if (jpgd->removing || !jpgd->clock_enabled || ctx->aborting)
 		goto error;
 	src = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
 	dst = v4l2_m2m_next_dst_buf(ctx->fh.m2m_ctx);
@@ -319,7 +349,8 @@ static void histb_jpgd_device_run(void *priv)
 	    dst_dma > U32_MAX || ctx->dst.size > U32_MAX - dst_dma)
 		goto error;
 
-	histb_jpgd_reset_engine(jpgd);
+	if (histb_jpgd_recover_engine(jpgd))
+		goto error;
 	/* BSP physical per-client bypass; no private SMMU page tables. */
 	writel(0x1ff, jpgd->regs + HISTB_JPGD_REG_MMU_BYPASS);
 	histb_jpgd_write_table(jpgd, HISTB_JPGD_REG_QUANT, img->quant, 64);
@@ -698,6 +729,109 @@ static const struct of_device_id histb_jpgd_of_match[] = {
 };
 MODULE_DEVICE_TABLE(of, histb_jpgd_of_match);
 
+static int histb_jpgd_power_on(struct histb_jpgd_dev *jpgd)
+{
+	int ret;
+
+	ret = clk_bulk_prepare_enable(ARRAY_SIZE(jpgd->clocks), jpgd->clocks);
+	if (ret)
+		return ret;
+	jpgd->clock_enabled = true;
+	ret = reset_control_assert(jpgd->core_reset);
+	if (ret)
+		goto off;
+	ret = reset_control_assert(jpgd->smmu_reset);
+	if (ret)
+		goto off;
+	udelay(5);
+	ret = reset_control_deassert(jpgd->smmu_reset);
+	if (ret)
+		goto off;
+	ret = reset_control_deassert(jpgd->core_reset);
+	if (ret)
+		goto off;
+	udelay(10);
+	ret = histb_jpgd_reset_engine(jpgd);
+	if (!ret) {
+		/* Restore the physical-DMA baseline before permitting another job. */
+		writel(0x1ff, jpgd->regs + HISTB_JPGD_REG_MMU_BYPASS);
+		return 0;
+	}
+off:
+	reset_control_assert(jpgd->core_reset);
+	reset_control_assert(jpgd->smmu_reset);
+	clk_bulk_disable_unprepare(ARRAY_SIZE(jpgd->clocks), jpgd->clocks);
+	jpgd->clock_enabled = false;
+	return ret;
+}
+
+static int histb_jpgd_runtime_resume(struct device *dev)
+{
+	struct histb_jpgd_dev *jpgd = dev_get_drvdata(dev);
+	int ret;
+
+	ret = histb_jpgd_power_on(jpgd);
+	if (!ret)
+		enable_irq(jpgd->irq);
+	return ret;
+}
+
+static int histb_jpgd_runtime_suspend(struct device *dev)
+{
+	struct histb_jpgd_dev *jpgd = dev_get_drvdata(dev);
+	int ret;
+
+	if (!jpgd->clock_enabled)
+		return 0;
+	disable_irq(jpgd->irq);
+	writel(0x7f, jpgd->regs + HISTB_JPGD_REG_INTMASK);
+	writel(0x7f, jpgd->regs + HISTB_JPGD_REG_INT);
+	ret = reset_control_assert(jpgd->core_reset);
+	if (ret)
+		return ret;
+	ret = reset_control_assert(jpgd->smmu_reset);
+	if (ret)
+		return ret;
+	clk_bulk_disable_unprepare(ARRAY_SIZE(jpgd->clocks), jpgd->clocks);
+	jpgd->clock_enabled = false;
+	return 0;
+}
+
+static int __maybe_unused histb_jpgd_suspend(struct device *dev)
+{
+	struct histb_jpgd_dev *jpgd = dev_get_drvdata(dev);
+	int ret;
+
+	/* The IRQ/watchdog/finish worker never needs dev_mutex. Keep contexts
+	 * alive, but do not hold launch_lock while waiting for their completion.
+	 */
+	mutex_lock(&jpgd->dev_mutex);
+	v4l2_m2m_suspend(jpgd->m2m_dev);
+	synchronize_irq(jpgd->irq);
+	cancel_delayed_work_sync(&jpgd->watchdog_work);
+	flush_workqueue(jpgd->workqueue);
+	ret = pm_runtime_force_suspend(dev);
+	mutex_unlock(&jpgd->dev_mutex);
+	return ret;
+}
+
+static int __maybe_unused histb_jpgd_resume(struct device *dev)
+{
+	struct histb_jpgd_dev *jpgd = dev_get_drvdata(dev);
+	int ret;
+
+	ret = pm_runtime_force_resume(dev);
+	if (!ret)
+		v4l2_m2m_resume(jpgd->m2m_dev);
+	return ret;
+}
+
+static const struct dev_pm_ops histb_jpgd_pm_ops = {
+	SET_RUNTIME_PM_OPS(histb_jpgd_runtime_suspend,
+			   histb_jpgd_runtime_resume, NULL)
+	SET_SYSTEM_SLEEP_PM_OPS(histb_jpgd_suspend, histb_jpgd_resume)
+};
+
 /* The video device holds a v4l2_device reference until its last fd closes. */
 static void histb_jpgd_device_release(struct v4l2_device *v4l2_dev)
 {
@@ -705,6 +839,7 @@ static void histb_jpgd_device_release(struct v4l2_device *v4l2_dev)
 						struct histb_jpgd_dev, v4l2_dev);
 
 	v4l2_m2m_release(jpgd->m2m_dev);
+	destroy_workqueue(jpgd->workqueue);
 	put_device(jpgd->dev);
 	kfree(jpgd);
 }
@@ -727,6 +862,11 @@ static int histb_jpgd_probe(struct platform_device *pdev)
 	mutex_init(&jpgd->dev_mutex);
 	mutex_init(&jpgd->launch_lock);
 	INIT_DELAYED_WORK(&jpgd->watchdog_work, histb_jpgd_watchdog);
+	jpgd->workqueue = alloc_ordered_workqueue("histb-jpgd", WQ_MEM_RECLAIM);
+	if (!jpgd->workqueue) {
+		ret = -ENOMEM;
+		goto err_free;
+	}
 	ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
 	if (ret)
 		goto err_free;
@@ -760,24 +900,9 @@ static int histb_jpgd_probe(struct platform_device *pdev)
 		ret = PTR_ERR(jpgd->smmu_reset);
 		goto err_free;
 	}
-	ret = clk_bulk_prepare_enable(ARRAY_SIZE(jpgd->clocks), jpgd->clocks);
+	ret = histb_jpgd_power_on(jpgd);
 	if (ret)
 		goto err_free;
-	ret = reset_control_assert(jpgd->core_reset);
-	if (ret)
-		goto err_clock;
-	ret = reset_control_assert(jpgd->smmu_reset);
-	if (ret)
-		goto err_clock;
-	udelay(5);
-	ret = reset_control_deassert(jpgd->smmu_reset);
-	if (ret)
-		goto err_clock;
-	ret = reset_control_deassert(jpgd->core_reset);
-	if (ret)
-		goto err_clock;
-	udelay(10);
-	histb_jpgd_reset_engine(jpgd);
 	ret = devm_request_threaded_irq(&pdev->dev, jpgd->irq, NULL,
 				 histb_jpgd_irq, IRQF_ONESHOT, "histb-jpgd", jpgd);
 	if (ret)
@@ -806,6 +931,10 @@ static int histb_jpgd_probe(struct platform_device *pdev)
 	if (ret)
 		goto err_m2m;
 	platform_set_drvdata(pdev, jpgd);
+	/* Preserve binding-time power ownership; system sleep forces it off. */
+	pm_runtime_set_active(&pdev->dev);
+	pm_runtime_get_noresume(&pdev->dev);
+	pm_runtime_enable(&pdev->dev);
 	return 0;
 
 err_m2m:
@@ -815,10 +944,14 @@ err_v4l2:
 err_irq:
 	devm_free_irq(&pdev->dev, jpgd->irq, jpgd);
 err_clock:
-	reset_control_assert(jpgd->core_reset);
-	reset_control_assert(jpgd->smmu_reset);
-	clk_bulk_disable_unprepare(ARRAY_SIZE(jpgd->clocks), jpgd->clocks);
+	if (jpgd->clock_enabled) {
+		reset_control_assert(jpgd->core_reset);
+		reset_control_assert(jpgd->smmu_reset);
+		clk_bulk_disable_unprepare(ARRAY_SIZE(jpgd->clocks), jpgd->clocks);
+	}
 err_free:
+	if (jpgd->workqueue)
+		destroy_workqueue(jpgd->workqueue);
 	put_device(jpgd->dev);
 	kfree(jpgd);
 	return dev_err_probe(&pdev->dev, ret, "cannot initialize JPGD\n");
@@ -834,20 +967,26 @@ static void histb_jpgd_remove(struct platform_device *pdev)
 	jpgd->removing = true;
 	ctx = jpgd->active;
 	jpgd->active = NULL;
-	histb_jpgd_reset_engine(jpgd);
+	if (jpgd->clock_enabled)
+		histb_jpgd_reset_engine(jpgd);
 	mutex_unlock(&jpgd->launch_lock);
 	disable_irq(jpgd->irq);
 	cancel_delayed_work_sync(&jpgd->watchdog_work);
 	if (ctx)
 		histb_jpgd_finish_job(ctx, VB2_BUF_STATE_ERROR);
 	v4l2_m2m_suspend(jpgd->m2m_dev);
+	flush_workqueue(jpgd->workqueue);
 	v4l2_device_disconnect(&jpgd->v4l2_dev);
 	video_unregister_device(&jpgd->vfd);
 	v4l2_device_unregister(&jpgd->v4l2_dev);
 	devm_free_irq(&pdev->dev, jpgd->irq, jpgd);
-	reset_control_assert(jpgd->core_reset);
-	reset_control_assert(jpgd->smmu_reset);
-	clk_bulk_disable_unprepare(ARRAY_SIZE(jpgd->clocks), jpgd->clocks);
+	pm_runtime_disable(&pdev->dev);
+	pm_runtime_put_noidle(&pdev->dev);
+	if (jpgd->clock_enabled) {
+		reset_control_assert(jpgd->core_reset);
+		reset_control_assert(jpgd->smmu_reset);
+		clk_bulk_disable_unprepare(ARRAY_SIZE(jpgd->clocks), jpgd->clocks);
+	}
 	mutex_unlock(&jpgd->dev_mutex);
 	v4l2_device_put(&jpgd->v4l2_dev);
 }
@@ -858,6 +997,7 @@ static struct platform_driver histb_jpgd_driver = {
 	.driver = {
 		.name = "histb-jpgd",
 		.of_match_table = histb_jpgd_of_match,
+		.pm = &histb_jpgd_pm_ops,
 	},
 };
 
