@@ -18,6 +18,7 @@
 #include <linux/iopoll.h>
 #include <linux/module.h>
 #include <linux/property.h>
+#include <linux/pm.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/rcupdate.h>
@@ -92,6 +93,18 @@
 		    SNDRV_PCM_RATE_96000 | SNDRV_PCM_RATE_176400 | \
 		    SNDRV_PCM_RATE_192000)
 
+/* Only hw_params-owned configuration is replayed after controller reset. */
+struct aiao_tx_config {
+	u32 crg0;
+	u32 crg1;
+	u32 if_attr;
+	u32 dma_addr;
+	u32 buffer_bytes;
+	u32 period_bytes;
+	unsigned int channel;
+	bool valid;
+};
+
 struct hi3798cv200_aiao {
 	struct device *dev;
 	void __iomem *base;
@@ -103,6 +116,12 @@ struct hi3798cv200_aiao {
 	/* Serializes top-level and channel register read-modify-write cycles. */
 	spinlock_t reg_lock;
 	u32 dsp_ctrl;
+	struct aiao_tx_config config;
+	u32 last_pos;
+	int stop_error;
+	bool prepared;
+	/* IRQF_SHARED handlers must not touch a controller with gated clocks. */
+	bool powered;
 	/* Selected by the board's audio routing. */
 	unsigned int tx_channel;
 	unsigned int analog_tx_channel;
@@ -127,25 +146,10 @@ static inline u32 aiao_tx_top_irq(const struct hi3798cv200_aiao *aiao)
 	return BIT(16 + aiao->tx_channel);
 }
 
-static inline u32 aiao_tx_bclk_mask(const struct hi3798cv200_aiao *aiao)
-{
-	return GENMASK(aiao->tx_channel * 4 + 3, aiao->tx_channel * 4);
-}
-
-static inline u32 aiao_tx_bclk_source(const struct hi3798cv200_aiao *aiao)
-{
-	return 8 + aiao->tx_channel;
-}
-static inline u32 aiao_tx_bclk_value(const struct hi3798cv200_aiao *aiao)
-{
-	return aiao_tx_bclk_source(aiao) << (aiao->tx_channel * 4);
-}
-
 static const struct snd_pcm_hardware hi3798cv200_aiao_pcm_hardware = {
 	.info = SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_MMAP_VALID |
 		SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_BLOCK_TRANSFER |
-		SNDRV_PCM_INFO_PAUSE | SNDRV_PCM_INFO_RESUME |
-		SNDRV_PCM_INFO_NO_REWINDS,
+		SNDRV_PCM_INFO_PAUSE | SNDRV_PCM_INFO_NO_REWINDS,
 	.formats = SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S32_LE,
 	.rates = AIAO_RATES,
 	.rate_min = 8000,
@@ -158,6 +162,14 @@ static const struct snd_pcm_hardware hi3798cv200_aiao_pcm_hardware = {
 	.periods_max = 128,
 	.buffer_bytes_max = AIAO_BUFFER_BYTES_MAX,
 };
+
+/*
+ * Deep standby loses the FIFO as well as the DMA registers.  Do not advertise
+ * INFO_RESUME: ALSA leaves the stream SUSPENDED, snd_pcm_resume() returns
+ * -ENOSYS, and userspace must prepare/refill it.  prepare resets both hardware
+ * byte positions to zero before ALSA resets hw_ptr/appl_ptr to that origin.
+ * PAUSE retains the live ring; system resume never replays its old pointers.
+ */
 
 static inline u32 aiao_read(struct hi3798cv200_aiao *aiao, u32 reg)
 {
@@ -190,9 +202,40 @@ static u32 aiao_mclk_div(struct hi3798cv200_aiao *aiao, unsigned int rate)
 	return DIV_ROUND_CLOSEST_ULL(numerator, aiao->mclk_rate);
 }
 
+static void aiao_restore_tx_config(struct hi3798cv200_aiao *aiao)
+{
+	const struct aiao_tx_config *config = &aiao->config;
+	u32 tx_offset = config->channel * 0x100;
+	u32 crg_offset = config->channel * 8;
+	u32 bclk_mask = GENMASK(config->channel * 4 + 3, config->channel * 4);
+	u32 bclk_value = (8 + config->channel) << (config->channel * 4);
+
+	if (!config->valid)
+		return;
+
+	/* Replay only the owner of hw_params, never the other DAI's TX bank. */
+	aiao_write(aiao, AIAO_TX0_INT_ENA + tx_offset, 0);
+	aiao_write(aiao, AIAO_TX0_INT_CLR + tx_offset, AIAO_TX_INT_ALL);
+	aiao_write(aiao, AIAO_TX0_CRG_CFG1 + crg_offset, 0);
+	aiao_write(aiao, AIAO_TX0_CRG_CFG0 + crg_offset, config->crg0);
+	aiao_write(aiao, AIAO_TX0_CRG_CFG1 + crg_offset, config->crg1);
+	aiao_write(aiao, AIAO_TX0_CRG_CFG1 + crg_offset,
+		   config->crg1 | AIAO_CRG_CLK_EN);
+	aiao_update_bits(aiao, AIAO_SWITCH_TX_BCLK, bclk_mask, bclk_value);
+	aiao_write(aiao, AIAO_TX0_IF_ATTR + tx_offset, config->if_attr);
+	aiao_write(aiao, AIAO_TX0_DSP_CTRL + tx_offset, aiao->dsp_ctrl);
+	aiao_write(aiao, AIAO_TX0_BUF_ADDR + tx_offset, config->dma_addr);
+	aiao_write(aiao, AIAO_TX0_BUF_SIZE + tx_offset, config->buffer_bytes);
+	aiao_write(aiao, AIAO_TX0_BUF_ALEMPTY + tx_offset, config->period_bytes);
+	aiao_write(aiao, AIAO_TX0_TRANS_SIZE + tx_offset, config->period_bytes);
+	/* No queued samples survive the required ALSA prepare/refill operation. */
+	aiao_write(aiao, AIAO_TX0_BUF_WPTR + tx_offset, 0);
+	aiao_write(aiao, AIAO_TX0_BUF_RPTR + tx_offset, 0);
+}
+
 static int aiao_stop_tx(struct hi3798cv200_aiao *aiao)
 {
-	u32 val, trans_size, rptr;
+	u32 val, trans_size;
 	int ret = 0;
 	const u32 tx_dsp = aiao_tx_reg(aiao, AIAO_TX0_DSP_CTRL);
 	const u32 tx_rptr = aiao_tx_reg(aiao, AIAO_TX0_BUF_RPTR);
@@ -201,14 +244,20 @@ static int aiao_stop_tx(struct hi3798cv200_aiao *aiao)
 	const u32 tx_int_clr = aiao_tx_reg(aiao, AIAO_TX0_INT_CLR);
 	const u32 top_irq = aiao_tx_top_irq(aiao);
 
+	if (!READ_ONCE(aiao->powered))
+		return 0;
+
 	/* Stop delivery before the disable handshake can empty the FIFO. */
 	aiao_write(aiao, tx_int_ena, 0);
 	aiao_update_bits(aiao, AIAO_INT_ENA, top_irq, 0);
 	trans_size = aiao_read(aiao, tx_trans);
 	val = aiao_read(aiao, tx_dsp);
-	if (val & AIAO_TX_ENABLE) {
-		aiao_update_bits(aiao, tx_dsp, AIAO_TX_ENABLE, 0);
-		rptr = aiao_read(aiao, tx_rptr) & AIAO_BUFFER_PTR_MASK;
+	if ((val & AIAO_TX_ENABLE) || aiao->stop_error) {
+		if (val & AIAO_TX_ENABLE) {
+			aiao_update_bits(aiao, tx_dsp, AIAO_TX_ENABLE, 0);
+			aiao->last_pos = aiao_read(aiao, tx_rptr) &
+				AIAO_BUFFER_PTR_MASK;
+		}
 		aiao_write(aiao, tx_trans, 1);
 		aiao_write(aiao, tx_rptr, 0);
 		udelay(500);
@@ -218,13 +267,16 @@ static int aiao_stop_tx(struct hi3798cv200_aiao *aiao)
 			dev_warn_ratelimited(aiao->dev,
 					     "AIAO TX%u stop timed out\n", aiao->tx_channel);
 		if (!ret)
-			aiao_write(aiao, tx_rptr, rptr);
+			aiao_write(aiao, tx_rptr, aiao->last_pos);
 		if (trans_size)
 			aiao_write(aiao, tx_trans, trans_size);
 	}
 
 	aiao_write(aiao, tx_int_clr, AIAO_TX_INT_ALL);
 	rcu_assign_pointer(aiao->substream, NULL);
+	aiao->stop_error = ret;
+	if (ret)
+		aiao->prepared = false;
 	return ret;
 }
 
@@ -293,12 +345,12 @@ static int hi3798cv200_aiao_hw_params(struct snd_soc_component *component,
 {
 	struct hi3798cv200_aiao *aiao = dev_get_drvdata(component->dev);
 	struct snd_pcm_runtime *runtime = substream->runtime;
-	u32 precision, if_attr, crg1;
+	u32 precision, if_attr;
 	size_t buffer_bytes = params_buffer_bytes(params);
 	size_t period_bytes = params_period_bytes(params);
-	u32 tx_crg0, tx_crg1, tx_if, tx_dsp, tx_addr, tx_size;
-	u32 tx_wptr, tx_rptr, tx_alempty, tx_trans;
 
+	if (!READ_ONCE(aiao->powered))
+		return -ESTRPIPE;
 	if (params_channels(params) != 2)
 		return -EINVAL;
 	if (!IS_ALIGNED(runtime->dma_addr, AIAO_BUFFER_ALIGN) ||
@@ -324,40 +376,26 @@ static int hi3798cv200_aiao_hw_params(struct snd_soc_component *component,
 		  FIELD_PREP(AIAO_TX_SD2_MASK, 2) |
 		  FIELD_PREP(AIAO_TX_SD3_MASK, 3);
 
-	crg1 = FIELD_PREP(AIAO_CRG_BCLK_DIV_MASK, 3) |
-	       FIELD_PREP(AIAO_CRG_FSCLK_DIV_MASK, 3);
-	tx_crg0 = aiao_tx_crg_reg(aiao, AIAO_TX0_CRG_CFG0);
-	tx_crg1 = aiao_tx_crg_reg(aiao, AIAO_TX0_CRG_CFG1);
-	tx_if = aiao_tx_reg(aiao, AIAO_TX0_IF_ATTR);
-	tx_dsp = aiao_tx_reg(aiao, AIAO_TX0_DSP_CTRL);
-	tx_addr = aiao_tx_reg(aiao, AIAO_TX0_BUF_ADDR);
-	tx_size = aiao_tx_reg(aiao, AIAO_TX0_BUF_SIZE);
-	tx_wptr = aiao_tx_reg(aiao, AIAO_TX0_BUF_WPTR);
-	tx_rptr = aiao_tx_reg(aiao, AIAO_TX0_BUF_RPTR);
-	tx_alempty = aiao_tx_reg(aiao, AIAO_TX0_BUF_ALEMPTY);
-	tx_trans = aiao_tx_reg(aiao, AIAO_TX0_TRANS_SIZE);
-
-	aiao_update_bits(aiao, tx_crg1, AIAO_CRG_CLK_EN, 0);
-	aiao_write(aiao, tx_crg0,
-		   FIELD_PREP(AIAO_CRG_MCLK_DIV_MASK,
-			      aiao_mclk_div(aiao, params_rate(params))));
-	aiao_write(aiao, tx_crg1, crg1);
-	aiao_write(aiao, tx_crg1, crg1 | AIAO_CRG_CLK_EN);
-	aiao_update_bits(aiao, AIAO_SWITCH_TX_BCLK,
-			 aiao_tx_bclk_mask(aiao), aiao_tx_bclk_value(aiao));
-	aiao_write(aiao, tx_if, if_attr);
+	aiao->config = (struct aiao_tx_config) {
+		.crg0 = FIELD_PREP(AIAO_CRG_MCLK_DIV_MASK,
+				  aiao_mclk_div(aiao, params_rate(params))),
+		.crg1 = FIELD_PREP(AIAO_CRG_BCLK_DIV_MASK, 3) |
+			FIELD_PREP(AIAO_CRG_FSCLK_DIV_MASK, 3),
+		.if_attr = if_attr,
+		.dma_addr = lower_32_bits(runtime->dma_addr),
+		.buffer_bytes = buffer_bytes,
+		.period_bytes = period_bytes,
+		.channel = aiao->tx_channel,
+		.valid = true,
+	};
 
 	aiao->dsp_ctrl = AIAO_TX_MUTE_FADE |
 		FIELD_PREP(AIAO_TX_VOLUME_MASK, 0x79) |
 		FIELD_PREP(AIAO_TX_FADE_IN_MASK, 4) |
 		FIELD_PREP(AIAO_TX_FADE_OUT_MASK, 3);
-	aiao_write(aiao, tx_dsp, aiao->dsp_ctrl);
-	aiao_write(aiao, tx_addr, lower_32_bits(runtime->dma_addr));
-	aiao_write(aiao, tx_size, buffer_bytes);
-	aiao_write(aiao, tx_wptr, 0);
-	aiao_write(aiao, tx_rptr, 0);
-	aiao_write(aiao, tx_alempty, period_bytes);
-	aiao_write(aiao, tx_trans, period_bytes);
+	aiao->prepared = false;
+	aiao->last_pos = 0;
+	aiao_restore_tx_config(aiao);
 
 	dev_dbg(aiao->dev, "AIAO TX%u: %u Hz, %u significant bits\n",
 		aiao->tx_channel, params_rate(params), precision == 1 ? 16 : 24);
@@ -371,9 +409,13 @@ static int hi3798cv200_aiao_hw_free(struct snd_soc_component *component,
 	int ret;
 
 	ret = aiao_stop_tx(aiao);
-	aiao_write(aiao, aiao_tx_crg_reg(aiao, AIAO_TX0_CRG_CFG1), 0);
-	aiao_write(aiao, aiao_tx_reg(aiao, AIAO_TX0_BUF_ADDR), 0);
-	aiao_write(aiao, aiao_tx_reg(aiao, AIAO_TX0_BUF_SIZE), 0);
+	aiao->prepared = false;
+	aiao->config.valid = false;
+	if (READ_ONCE(aiao->powered)) {
+		aiao_write(aiao, aiao_tx_crg_reg(aiao, AIAO_TX0_CRG_CFG1), 0);
+		aiao_write(aiao, aiao_tx_reg(aiao, AIAO_TX0_BUF_ADDR), 0);
+		aiao_write(aiao, aiao_tx_reg(aiao, AIAO_TX0_BUF_SIZE), 0);
+	}
 	return ret;
 }
 
@@ -383,12 +425,19 @@ static int hi3798cv200_aiao_prepare(struct snd_soc_component *component,
 	struct hi3798cv200_aiao *aiao = dev_get_drvdata(component->dev);
 	int ret;
 
+	if (!READ_ONCE(aiao->powered))
+		return -ESTRPIPE;
+	if (!aiao->config.valid)
+		return -EINVAL;
+
 	ret = aiao_stop_tx(aiao);
 	if (ret)
 		return ret;
 	aiao_write(aiao, aiao_tx_reg(aiao, AIAO_TX0_DSP_CTRL), aiao->dsp_ctrl);
 	aiao_write(aiao, aiao_tx_reg(aiao, AIAO_TX0_BUF_WPTR), 0);
 	aiao_write(aiao, aiao_tx_reg(aiao, AIAO_TX0_BUF_RPTR), 0);
+	aiao->last_pos = 0;
+	aiao->prepared = true;
 	return 0;
 }
 
@@ -404,8 +453,9 @@ static int hi3798cv200_aiao_trigger(struct snd_soc_component *component,
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
-	case SNDRV_PCM_TRIGGER_RESUME:
 	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
+		if (!READ_ONCE(aiao->powered) || !aiao->prepared)
+			return -ESTRPIPE;
 		rcu_assign_pointer(aiao->substream, substream);
 		aiao_write(aiao, tx_int_clr, AIAO_TX_INT_ALL);
 		aiao_write(aiao, tx_int_ena,
@@ -415,8 +465,15 @@ static int hi3798cv200_aiao_trigger(struct snd_soc_component *component,
 		aiao_update_bits(aiao, tx_dsp, AIAO_TX_ENABLE, AIAO_TX_ENABLE);
 		return 0;
 
-	case SNDRV_PCM_TRIGGER_STOP:
+	case SNDRV_PCM_TRIGGER_RESUME:
+		/* FIFO contents were lost; only prepare/refill can restart safely. */
+		return -ENOSYS;
+
 	case SNDRV_PCM_TRIGGER_SUSPEND:
+		aiao->prepared = false;
+		return aiao_stop_tx(aiao);
+
+	case SNDRV_PCM_TRIGGER_STOP:
 	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
 		return aiao_stop_tx(aiao);
 
@@ -473,11 +530,16 @@ hi3798cv200_aiao_pointer(struct snd_soc_component *component,
 {
 	struct hi3798cv200_aiao *aiao = dev_get_drvdata(component->dev);
 	struct snd_pcm_runtime *runtime = substream->runtime;
-	u32 pos = aiao_read(aiao, aiao_tx_reg(aiao, AIAO_TX0_BUF_RPTR)) &
+	u32 pos = aiao->last_pos;
+
+	if (!READ_ONCE(aiao->powered) || !aiao->prepared)
+		return bytes_to_frames(runtime, pos);
+	pos = aiao_read(aiao, aiao_tx_reg(aiao, AIAO_TX0_BUF_RPTR)) &
 		AIAO_BUFFER_PTR_MASK;
 
 	if (hi3798cv200_aiao_publish(component, substream, pos))
 		return SNDRV_PCM_POS_XRUN;
+	aiao->last_pos = pos;
 	return bytes_to_frames(runtime, pos);
 }
 
@@ -485,7 +547,11 @@ static int hi3798cv200_aiao_ack(struct snd_soc_component *component,
 				struct snd_pcm_substream *substream)
 {
 	struct hi3798cv200_aiao *aiao = dev_get_drvdata(component->dev);
-	u32 rptr = aiao_read(aiao, aiao_tx_reg(aiao, AIAO_TX0_BUF_RPTR)) &
+	u32 rptr;
+
+	if (!READ_ONCE(aiao->powered) || !aiao->prepared)
+		return -ESTRPIPE;
+	rptr = aiao_read(aiao, aiao_tx_reg(aiao, AIAO_TX0_BUF_RPTR)) &
 		AIAO_BUFFER_PTR_MASK;
 
 	return hi3798cv200_aiao_publish(component, substream, rptr);
@@ -499,8 +565,27 @@ static int hi3798cv200_aiao_pcm_construct(struct snd_soc_component *component,
 					      AIAO_BUFFER_BYTES_MAX);
 }
 
+static int hi3798cv200_aiao_component_suspend(struct snd_soc_component *component)
+{
+	struct hi3798cv200_aiao *aiao = dev_get_drvdata(component->dev);
+
+	/* ASoC has already suspended the PCM, including a paused/prepared one. */
+	aiao->prepared = false;
+	return aiao_stop_tx(aiao);
+}
+
+static int hi3798cv200_aiao_component_resume(struct snd_soc_component *component)
+{
+	struct hi3798cv200_aiao *aiao = dev_get_drvdata(component->dev);
+
+	/* Device resume_early restored configuration, never the playback queue. */
+	return READ_ONCE(aiao->powered) ? 0 : -EIO;
+}
+
 static const struct snd_soc_component_driver hi3798cv200_aiao_component = {
 	.name = "hi3798cv200-aiao",
+	.suspend = hi3798cv200_aiao_component_suspend,
+	.resume = hi3798cv200_aiao_component_resume,
 	.open = hi3798cv200_aiao_open,
 	.close = hi3798cv200_aiao_close,
 	.sync_stop = hi3798cv200_aiao_sync_stop,
@@ -617,6 +702,9 @@ static irqreturn_t hi3798cv200_aiao_irq(int irq, void *data)
 	bool handled = false, acked;
 	u32 top_irq = aiao_tx_top_irq(aiao);
 
+	if (!READ_ONCE(aiao->powered))
+		return IRQ_NONE;
+
 	top = aiao_read(aiao, AIAO_INT_STATUS);
 	if (!top)
 		return IRQ_NONE;
@@ -649,12 +737,127 @@ static irqreturn_t hi3798cv200_aiao_irq(int irq, void *data)
 	return handled ? IRQ_HANDLED : IRQ_NONE;
 }
 
+static int aiao_power_on(struct hi3798cv200_aiao *aiao)
+{
+	u32 val;
+	int ret, reset_ret;
+
+	if (READ_ONCE(aiao->powered))
+		return 0;
+
+	/* CRG restores its parent selectors before device resume_early. */
+	ret = clk_set_rate(aiao->bus_clk, 50000000);
+	if (ret)
+		return ret;
+	ret = clk_set_rate(aiao->mclk, aiao->mclk_rate);
+	if (ret)
+		return ret;
+	if (clk_get_rate(aiao->mclk) != aiao->mclk_rate)
+		return -ERANGE;
+
+	ret = reset_control_assert(aiao->reset);
+	if (ret)
+		return ret;
+	ret = clk_prepare_enable(aiao->mclk);
+	if (ret)
+		return ret;
+	ret = clk_prepare_enable(aiao->bus_clk);
+	if (ret) {
+		clk_disable_unprepare(aiao->mclk);
+		return ret;
+	}
+
+	udelay(1);
+	ret = reset_control_deassert(aiao->reset);
+	if (ret)
+		goto assert_reset;
+	ret = readl_poll_timeout(aiao->base + AIAO_STATUS, val, val & BIT(0),
+				 1, 1000);
+	if (ret) {
+		dev_err(aiao->dev, "controller did not leave reset\n");
+		goto assert_reset;
+	}
+
+	aiao_update_bits(aiao, AIAO_OUTSTANDING, AIAO_OUTSTANDING_MASK, 2);
+	aiao_write(aiao, AIAO_INT_ENA, 0);
+	aiao_write(aiao, aiao_tx_reg(aiao, AIAO_TX0_INT_ENA), 0);
+	aiao_write(aiao, aiao_tx_reg(aiao, AIAO_TX0_INT_CLR), AIAO_TX_INT_ALL);
+	aiao_restore_tx_config(aiao);
+	aiao->stop_error = 0;
+	WRITE_ONCE(aiao->powered, true);
+	return 0;
+
+assert_reset:
+	reset_ret = reset_control_assert(aiao->reset);
+	if (reset_ret)
+		dev_err(aiao->dev, "failed to reassert reset: %d\n", reset_ret);
+	clk_disable_unprepare(aiao->bus_clk);
+	clk_disable_unprepare(aiao->mclk);
+	return ret;
+}
+
+static int hi3798cv200_aiao_suspend_late(struct device *dev)
+{
+	struct hi3798cv200_aiao *aiao = dev_get_drvdata(dev);
+	int ret;
+
+	if (!READ_ONCE(aiao->powered))
+		return 0;
+	/* An ignore_suspend link must not silently lose an active DMA stream. */
+	if (rcu_access_pointer(aiao->substream))
+		return -EBUSY;
+
+	/* All cards have completed their normal ASoC/PCM suspend callbacks. */
+	aiao->prepared = false;
+	ret = aiao_stop_tx(aiao);
+	if (ret)
+		return ret;
+
+	/* Never wait for period_elapsed while holding reg_lock/ALSA's lock. */
+	WRITE_ONCE(aiao->powered, false);
+	synchronize_irq(aiao->irq);
+	synchronize_rcu();
+	ret = reset_control_assert(aiao->reset);
+	if (ret) {
+		WRITE_ONCE(aiao->powered, true);
+		return ret;
+	}
+	clk_disable_unprepare(aiao->bus_clk);
+	clk_disable_unprepare(aiao->mclk);
+	return 0;
+}
+
+static int hi3798cv200_aiao_resume_early(struct device *dev)
+{
+	struct hi3798cv200_aiao *aiao = dev_get_drvdata(dev);
+	int ret;
+
+	/* Restore before the card's deferred component resume, never start DMA. */
+	ret = aiao_power_on(aiao);
+	if (ret)
+		dev_err(dev, "failed to restore AIAO: %d\n", ret);
+	return ret;
+}
+
+static const struct dev_pm_ops hi3798cv200_aiao_pm_ops = {
+	LATE_SYSTEM_SLEEP_PM_OPS(hi3798cv200_aiao_suspend_late,
+				hi3798cv200_aiao_resume_early)
+};
+
 static void hi3798cv200_aiao_disable(void *data)
 {
 	struct hi3798cv200_aiao *aiao = data;
+	int ret;
 
+	if (!READ_ONCE(aiao->powered))
+		return;
 	aiao_stop_tx(aiao);
-	reset_control_assert(aiao->reset);
+	WRITE_ONCE(aiao->powered, false);
+	synchronize_irq(aiao->irq);
+	synchronize_rcu();
+	ret = reset_control_assert(aiao->reset);
+	if (ret)
+		dev_err(aiao->dev, "failed to assert reset on removal: %d\n", ret);
 	clk_disable_unprepare(aiao->bus_clk);
 	clk_disable_unprepare(aiao->mclk);
 }
@@ -663,7 +866,6 @@ static int hi3798cv200_aiao_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct hi3798cv200_aiao *aiao;
-	u32 val;
 	int ret;
 
 	aiao = devm_kzalloc(dev, sizeof(*aiao), GFP_KERNEL);
@@ -707,55 +909,16 @@ static int hi3798cv200_aiao_probe(struct platform_device *pdev)
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to set DMA mask\n");
 
-	ret = clk_set_rate(aiao->bus_clk, 50000000);
-	if (ret)
-		return dev_err_probe(dev, ret, "failed to select 50 MHz bus clock\n");
-
 	aiao->mclk_rate = of_device_is_compatible(dev->of_node,
 						 "hisilicon,hi3798mv310-aiao") ?
 		860160000 : AIAO_EPLL_RATE;
-	ret = clk_set_rate(aiao->mclk, aiao->mclk_rate);
-	if (ret)
-		return dev_err_probe(dev, ret, "failed to select audio PLL clock\n");
-	if (clk_get_rate(aiao->mclk) != aiao->mclk_rate)
-		return dev_err_probe(dev, -ERANGE, "unexpected audio PLL rate\n");
-
-	ret = reset_control_assert(aiao->reset);
-	if (ret)
-		return dev_err_probe(dev, ret, "failed to assert reset\n");
-
-	ret = clk_prepare_enable(aiao->mclk);
-	if (ret)
-		return dev_err_probe(dev, ret, "failed to enable master clock\n");
-
-	ret = clk_prepare_enable(aiao->bus_clk);
-	if (ret) {
-		clk_disable_unprepare(aiao->mclk);
-		return dev_err_probe(dev, ret, "failed to enable bus clock\n");
-	}
-
-	udelay(1);
-	ret = reset_control_deassert(aiao->reset);
-	if (ret)
-		goto disable_clocks;
-
-	ret = readl_poll_timeout(aiao->base + AIAO_STATUS, val, val & BIT(0),
-				 1, 1000);
-	if (ret) {
-		dev_err(dev, "controller did not leave reset\n");
-		goto assert_reset;
-	}
-
-	aiao_update_bits(aiao, AIAO_OUTSTANDING,
-			 AIAO_OUTSTANDING_MASK, 2);
-	aiao_write(aiao, AIAO_INT_ENA, 0);
-	aiao_write(aiao, aiao_tx_reg(aiao, AIAO_TX0_INT_ENA), 0);
-	aiao_write(aiao, aiao_tx_reg(aiao, AIAO_TX0_INT_CLR), AIAO_TX_INT_ALL);
 	aiao->irq = platform_get_irq(pdev, 0);
-	if (aiao->irq < 0) {
-		ret = aiao->irq;
-		goto assert_reset;
-	}
+	if (aiao->irq < 0)
+		return aiao->irq;
+
+	ret = aiao_power_on(aiao);
+	if (ret)
+		return dev_err_probe(dev, ret, "failed to power on AIAO\n");
 
 	platform_set_drvdata(pdev, aiao);
 	ret = devm_add_action_or_reset(dev, hi3798cv200_aiao_disable, aiao);
@@ -772,13 +935,6 @@ static int hi3798cv200_aiao_probe(struct platform_device *pdev)
 					       &hi3798cv200_aiao_component,
 					       hi3798cv200_aiao_dais,
 					       ARRAY_SIZE(hi3798cv200_aiao_dais));
-
-assert_reset:
-	reset_control_assert(aiao->reset);
-disable_clocks:
-	clk_disable_unprepare(aiao->bus_clk);
-	clk_disable_unprepare(aiao->mclk);
-	return ret;
 }
 
 static const struct of_device_id hi3798cv200_aiao_of_match[] = {
@@ -793,6 +949,7 @@ static struct platform_driver hi3798cv200_aiao_driver = {
 	.driver = {
 		.name = "hi3798cv200-aiao",
 		.of_match_table = hi3798cv200_aiao_of_match,
+		.pm = pm_sleep_ptr(&hi3798cv200_aiao_pm_ops),
 	},
 };
 module_platform_driver(hi3798cv200_aiao_driver);
