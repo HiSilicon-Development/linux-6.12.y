@@ -10,12 +10,14 @@
 #include <linux/bits.h>
 #include <linux/bitrev.h>
 #include <linux/clk.h>
+#include <linux/delay.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/math64.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/pm.h>
 #include <linux/property.h>
 #include <linux/reset.h>
 #include <linux/serial.h>
@@ -168,6 +170,8 @@ struct histb_sci_port {
 	bool atr_tck_required;
 	bool atr_has_char_guard;
 	bool opened;
+	bool pm_blocked;
+	int shutdown_error;
 	bool card_present;
 	bool tx_active;
 	bool tx_drain_pending;
@@ -1129,6 +1133,11 @@ static int histb_sci_startup(struct uart_port *port)
 	unsigned long flags;
 	int ret;
 
+	/* A powered-down card cannot continue an APDU or negotiated PPS session. */
+	if (sci->pm_blocked)
+		return -EHOSTDOWN;
+	sci->shutdown_error = 0;
+
 	/* serial_core owns this line now, and RX producers are still stopped. */
 	tty_buffer_set_workqueue(sci->tty_port, sci->rx_workqueue);
 
@@ -1195,7 +1204,9 @@ static void histb_sci_shutdown(struct uart_port *port)
 
 	free_irq(port->irq, sci);
 	cancel_delayed_work_sync(&sci->activate_work);
-	reset_control_assert(sci->reset);
+	/* Match the BSP FINISH deactivation interval before gating card clocks. */
+	msleep(10);
+	sci->shutdown_error = reset_control_assert(sci->reset);
 	clk_disable_unprepare(sci->clk);
 }
 
@@ -1555,6 +1566,58 @@ static void histb_sci_remove(struct platform_device *pdev)
 	cancel_delayed_work_sync(&sci->activate_work);
 }
 
+static int histb_sci_suspend(struct device *dev)
+{
+	struct histb_sci_port *sci = dev_get_drvdata(dev);
+	struct tty_port *tport = sci->tty_port;
+	int ret;
+
+	/* Serialize against open/startup without holding locks across hangup. */
+	mutex_lock(&tport->mutex);
+	sci->pm_blocked = true;
+	sci->shutdown_error = 0;
+	mutex_unlock(&tport->mutex);
+
+	/*
+	 * This synchronously calls serial_core's flush/shutdown path: TX/RX
+	 * are masked under the UART lock, free_irq drains the handler, FINISH
+	 * powers the card down and activation work is cancelled before clock-off.
+	 * Existing descriptors see hangup, never a transparent old card session.
+	 */
+	tty_port_tty_vhangup(tport);
+	flush_workqueue(sci->rx_workqueue);
+	cancel_delayed_work_sync(&sci->activate_work);
+	mutex_lock(&tport->mutex);
+	memset(&sci->port.iso7816, 0, sizeof(sci->port.iso7816));
+	ret = sci->shutdown_error;
+	mutex_unlock(&tport->mutex);
+	if (!ret)
+		ret = uart_suspend_port(&histb_sci_uart_driver, &sci->port);
+	if (ret) {
+		mutex_lock(&tport->mutex);
+		sci->pm_blocked = false;
+		mutex_unlock(&tport->mutex);
+	}
+	return ret;
+}
+
+static int histb_sci_resume(struct device *dev)
+{
+	struct histb_sci_port *sci = dev_get_drvdata(dev);
+	int ret;
+
+	/* No old session is restarted. Reopen runs hw_init and fresh ATR setup. */
+	ret = uart_resume_port(&histb_sci_uart_driver, &sci->port);
+	mutex_lock(&sci->tty_port->mutex);
+	if (!ret)
+		sci->pm_blocked = false;
+	mutex_unlock(&sci->tty_port->mutex);
+	return ret;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(histb_sci_pm_ops, histb_sci_suspend,
+			      histb_sci_resume);
+
 static const struct of_device_id histb_sci_of_match[] = {
 	{ .compatible = "hisilicon,hi3798cv200-sci" },
 	{ }
@@ -1567,6 +1630,7 @@ static struct platform_driver histb_sci_platform_driver = {
 	.driver = {
 		.name = "hi3798cv200-sci",
 		.of_match_table = histb_sci_of_match,
+		.pm = pm_sleep_ptr(&histb_sci_pm_ops),
 	},
 };
 

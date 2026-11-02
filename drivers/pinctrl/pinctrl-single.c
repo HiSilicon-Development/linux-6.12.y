@@ -1971,7 +1971,12 @@ static const struct pcs_soc_data pinconf_single = {
 	.flags = PCS_FEAT_PINCONF,
 };
 
+static const struct pcs_soc_data pinconf_single_cv200 = {
+	.flags = PCS_FEAT_PINCONF | PCS_CONTEXT_LOSS_OFF,
+};
+
 static const struct of_device_id pcs_of_match[] = {
+	{ .compatible = "hisilicon,hi3798cv200-pinconf", .data = &pinconf_single_cv200 },
 	{ .compatible = "ti,am437-padconf", .data = &pinctrl_single_am437x },
 	{ .compatible = "ti,am654-padconf", .data = &pinctrl_single_am654 },
 	{ .compatible = "ti,dra7-padconf", .data = &pinctrl_single_dra7 },

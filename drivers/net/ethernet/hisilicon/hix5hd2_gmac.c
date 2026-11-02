@@ -15,6 +15,7 @@
 #include <linux/clk.h>
 #include <linux/rtnetlink.h>
 #include <linux/circ_buf.h>
+#include <linux/pm.h>
 
 #define STATION_ADDR_LOW		0x0000
 #define STATION_ADDR_HIGH		0x0004
@@ -290,9 +291,13 @@ struct hix5hd2_priv {
 	struct mii_bus *bus;
 	struct napi_struct napi;
 	struct work_struct tx_timeout_task;
+	bool suspended;
+	bool resume_running;
+	bool needs_phy_reset;
 };
 
 static int hix5hd2_mac_core_reset(struct hix5hd2_priv *priv);
+static int hix5hd2_phy_reset(struct hix5hd2_priv *priv);
 
 static inline void hix5hd2_mac_interface_reset(struct hix5hd2_priv *priv)
 {
@@ -431,6 +436,8 @@ static void hix5hd2_hw_init(struct hix5hd2_priv *priv)
 
 static void hix5hd2_irq_enable(struct hix5hd2_priv *priv)
 {
+	if (READ_ONCE(priv->suspended))
+		return;
 	writel_relaxed(DEF_INT_MASK, priv->base + ENA_PMU_INT);
 }
 
@@ -658,7 +665,8 @@ static void hix5hd2_xmit_reclaim(struct net_device *dev)
 	if (pkts_compl || bytes_compl)
 		netdev_completed_queue(dev, pkts_compl, bytes_compl);
 
-	if (unlikely(netif_queue_stopped(priv->netdev)) && pkts_compl)
+	if (unlikely(netif_queue_stopped(priv->netdev)) && pkts_compl &&
+	    !READ_ONCE(priv->suspended))
 		netif_wake_queue(priv->netdev);
 }
 
@@ -898,6 +906,19 @@ static int hix5hd2_net_open(struct net_device *dev)
 			return ret;
 		}
 
+		if (priv->needs_phy_reset) {
+			ret = reset_control_assert(priv->mac_ifc_rst);
+			if (!ret)
+				ret = reset_control_deassert(priv->mac_ifc_rst);
+			if (!ret && priv->phy_rst)
+				ret = hix5hd2_phy_reset(priv);
+			if (ret) {
+				clk_disable_unprepare(priv->mac_ifc_clk);
+				clk_disable_unprepare(priv->mac_core_clk);
+				return ret;
+			}
+		}
+
 		priv->speed = SPEED_UNKNOWN;
 		priv->duplex = DUPLEX_UNKNOWN;
 
@@ -911,6 +932,19 @@ static int hix5hd2_net_open(struct net_device *dev)
 		clk_disable_unprepare(priv->mac_ifc_clk);
 		clk_disable_unprepare(priv->mac_core_clk);
 		return -ENODEV;
+	}
+
+	if (priv->variant->cv200_policy) {
+		/* The MDIO child must never touch registers after MAC clock-off. */
+		phy->mac_managed_pm = true;
+		ret = phy_resume(phy);
+		if (ret) {
+			phy_disconnect(phy);
+			clk_disable_unprepare(priv->mac_ifc_clk);
+			clk_disable_unprepare(priv->mac_core_clk);
+			return ret;
+		}
+		priv->needs_phy_reset = false;
 	}
 
 	if (priv->variant->cv200_policy)
@@ -932,6 +966,16 @@ static int hix5hd2_net_open(struct net_device *dev)
 static int hix5hd2_net_close(struct net_device *dev)
 {
 	struct hix5hd2_priv *priv = netdev_priv(dev);
+
+	/* A failed system resume leaves an attached but stopped interface. */
+	if (priv->suspended) {
+		if (dev->phydev)
+			phy_disconnect(dev->phydev);
+		priv->suspended = false;
+		priv->resume_running = false;
+		netif_device_attach(dev);
+		return 0;
+	}
 
 	hix5hd2_port_disable(priv);
 	hix5hd2_irq_disable(priv);
@@ -957,7 +1001,7 @@ static void hix5hd2_tx_timeout_task(struct work_struct *work)
 
 	priv = container_of(work, struct hix5hd2_priv, tx_timeout_task);
 	rtnl_lock();
-	if (netif_running(priv->netdev)) {
+	if (netif_running(priv->netdev) && !priv->suspended) {
 		dev_close(priv->netdev);
 		if (dev_open(priv->netdev, NULL))
 			netdev_err(priv->netdev, "failed to reopen after TX timeout\n");
@@ -1358,6 +1402,20 @@ static int hix5hd2_dev_probe(struct platform_device *pdev)
 		goto err_mdiobus;
 	}
 
+	if (priv->variant->cv200_policy) {
+		struct phy_device *phy = of_phy_find_device(priv->phy_node);
+
+		if (!phy) {
+			ret = -EPROBE_DEFER;
+			goto out_phy_node;
+		}
+		phy->mac_managed_pm = true;
+		ret = phy_suspend(phy);
+		put_device(&phy->mdio.dev);
+		if (ret)
+			goto out_phy_node;
+	}
+
 	ndev->irq = platform_get_irq(pdev, 0);
 	if (ndev->irq < 0) {
 		ret = ndev->irq;
@@ -1452,6 +1510,118 @@ static void hix5hd2_dev_remove(struct platform_device *pdev)
 	free_netdev(ndev);
 }
 
+static int hix5hd2_suspend(struct device *dev)
+{
+	struct net_device *ndev = dev_get_drvdata(dev);
+	struct hix5hd2_priv *priv = netdev_priv(ndev);
+	int ret;
+
+	if (!priv->variant->cv200_policy)
+		return 0;
+	/* No proven DMA-idle indication exists without the core reset. */
+	if (!priv->mac_core_rst)
+		return -EOPNOTSUPP;
+
+	cancel_work_sync(&priv->tx_timeout_task);
+	rtnl_lock();
+	priv->resume_running = netif_running(ndev);
+	if (!priv->resume_running) {
+		priv->needs_phy_reset = true;
+		goto out;
+	}
+
+	netif_device_detach(ndev);
+	WRITE_ONCE(priv->suspended, true);
+	netif_tx_disable(ndev);
+	phy_stop(ndev->phydev);
+	hix5hd2_irq_disable(priv);
+	hix5hd2_port_disable(priv);
+	/* Complete posted engine/interrupt disables before draining software. */
+	readl(priv->base + DESC_WR_RD_ENA);
+	synchronize_irq(ndev->irq);
+	napi_disable(&priv->napi);
+	/* A poll completing during the first mask must not leave IRQs enabled. */
+	hix5hd2_irq_disable(priv);
+	readl(priv->base + ENA_PMU_INT);
+	synchronize_irq(ndev->irq);
+	/* PHY MDIO transactions must finish while the MAC clock is available. */
+	ret = phy_suspend(ndev->phydev);
+	if (ret)
+		goto resume_phy;
+	/* Disconnect drains PHY IRQ/work and MDIO before resetting its bus. */
+	phy_disconnect(ndev->phydev);
+	ret = reset_control_assert(priv->mac_core_rst);
+	if (ret)
+		goto resume_phy;
+	/* The reset now owns DMA; no descriptor can be fetched or written. */
+	hix5hd2_free_dma_desc_rings(priv);
+	clk_disable_unprepare(priv->mac_ifc_clk);
+	clk_disable_unprepare(priv->mac_core_clk);
+	priv->suspended = true;
+	priv->needs_phy_reset = true;
+out:
+	rtnl_unlock();
+	return 0;
+
+resume_phy:
+	WRITE_ONCE(priv->suspended, false);
+	napi_enable(&priv->napi);
+	if (!ndev->phydev &&
+	    !of_phy_connect(ndev, priv->phy_node, hix5hd2_adjust_link, 0,
+			    priv->phy_mode)) {
+		netdev_err(ndev, "could not reconnect PHY during suspend rollback\n");
+		priv->resume_running = false;
+		rtnl_unlock();
+		return -ENODEV;
+	}
+	{
+		int err = phy_resume(ndev->phydev);
+
+		if (err) {
+			netdev_err(ndev, "PHY suspend rollback failed: %d\n", err);
+			priv->resume_running = false;
+			rtnl_unlock();
+			return err;
+		}
+	}
+	hix5hd2_port_enable(priv);
+	hix5hd2_irq_enable(priv);
+	phy_start(ndev->phydev);
+	netif_device_attach(ndev);
+	netif_wake_queue(ndev);
+	priv->resume_running = false;
+	rtnl_unlock();
+	return ret;
+}
+
+static int hix5hd2_resume(struct device *dev)
+{
+	struct net_device *ndev = dev_get_drvdata(dev);
+	struct hix5hd2_priv *priv = netdev_priv(ndev);
+	int ret = 0;
+
+	if (!priv->variant->cv200_policy)
+		return 0;
+	rtnl_lock();
+	if (priv->resume_running) {
+		/* The regular open path restores clocks, reset, PHY and all rings. */
+		WRITE_ONCE(priv->suspended, false);
+		ret = hix5hd2_net_open(ndev);
+		if (!ret) {
+			priv->suspended = false;
+			priv->resume_running = false;
+			netif_device_attach(ndev);
+		} else {
+			WRITE_ONCE(priv->suspended, true);
+		}
+	}
+	rtnl_unlock();
+	return ret;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(hix5hd2_pm_ops, hix5hd2_suspend,
+			      hix5hd2_resume);
+
 static const struct of_device_id hix5hd2_of_match[] = {
 	{ .compatible = "hisilicon,hisi-gmac-v1",
 	  .data = &hix5hd2_generic_variant },
@@ -1472,6 +1642,7 @@ static struct platform_driver hix5hd2_dev_driver = {
 	.driver = {
 		.name = "hisi-gmac",
 		.of_match_table = hix5hd2_of_match,
+		.pm = pm_sleep_ptr(&hix5hd2_pm_ops),
 	},
 	.probe = hix5hd2_dev_probe,
 	.remove_new = hix5hd2_dev_remove,

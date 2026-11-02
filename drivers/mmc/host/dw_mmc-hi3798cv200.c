@@ -724,6 +724,13 @@ static void dw_mci_hi3798cv200_remove(struct platform_device *pdev)
 	dw_mci_pltfm_remove(pdev);
 }
 
+/* Host runtime PM is not enabled here. Force-runtime helpers would see the
+ * default SUSPENDED status and skip restoring registers lost in deep sleep.
+ * The card's runtime resume must find interrupts and IDMAC ready for CMD0.
+ */
+static DEFINE_SIMPLE_DEV_PM_OPS(dw_mci_hi3798cv200_pmops,
+			      dw_mci_runtime_suspend, dw_mci_runtime_resume);
+
 static const struct of_device_id dw_mci_hi3798cv200_match[] = {
 	{ .compatible = "hisilicon,hi3798cv200-dw-mshc", },
 	{},
@@ -737,7 +744,7 @@ static struct platform_driver dw_mci_hi3798cv200_driver = {
 		.name = "dwmmc_hi3798cv200",
 		.probe_type = PROBE_PREFER_ASYNCHRONOUS,
 		.of_match_table = dw_mci_hi3798cv200_match,
-		.pm = &dw_mci_pltfm_pmops,
+		.pm = pm_sleep_ptr(&dw_mci_hi3798cv200_pmops),
 	},
 };
 module_platform_driver(dw_mci_hi3798cv200_driver);

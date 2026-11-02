@@ -263,6 +263,9 @@ struct uart_amba_port {
 	char			type[12];
 	bool			rs485_tx_started;
 	unsigned int		rs485_tx_drain_interval; /* usecs */
+#ifdef CONFIG_PM_SLEEP
+	unsigned int		suspend_cr;
+#endif
 #ifdef CONFIG_DMA_ENGINE
 	/* DMA stuff */
 	unsigned int		dmacr;		/* dma control reg */
@@ -2838,9 +2841,16 @@ static void pl011_remove(struct amba_device *dev)
 static int pl011_suspend(struct device *dev)
 {
 	struct uart_amba_port *uap = dev_get_drvdata(dev);
+	unsigned long flags;
 
 	if (!uap)
 		return -EINVAL;
+	if (!console_suspend_enabled && uart_console(&uap->port) &&
+	    !uap->vendor->always_enabled) {
+		uart_port_lock_irqsave(&uap->port, &flags);
+		uap->suspend_cr = pl011_read(uap, REG_CR);
+		uart_port_unlock_irqrestore(&uap->port, flags);
+	}
 
 	return uart_suspend_port(&amba_reg, &uap->port);
 }
@@ -2848,11 +2858,25 @@ static int pl011_suspend(struct device *dev)
 static int pl011_resume(struct device *dev)
 {
 	struct uart_amba_port *uap = dev_get_drvdata(dev);
+	unsigned long flags;
+	int ret;
 
 	if (!uap)
 		return -EINVAL;
 
-	return uart_resume_port(&amba_reg, &uap->port);
+	ret = uart_resume_port(&amba_reg, &uap->port);
+	if (!ret && !console_suspend_enabled && uart_console(&uap->port) &&
+	    !uap->vendor->always_enabled) {
+		/* The core skips startup for a live console. set_termios restores
+		 * baud/RXE, but not UARTEN or the interrupt mask lost with power.
+		 * Console writes enable TX only temporarily, hiding broken RX.
+		 */
+		uart_port_lock_irqsave(&uap->port, &flags);
+		pl011_write(uap->suspend_cr, uap, REG_CR);
+		pl011_write(uap->im, uap, REG_IMSC);
+		uart_port_unlock_irqrestore(&uap->port, flags);
+	}
+	return ret;
 }
 #endif
 
