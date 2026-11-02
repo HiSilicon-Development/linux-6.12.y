@@ -1,0 +1,73 @@
+What:		/sys/bus/platform/devices/standby-controller/wakeup_config
+Date:		November 2026
+Contact:	linux-arm-kernel@lists.infradead.org
+Description:
+		CV200 DVBIP CVPM ABI 1 wake policy, root read/write only.
+		Four base-0 unsigned 32-bit numbers: enabled_mask timeout_seconds
+		raw_ir_low raw_ir_high. Bit 0 enables IR; bit 1 enables the C51
+		relative timer. Initial policy is "0x2 30 0x00000000 0x00000000"
+		unless overridden in DT. Enabled timer requires 1..4294967294
+		seconds. Disabled timer requires timeout_seconds=0; at least one
+		supported wake source is mandatory. IR words are the selected C51
+		raw parser's values, not Linux rc-core scancodes. Configuration is
+		frozen throughout suspend and after a failed firmware disarm.
+		This is not a generic register-write, OTP, or security control.
+
+What:		/sys/bus/platform/devices/standby-controller/firmware
+Date:		November 2026
+Contact:	linux-arm-kernel@lists.infradead.org
+Description:
+		Root-readable CVPM ABI version and advertised wake capabilities.
+		Presence proves discovery of the expected resident monitor, not
+		that a particular fuse/OEM policy permits C51 takeover or that a
+		hardware suspend/resume has succeeded. CONFIG errors are propagated
+		when a transition is attempted.
+		CONFIG, LAST_WAKE and CANCEL are serialized global operations and
+		may be called on any CPU. Linux prepares before offlining secondary
+		CPUs and unwinds after re-enabling them. Only the actual ENTER
+		operation requires CPU0 with all secondary CPUs offline.
+		Deep resume also requires controller context restoration, not just
+		a successful firmware return. CV200 pinconf saves/restores its pad
+		registers in noirq PM; DW-MMC restores controller interrupts and
+		IDMAC before the card can runtime-resume; the monitor preserves
+		SC_GEN17's boot-selected GPU SVB corner for the existing OPP policy.
+		With no_console_suspend, PL011 must retain/restore its live console
+		control register and interrupt mask: TX polling can still print
+		with UARTEN lost while interactive RX no longer works.
+		ENTER additionally requires a settled core-bus clock selector and
+		empty Secure/Non-secure GIC active-priority registers. A late pending
+		interrupt rejects entry with -EBUSY; the monitor does not acknowledge
+		or discard it. This restricted contract is not a full interrupt-stack
+		or secure-payload context switch. Resume verifies the core-bus mux
+		acknowledgement and clears the CV200 GEN0 retention marker.
+		CV200 USB2 host nodes must use their matching compatible, six CCF
+		clocks and four shared reset lines. Their INNO PHY init references
+		remain owned across system sleep, with power references still balanced.
+		The provider restores MODE and analog state in resume_early, before
+		normal host resume accesses controller MMIO. A failed provider restore
+		is propagated rather than bypassed. This does not add USB wake support.
+
+What:		/sys/bus/platform/devices/standby-controller/last_wake
+Date:		November 2026
+Contact:	linux-arm-kernel@lists.infradead.org
+Description:
+		Root-readable snapshot captured once after a real firmware resume,
+		before stopping/cancelling the MCU. Reports source, MCU elapsed
+		whole seconds and raw IR words. Before a valid wake, or on an
+		invalid/stale firmware record, prints "unavailable error=<errno>".
+		A timeout is source 2. Snapshot reads do not consume the cached
+		kernel result. No absent cause is converted into a fabricated IR
+		or timer wake.
+
+What:		/sys/bus/platform/devices/standby-controller/stats
+Date:		November 2026
+Contact:	linux-arm-kernel@lists.infradead.org
+Description:
+		Root-readable attempts, actual firmware resumes, aborted
+		transitions, active/armed flags, first transition error, cancellation
+		error, wake-record error and sleep-time-injection state. A resume
+		count means cpu_resume returned; it does not certify every device,
+		DDR byte, clock, audio sample or retained application transaction.
+		PM debug tests that return before ENTER increment attempts and
+		aborted, not resumes. A successful test must leave active/armed
+		clear and last_error/cancel_error zero; it is not a deep-wake pass.

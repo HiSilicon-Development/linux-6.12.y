@@ -26,6 +26,21 @@ config SOC_HI3798CV200
 	  so builds for other SoCs retain their upstream behavior. Runtime
 	  compatible data still selects each hardware-specific operation.
 
+config HI3798CV200_PM
+	bool "DVBIP Hi3798CV200 deep standby"
+	depends on SOC_HI3798CV200 && ARM64 && OF
+	depends on SUSPEND && ARM_PSCI_FW && HOTPLUG_CPU
+	depends on RTC_CLASS=y && RTC_HCTOSYS
+	help
+	  Enable memory-retaining whole-system standby on CV200 DVBIP boards
+	  using the CVPM ABI 1 resident EL3 monitor and its standby MCU.
+	  Requires an enabled hisilicon,hi3798cv200-pm device-tree node with
+	  system-power-controller and matching boot firmware. Missing or
+	  unsupported firmware does not acquire suspend ops; secure firmware
+	  authority and board wake routing remain prerequisites.
+	  Wake configuration is root-only sysfs, initially a 30-second timer
+	  unless overridden in the device tree; no IR key is guessed.
+
 config HISTB_RTL8211F_LED
 	bool "HiSTB RTL8211F link and activity LED wiring"
 	depends on SOC_HI3798CV200 && OF && PHYLIB=y

@@ -1,0 +1,63 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/power/hisilicon,hi3798cv200-pm.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: HiSilicon Hi3798CV200 resident-monitor system standby
+
+maintainers:
+  - linux-arm-kernel@lists.infradead.org
+
+description: |
+  CV200 DVBIP board integration with the CVPM ABI 1 resident EL3 monitor
+  and the CV200 C51 standby controller. The monitor supplies PSCI CPU
+  lifecycle operations; this device owns the platform suspend-to-RAM policy
+  and the versioned CVPM SiP interface. It must not be enabled with a spin-table-only cold
+  handoff or an unrelated vendor monitor. Wakeup policy is restricted to
+  the capabilities returned by that monitor. The timeout is a C51 relative
+  countdown, not a battery-backed RTC alarm. Enabling this node does not
+  make unsupported secure firmware, OEM authority, MCU ownership or board
+  wake routes available. The host rejects an absent or incompatible CVPM
+  QUERY response instead of installing suspend operations.
+
+properties:
+  compatible:
+    const: hisilicon,hi3798cv200-pm
+
+  system-power-controller:
+    type: boolean
+
+  hisilicon,wakeup-timeout-sec:
+    minimum: 0
+    maximum: 4294967294
+    default: 30
+    description: |
+      Initial relative timer wakeup in seconds. Zero disables the timer and
+      is valid only when another supported wake source is configured. A
+      nonzero timeout provides relative timer wake without requiring IR.
+
+  hisilicon,ir-power-key:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 2
+    maxItems: 2
+    description: |
+      Raw low and high IR words compared by the selected C51 firmware.
+      These are not Linux rc-core scancodes. Omit the property until the
+      actual remote encoding has been established for this board. The
+      property enables IR wakeup in addition to any configured timer.
+
+required:
+  - compatible
+  - system-power-controller
+
+additionalProperties: false
+
+examples:
+  - |
+    standby-controller {
+        compatible = "hisilicon,hi3798cv200-pm";
+        system-power-controller;
+        hisilicon,wakeup-timeout-sec = <30>;
+    };
+...
