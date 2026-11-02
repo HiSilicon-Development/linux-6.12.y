@@ -38,6 +38,9 @@ struct mxl214_state {
 	struct mxl214_channel channels[MXL214_NUM_FRONTENDS];
 	unsigned int device_id;
 	unsigned int lock_timeout_ms;
+	unsigned long resume_frontends;
+	bool suspended;
+	bool force_firmware;
 	bool three_wire;
 	bool initialized;
 	bool removed;

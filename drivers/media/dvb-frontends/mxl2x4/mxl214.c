@@ -14,6 +14,7 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_device.h>
+#include <linux/pm.h>
 #include <linux/slab.h>
 #include <linux/units.h>
 #include <media/mxl214.h>
@@ -172,6 +173,8 @@ static int mxl214_hw_init_locked(struct mxl214_state *state)
 
 	if (state->removed)
 		return -ENODEV;
+	if (state->suspended)
+		return -EHOSTDOWN;
 
 	if (state->initialized)
 		return 0;
@@ -206,7 +209,7 @@ static int mxl214_hw_init_locked(struct mxl214_state *state)
 						      &version);
 	if (status != MXL_SUCCESS)
 		goto fail;
-	if (!version.firmwareDownloaded) {
+	if (state->force_firmware || !version.firmwareDownloaded) {
 		ret = request_firmware(&firmware, MXL214_FIRMWARE,
 				       &state->client->dev);
 		if (ret) {
@@ -280,6 +283,7 @@ static int mxl214_hw_init_locked(struct mxl214_state *state)
 	}
 
 	state->initialized = true;
+	state->force_firmware = false;
 	return 0;
 
 release_firmware:
@@ -521,9 +525,24 @@ static int mxl214_init(struct dvb_frontend *frontend)
 
 static int mxl214_sleep(struct dvb_frontend *frontend)
 {
-	(void)frontend;
-	/* Frontends share one chip, so keep its lifetime device-scoped. */
-	return 0;
+	struct mxl214_channel *channel = frontend->demodulator_priv;
+	struct mxl214_state *state = channel->state;
+	MXL_STATUS_E status;
+	int ret = 0;
+
+	mutex_lock(&state->lock);
+	if (state->initialized && channel->demod_enabled) {
+		status = MxLWare_HRCLS_API_CfgDemodEnable(state->device_id,
+			channel->id, MXL_FALSE);
+		ret = mxl214_api_result(state, channel->id,
+					"sleep demod disable", status);
+		if (!ret) {
+			channel->demod_enabled = false;
+			channel->locked = false;
+		}
+	}
+	mutex_unlock(&state->lock);
+	return ret;
 }
 
 static int mxl214_set_frontend(struct dvb_frontend *frontend)
@@ -896,6 +915,8 @@ struct dvb_frontend *mxl214_get_frontend(struct i2c_client *client,
 	mutex_lock(&state->lock);
 	if (state->removed) {
 		frontend = ERR_PTR(-ENODEV);
+	} else if (state->suspended) {
+		frontend = ERR_PTR(-EHOSTDOWN);
 	} else if (state->channels[id].claimed) {
 		frontend = ERR_PTR(-EBUSY);
 	} else if (!try_module_get(THIS_MODULE)) {
@@ -956,6 +977,14 @@ static int mxl214_probe(struct i2c_client *client)
 		return device_id;
 	}
 
+
+	/* Also cache when boot firmware was reusable and no download was needed. */
+	ret = firmware_request_cache(&client->dev, MXL214_FIRMWARE);
+	if (ret) {
+		mxl214_free_device_id(state->device_id);
+		kref_put(&state->refcount, mxl214_free_state);
+		return ret;
+	}
 	ret = mxl214_hw_init_locked(state);
 	if (ret) {
 		mxl214_free_device_id(state->device_id);
@@ -998,6 +1027,100 @@ static void mxl214_remove(struct i2c_client *client)
 	kref_put(&state->refcount, mxl214_free_state);
 }
 
+static int mxl214_resume(struct device *dev)
+{
+	struct mxl214_state *state = dev_get_drvdata(dev);
+	unsigned long frontends;
+	unsigned int i;
+	int ret, err;
+
+	mutex_lock(&state->lock);
+	frontends = state->resume_frontends;
+	state->suspended = false;
+	/* Full GPIO reset, real firmware query/download and XPT/tuner setup. */
+	ret = mxl214_hw_init_locked(state);
+	if (ret) {
+		state->suspended = true;
+		gpiod_set_value_cansleep(state->reset_gpio, 1);
+	}
+	mutex_unlock(&state->lock);
+	if (ret)
+		return ret;
+
+	/* DVB helpers take our chip mutex through init: never call while held. */
+	for_each_set_bit(i, &frontends, MXL214_NUM_FRONTENDS) {
+		err = dvb_frontend_resume(&state->channels[i].frontend);
+		if (err && !ret)
+			ret = err;
+	}
+	return ret;
+}
+
+static int mxl214_suspend(struct device *dev)
+{
+	struct mxl214_state *state = dev_get_drvdata(dev);
+	unsigned long frontends = 0;
+	unsigned int i;
+	int ret;
+
+	mutex_lock(&state->lock);
+	/* Gate frontend kthreads as well as userspace before touching the chip. */
+	state->suspended = true;
+	state->resume_frontends = 0;
+	for (i = 0; i < MXL214_NUM_FRONTENDS; i++) {
+		struct mxl214_channel *channel = &state->channels[i];
+
+		if (channel->claimed && channel->frontend.frontend_priv) {
+			__set_bit(i, &frontends);
+			if (channel->demod_enabled)
+				__set_bit(i, &state->resume_frontends);
+		}
+	}
+	mutex_unlock(&state->lock);
+
+	for_each_set_bit(i, &frontends, MXL214_NUM_FRONTENDS) {
+		ret = dvb_frontend_suspend(&state->channels[i].frontend);
+		if (ret)
+			goto rollback;
+	}
+
+	mutex_lock(&state->lock);
+	/* Reset held across sleep: no claim that external power is retained. */
+	gpiod_set_value_cansleep(state->reset_gpio, 1);
+	ret = gpiod_get_value_cansleep(state->reset_gpio);
+	if (ret != 1) {
+		ret = ret < 0 ? ret : -EIO;
+		mutex_unlock(&state->lock);
+		goto rollback;
+	}
+	/* Clear only the vendor context; registered DVB objects/claims survive. */
+	mxl214_clear_context(state);
+	state->force_firmware = true;
+	for (i = 0; i < MXL214_NUM_FRONTENDS; i++) {
+		state->channels[i].demod_enabled = false;
+		state->channels[i].locked = false;
+		mxl214_stats_reset(&state->channels[i]);
+	}
+	mutex_unlock(&state->lock);
+	return 0;
+
+rollback:
+	/* Partial demod shutdown/reset requires a complete restore, not a flag. */
+	mutex_lock(&state->lock);
+	mxl214_clear_context(state);
+	state->force_firmware = true;
+	mutex_unlock(&state->lock);
+	{
+		int err = mxl214_resume(dev);
+
+		if (err)
+			dev_err(dev, "suspend rollback failed: %d\n", err);
+	}
+	return ret;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(mxl214_pm_ops, mxl214_suspend, mxl214_resume);
+
 static const struct of_device_id mxl214_of_match[] = {
 	{ .compatible = "maxlinear,mxl214c" },
 	{ .compatible = "maxlinear,mxl214" },
@@ -1016,6 +1139,7 @@ static struct i2c_driver mxl214_driver = {
 	.driver = {
 		.name = "mxl214",
 		.of_match_table = mxl214_of_match,
+		.pm = pm_sleep_ptr(&mxl214_pm_ops),
 		/* DVB consumers hold device-owned frontend pointers. */
 		.suppress_bind_attrs = true,
 	},
