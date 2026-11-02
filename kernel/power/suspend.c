@@ -206,18 +206,10 @@ static int __init mem_sleep_default_setup(char *str)
 }
 __setup("mem_sleep_default=", mem_sleep_default_setup);
 
-/**
- * suspend_set_ops - Set the global suspend method table.
- * @ops: Suspend operations to use.
- */
-void suspend_set_ops(const struct platform_suspend_ops *ops)
+/* Caller serializes registration with lock_system_sleep(). */
+static void __suspend_set_ops(const struct platform_suspend_ops *ops)
 {
-	unsigned int sleep_flags;
-
-	sleep_flags = lock_system_sleep();
-
 	suspend_ops = ops;
-
 	if (valid_state(PM_SUSPEND_STANDBY)) {
 		mem_sleep_states[PM_SUSPEND_STANDBY] = mem_sleep_labels[PM_SUSPEND_STANDBY];
 		pm_states[PM_SUSPEND_STANDBY] = pm_labels[PM_SUSPEND_STANDBY];
@@ -229,10 +221,46 @@ void suspend_set_ops(const struct platform_suspend_ops *ops)
 		if (mem_sleep_default >= PM_SUSPEND_MEM)
 			mem_sleep_current = PM_SUSPEND_MEM;
 	}
+}
 
+/**
+ * suspend_set_ops - Set the global suspend method table.
+ * @ops: Suspend operations to use.
+ */
+void suspend_set_ops(const struct platform_suspend_ops *ops)
+{
+	unsigned int sleep_flags = lock_system_sleep();
+
+	__suspend_set_ops(ops);
 	unlock_system_sleep(sleep_flags);
 }
 EXPORT_SYMBOL_GPL(suspend_set_ops);
+
+/**
+ * suspend_set_ops_if_unset - claim an unowned platform suspend implementation
+ * @ops: Suspend operations with permanent lifetime.
+ *
+ * Do not replace a firmware/platform driver that already owns system sleep.
+ * Registration and ownership testing are atomic against suspend transitions.
+ * Return: zero on success, -EBUSY if an implementation is already installed,
+ * or -EINVAL for an empty implementation.
+ */
+int suspend_set_ops_if_unset(const struct platform_suspend_ops *ops)
+{
+	unsigned int sleep_flags;
+	int ret = 0;
+
+	if (!ops || !ops->valid || !ops->enter)
+		return -EINVAL;
+	sleep_flags = lock_system_sleep();
+	if (suspend_ops)
+		ret = -EBUSY;
+	else
+		__suspend_set_ops(ops);
+	unlock_system_sleep(sleep_flags);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(suspend_set_ops_if_unset);
 
 /**
  * suspend_valid_only_mem - Generic memory-only valid callback.
