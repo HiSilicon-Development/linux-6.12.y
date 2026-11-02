@@ -15,6 +15,7 @@
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/syscore_ops.h>
 #include "clk.h"
 #include "clk-histb-cpu.h"
 #include "crg.h"
@@ -1424,6 +1425,217 @@ static const struct hisi_divider_clock hi3798cv200_divider_clks[] = {
 		0, 0x278, 4, 1, 0, NULL },
 };
 
+/*
+ * The CV200 monitor restores the CPU/bus/DDR and source PLLs, including HPLL,
+ * and settles the saved PWM voltages before entering cpu_resume. Replay only
+ * fields owned by this clock/reset provider here, before device callbacks.
+ * CCF prepare/enable counts and cached rates deliberately remain unchanged.
+ */
+#define HI3798CV200_SYS_CTRL		0x0
+#define HI3798CV200_MCU_BUS_CLK_SEL	GENMASK(1, 0)
+#define HI3798CV200_MCU_BUS_CLK_STATUS	GENMASK(3, 2)
+
+#define CV200_PM_MAX_REGS 64
+struct hi3798cv200_pm_reg {
+	u32 offset;
+	u32 mask;
+	u32 value;
+};
+
+struct hi3798cv200_pm_context {
+	struct hisi_crg_dev *crg;
+	struct hi3798cv200_pm_reg regs[CV200_PM_MAX_REGS];
+	unsigned int count;
+	u32 gpu_selector, gpu_gate;
+	u32 hpll0, hpll1;
+	u32 mcu_selector;
+	bool saved;
+	bool overflow;
+	bool hpll_locked;
+};
+
+static struct hi3798cv200_pm_context hi3798cv200_pm[2];
+
+/* Provider reset fields and CV200 USB reference selectors, not whole words. */
+static const struct hi3798cv200_pm_reg hi3798cv200_pm_extra[] = {
+	{ 0x6c, BIT(5) | BIT(9) | BIT(13) | BIT(17) | BIT(21) },
+	{ 0x74, BIT(1) }, { 0x78, GENMASK(6, 4) },
+	{ 0x7c, BIT(4) }, { 0x88, BIT(4) },
+	{ 0x8c, BIT(4) }, { 0x90, BIT(4) },
+	{ 0x9c, BIT(4) }, { 0xa0, BIT(4) },
+	{ 0xb0, BIT(12) | BIT(28) },
+	{ 0xb8, BIT(12) | BIT(13) | BIT(16) | BIT(17) },
+	{ 0xbc, BIT(4) | BIT(6) | GENMASK(10, 8) | BIT(12) | BIT(14) },
+	/* HDMI's reset line only; no cipher/security configuration. */
+	{ 0xc0, BIT(9) }, { 0xcc, GENMASK(13, 8) },
+	{ 0xd8, BIT(30) | HI3798CV200_VO_HD_CLK_SEL |
+		HI3798CV200_VO_HD_CLK_DIV_MASK | HI3798CV200_HDMI_CLK_SEL |
+		HI3798CV200_VDP_CLK_SEL | HI3798CV200_VO_HD_HDMI_DIV },
+	{ 0xf0, BIT(4) },
+	{ 0xfc, GENMASK(8, 3) | GENMASK(20, 15) | BIT(24) },
+	{ 0x10c, BIT(8) | BIT(9) | HI3798CV200_HDMI_ASCLK_SEL },
+	{ 0x110, BIT(4) }, { 0x114, BIT(4) }, { 0x118, BIT(4) },
+	{ 0x188, BIT(4) | BIT(12) }, { 0x18c, GENMASK(6, 4) },
+	{ 0x278, HI3798CV200_HDMI_PIXEL_GATE | HI3798CV200_HDMI_OSCLK_SEL |
+		HI3798CV200_HDMI_IDCLK_SEL },
+	{ 0x334, BIT(4) },
+	{ 0x34c, HI3798CV200_VDP_HD_DIV0 | HI3798CV200_VDP_INIT_SEL0 |
+		HI3798CV200_VO_HD_BP_CLK_SEL },
+};
+
+static void hi3798cv200_pm_add(struct hi3798cv200_pm_context *ctx,
+			      u32 offset, u32 mask)
+{
+	unsigned int i;
+
+	for (i = 0; i < ctx->count; i++)
+		if (ctx->regs[i].offset == offset) {
+			ctx->regs[i].mask |= mask;
+			return;
+		}
+	/* Bounded by the static provider tables below. */
+	if (WARN_ON(ctx->count == CV200_PM_MAX_REGS)) {
+		ctx->overflow = true;
+		return;
+	}
+	ctx->regs[ctx->count++] = (struct hi3798cv200_pm_reg) {
+		.offset = offset, .mask = mask,
+	};
+}
+
+
+static int hi3798cv200_pm_suspend(void *unused)
+{
+	unsigned int n, i;
+
+	for (n = 0; n < ARRAY_SIZE(hi3798cv200_pm); n++) {
+		struct hi3798cv200_pm_context *ctx = &hi3798cv200_pm[n];
+		void __iomem *base;
+
+		ctx->saved = false;
+		if (!ctx->crg)
+			continue;
+		if (ctx->overflow)
+			return -EOVERFLOW;
+		base = ctx->crg->clk_data->base;
+		if (n) {
+			u32 control = readl(base + HI3798CV200_SYS_CTRL);
+
+			ctx->mcu_selector = FIELD_GET(HI3798CV200_MCU_BUS_CLK_SEL,
+						      control);
+			if (FIELD_GET(HI3798CV200_MCU_BUS_CLK_STATUS, control) !=
+			    ctx->mcu_selector)
+				return -EBUSY;
+		}
+		for (i = 0; i < ctx->count; i++)
+			ctx->regs[i].value = readl(base + ctx->regs[i].offset) &
+					     ctx->regs[i].mask;
+		if (!n) {
+			ctx->gpu_selector = FIELD_GET(HI3798CV200_GPU_STATUS_MASK,
+				readl(base + HI3798CV200_GPU_CLK_STATUS));
+			ctx->gpu_gate = readl(base + HI3798CV200_GPU_CLK_GATE_RESET);
+			if ((ctx->gpu_gate & HI3798CV200_GPU_CLK_GATE) &&
+			    !hi3798cv200_gpu_selector_rate(ctx->gpu_selector))
+				return -EIO;
+			ctx->hpll0 = readl(base + HI3798CV200_HPLL_CTRL0);
+			ctx->hpll1 = readl(base + HI3798CV200_HPLL_CTRL1);
+			ctx->hpll_locked = readl(base + HI3798CV200_HPLL_LOCK_STATUS) &
+					   HI3798CV200_HPLL_LOCK;
+		}
+		ctx->saved = true;
+	}
+	return 0;
+}
+
+static void hi3798cv200_pm_resume(void *unused)
+{
+	unsigned int n, i;
+	u32 value, status;
+
+	for (n = 0; n < ARRAY_SIZE(hi3798cv200_pm); n++) {
+		struct hi3798cv200_pm_context *ctx = &hi3798cv200_pm[n];
+		void __iomem *base;
+
+		if (!ctx->crg || !ctx->saved)
+			continue;
+		ctx->saved = false;
+		base = ctx->crg->clk_data->base;
+		if (!n) {
+			/* Monitor-owned PLLs must be restored before their consumers. */
+			if (readl(base + HI3798CV200_HPLL_CTRL0) != ctx->hpll0 ||
+			    readl(base + HI3798CV200_HPLL_CTRL1) != ctx->hpll1)
+				panic("CV200: monitor failed to restore HPLL context");
+			if (ctx->hpll_locked &&
+			    readl_poll_timeout_atomic(base + HI3798CV200_HPLL_LOCK_STATUS,
+				status, status & HI3798CV200_HPLL_LOCK, 1, 1000))
+				panic("CV200: resume HPLL lock timed out");
+			/* GPU frequency uses a request edge plus a status acknowledgement. */
+			if ((ctx->gpu_gate & HI3798CV200_GPU_CLK_GATE) &&
+			    FIELD_GET(HI3798CV200_GPU_STATUS_MASK,
+				readl(base + HI3798CV200_GPU_CLK_STATUS)) !=
+			    ctx->gpu_selector) {
+				value = readl(base + HI3798CV200_GPU_CLK_GATE_RESET);
+				writel(value | HI3798CV200_GPU_CLK_GATE,
+				       base + HI3798CV200_GPU_CLK_GATE_RESET);
+				value = readl(base + HI3798CV200_GPU_CLK_CTRL);
+				value &= ~(HI3798CV200_GPU_CLK_SEL_MASK |
+					   HI3798CV200_GPU_CLK_SWITCH);
+				value |= HI3798CV200_GPU_CLK_BYPASS | ctx->gpu_selector;
+				writel(value, base + HI3798CV200_GPU_CLK_CTRL);
+				writel(value | HI3798CV200_GPU_CLK_SWITCH,
+				       base + HI3798CV200_GPU_CLK_CTRL);
+				if (readl_poll_timeout_atomic(base + HI3798CV200_GPU_CLK_STATUS,
+					status, FIELD_GET(HI3798CV200_GPU_STATUS_MASK,
+					status) == ctx->gpu_selector, 1, 1000))
+					panic("CV200: resume GPU clock switch timed out");
+			}
+			value = readl(base + HI3798CV200_GPU_CLK_GATE_RESET);
+			value &= ~(HI3798CV200_GPU_CLK_GATE | HI3798CV200_GPU_RESET);
+			value |= ctx->gpu_gate & (HI3798CV200_GPU_CLK_GATE |
+						 HI3798CV200_GPU_RESET);
+			writel(value, base + HI3798CV200_GPU_CLK_GATE_RESET);
+			if ((readl(base + HI3798CV200_GPU_CLK_GATE_RESET) ^ ctx->gpu_gate) &
+			    (HI3798CV200_GPU_CLK_GATE | HI3798CV200_GPU_RESET))
+				panic("CV200: resume GPU gate/reset readback failed");
+		}
+		if (n) {
+			/* C51 changes this selector even in the normal-wake scene. */
+			value = readl(base + HI3798CV200_SYS_CTRL);
+			value &= ~HI3798CV200_MCU_BUS_CLK_SEL;
+			value |= FIELD_PREP(HI3798CV200_MCU_BUS_CLK_SEL,
+					    ctx->mcu_selector);
+			writel(value, base + HI3798CV200_SYS_CTRL);
+			if ((readl(base + HI3798CV200_SYS_CTRL) &
+			     HI3798CV200_MCU_BUS_CLK_SEL) !=
+			    FIELD_PREP(HI3798CV200_MCU_BUS_CLK_SEL, ctx->mcu_selector))
+				panic("CV200: SYS MCU clock selector readback failed");
+			if (readl_poll_timeout_atomic(base + HI3798CV200_SYS_CTRL,
+				status, FIELD_GET(HI3798CV200_MCU_BUS_CLK_STATUS,
+						  status) == ctx->mcu_selector, 1, 1000))
+				panic("CV200: resume SYS MCU clock switch timed out");
+		}
+		for (i = 0; i < ctx->count; i++) {
+			const struct hi3798cv200_pm_reg *reg = &ctx->regs[i];
+
+			value = readl(base + reg->offset);
+			if ((value & reg->mask) == reg->value)
+				continue;
+			writel((value & ~reg->mask) | reg->value, base + reg->offset);
+			if ((readl(base + reg->offset) & reg->mask) != reg->value)
+				panic("CV200: CRG resume readback failed at %#x", reg->offset);
+		}
+	}
+}
+
+static struct syscore_ops hi3798cv200_syscore_ops = {
+	.suspend = hi3798cv200_pm_suspend,
+	.resume = hi3798cv200_pm_resume,
+};
+
+static struct syscore hi3798cv200_syscore = {
+	.ops = &hi3798cv200_syscore_ops,
+};
+
 static struct hisi_clock_data *hi3798cv200_clk_register(
 				struct platform_device *pdev)
 {
@@ -1554,6 +1766,42 @@ static const struct hisi_gate_clock hi3798cv200_sysctrl_gate_clks[] = {
 	{ HISTB_UART0_CLK, "clk_uart0", "75m",
 		CLK_SET_RATE_PARENT, 0x48, 10, 0, },
 };
+static void hi3798cv200_pm_init(struct hisi_crg_dev *crg, bool sysctrl)
+{
+	struct hi3798cv200_pm_context *ctx = &hi3798cv200_pm[sysctrl];
+	unsigned int i;
+
+	if (!of_machine_is_compatible("hisilicon,hi3798cv200"))
+		return;
+	ctx->crg = crg;
+	if (sysctrl) {
+		/* CV200 SYS header and clk-hiir.c both identify the IR reset. */
+		hi3798cv200_pm_add(ctx, 0x48, BIT(5));
+		for (i = 0; i < ARRAY_SIZE(hi3798cv200_sysctrl_gate_clks); i++)
+			hi3798cv200_pm_add(ctx,
+				hi3798cv200_sysctrl_gate_clks[i].offset,
+				BIT(hi3798cv200_sysctrl_gate_clks[i].bit_idx));
+		return;
+	}
+	for (i = 0; i < ARRAY_SIZE(hi3798cv200_gate_clks); i++)
+		hi3798cv200_pm_add(ctx, hi3798cv200_gate_clks[i].offset,
+				  BIT(hi3798cv200_gate_clks[i].bit_idx));
+	for (i = 0; i < ARRAY_SIZE(hi3798cv200_mux_clks); i++)
+		hi3798cv200_pm_add(ctx, hi3798cv200_mux_clks[i].offset,
+			GENMASK(hi3798cv200_mux_clks[i].width - 1, 0) <<
+			hi3798cv200_mux_clks[i].shift);
+	for (i = 0; i < ARRAY_SIZE(hi3798cv200_phase_clks); i++)
+		hi3798cv200_pm_add(ctx, hi3798cv200_phase_clks[i].offset,
+			GENMASK(hi3798cv200_phase_clks[i].width - 1, 0) <<
+			hi3798cv200_phase_clks[i].shift);
+	for (i = 0; i < ARRAY_SIZE(hi3798cv200_divider_clks); i++)
+		hi3798cv200_pm_add(ctx, hi3798cv200_divider_clks[i].offset,
+			GENMASK(hi3798cv200_divider_clks[i].width - 1, 0) <<
+			hi3798cv200_divider_clks[i].shift);
+	for (i = 0; i < ARRAY_SIZE(hi3798cv200_pm_extra); i++)
+		hi3798cv200_pm_add(ctx, hi3798cv200_pm_extra[i].offset,
+				  hi3798cv200_pm_extra[i].mask);
+}
 
 static struct hisi_clock_data *hi3798cv200_sysctrl_clk_register(
 					struct platform_device *pdev)
@@ -1633,6 +1881,7 @@ static int hi3798cv200_crg_probe(struct platform_device *pdev)
 	}
 
 	platform_set_drvdata(pdev, crg);
+	hi3798cv200_pm_init(crg, crg->funcs == &hi3798cv200_sysctrl_funcs);
 	return 0;
 }
 
@@ -1640,6 +1889,11 @@ static void hi3798cv200_crg_remove(struct platform_device *pdev)
 {
 	struct hisi_crg_dev *crg = platform_get_drvdata(pdev);
 
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(hi3798cv200_pm); i++)
+		if (hi3798cv200_pm[i].crg == crg)
+			memset(&hi3798cv200_pm[i], 0, sizeof(hi3798cv200_pm[i]));
 	hisi_reset_exit(crg->rstc);
 	crg->funcs->unregister_clks(pdev);
 }
@@ -1655,12 +1909,18 @@ static struct platform_driver hi3798cv200_crg_driver = {
 
 static int __init hi3798cv200_crg_init(void)
 {
-	return platform_driver_register(&hi3798cv200_crg_driver);
+	int ret;
+
+	ret = platform_driver_register(&hi3798cv200_crg_driver);
+	if (!ret)
+		register_syscore(&hi3798cv200_syscore);
+	return ret;
 }
 core_initcall(hi3798cv200_crg_init);
 
 static void __exit hi3798cv200_crg_exit(void)
 {
+	unregister_syscore(&hi3798cv200_syscore);
 	platform_driver_unregister(&hi3798cv200_crg_driver);
 }
 module_exit(hi3798cv200_crg_exit);

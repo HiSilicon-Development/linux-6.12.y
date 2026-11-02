@@ -14,6 +14,7 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/pm.h>
 #include <linux/regulator/driver.h>
 #include <linux/regulator/of_regulator.h>
 
@@ -33,6 +34,8 @@ struct hi3798cv200_pwm_regulator_data {
 struct hi3798cv200_pwm_regulator {
 	void __iomem *base;
 	const struct hi3798cv200_pwm_regulator_data *data;
+	u32 sleep_value;
+	bool sleep_saved;
 };
 
 static int hi3798cv200_pwm_get_voltage_sel(struct regulator_dev *rdev)
@@ -122,6 +125,46 @@ static const struct hi3798cv200_pwm_regulator_data hi3798cv200_cpu_data = {
 	.settle_time_us = 10000,
 };
 
+static int __maybe_unused hi3798cv200_pwm_suspend_noirq(struct device *dev)
+{
+	struct hi3798cv200_pwm_regulator *regulator = dev_get_drvdata(dev);
+	u32 duty, period;
+
+	if (!of_machine_is_compatible("hisilicon,hi3798cv200"))
+		return 0;
+	regulator->sleep_saved = false;
+	regulator->sleep_value = readl(regulator->base);
+	period = FIELD_GET(HI3798CV200_PWM_PERIOD_MASK, regulator->sleep_value);
+	duty = FIELD_GET(HI3798CV200_PWM_DUTY_MASK, regulator->sleep_value);
+	if (period != HI3798CV200_PWM_PERIOD || !duty || duty > period)
+		return dev_err_probe(dev, -EIO, "invalid suspend PWM voltage encoding\n");
+	regulator->sleep_saved = true;
+	return 0;
+}
+
+static int __maybe_unused hi3798cv200_pwm_resume_noirq(struct device *dev)
+{
+	struct hi3798cv200_pwm_regulator *regulator = dev_get_drvdata(dev);
+
+	if (!regulator->sleep_saved)
+		return 0;
+	regulator->sleep_saved = false;
+	/* The monitor already restores and settles this before any core PLL. */
+	if (readl(regulator->base) == regulator->sleep_value)
+		return 0;
+	writel(regulator->sleep_value, regulator->base);
+	if (readl(regulator->base) != regulator->sleep_value)
+		panic("CV200: failed to restore %s PWM voltage", dev_name(dev));
+	/* noirq callbacks cannot use the sleeping DVFS settle helper. */
+	udelay(regulator->data->settle_time_us);
+	return 0;
+}
+
+static const struct dev_pm_ops hi3798cv200_pwm_pm_ops = {
+	SET_NOIRQ_SYSTEM_SLEEP_PM_OPS(hi3798cv200_pwm_suspend_noirq,
+				    hi3798cv200_pwm_resume_noirq)
+};
+
 static int hi3798cv200_pwm_regulator_probe(struct platform_device *pdev)
 {
 	struct hi3798cv200_pwm_regulator *regulator;
@@ -150,6 +193,7 @@ static int hi3798cv200_pwm_regulator_probe(struct platform_device *pdev)
 
 	rdev = devm_regulator_register(&pdev->dev, regulator->data->desc,
 				       &config);
+	platform_set_drvdata(pdev, regulator);
 	return PTR_ERR_OR_ZERO(rdev);
 }
 
@@ -171,6 +215,7 @@ static struct platform_driver hi3798cv200_pwm_regulator_driver = {
 	.driver = {
 		.name = "hi3798cv200-pwm-regulator",
 		.of_match_table = hi3798cv200_pwm_regulator_of_match,
+		.pm = pm_sleep_ptr(&hi3798cv200_pwm_pm_ops),
 	},
 };
 module_platform_driver(hi3798cv200_pwm_regulator_driver);
