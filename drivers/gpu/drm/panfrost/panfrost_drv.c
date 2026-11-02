@@ -742,6 +742,7 @@ static const struct panfrost_compatible hi3798cv200_data = {
 	.num_supplies = ARRAY_SIZE(default_supplies) - 1,
 	.supply_names = default_supplies,
 	.vendor_init = panfrost_hi3798cv200_init,
+	.vendor_resume = panfrost_hi3798cv200_resume,
 	.pm_features = BIT(GPU_PM_KEEP_L2_ON) | BIT(GPU_PM_RESET_LOW_FREQ),
 };
 

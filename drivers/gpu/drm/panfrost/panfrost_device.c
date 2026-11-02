@@ -473,6 +473,12 @@ static int panfrost_device_resume(struct device *dev)
 		}
 	}
 
+	if (pfdev->comp->vendor_resume) {
+		ret = pfdev->comp->vendor_resume(pfdev);
+		if (ret)
+			goto err_resume;
+	}
+
 	ret = pm_runtime_force_resume(dev);
 	if (ret)
 		goto err_resume;

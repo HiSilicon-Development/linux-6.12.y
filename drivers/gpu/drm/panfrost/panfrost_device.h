@@ -98,6 +98,8 @@ struct panfrost_compatible {
 	void (*vendor_quirk)(struct panfrost_device *pfdev);
 	/* Platform setup before the OPP table and GPU registers are initialized. */
 	int (*vendor_init)(struct panfrost_device *pfdev);
+	/* Restore platform context after system sleep, before runtime resume. */
+	int (*vendor_resume)(struct panfrost_device *pfdev);
 
 	/* Allowed PM features */
 	u8 pm_features;
@@ -122,6 +124,7 @@ struct panfrost_device {
 
 	struct panfrost_features features;
 	const struct panfrost_compatible *comp;
+	void *vendor_data;
 	DECLARE_BITMAP(is_suspended, PANFROST_COMP_BIT_MAX);
 
 	spinlock_t as_lock;
@@ -217,6 +220,7 @@ int panfrost_device_init(struct panfrost_device *pfdev);
 void panfrost_device_fini(struct panfrost_device *pfdev);
 int panfrost_device_reset(struct panfrost_device *pfdev);
 int panfrost_hi3798cv200_init(struct panfrost_device *pfdev);
+int panfrost_hi3798cv200_resume(struct panfrost_device *pfdev);
 
 extern const struct dev_pm_ops panfrost_pm_ops;
 
