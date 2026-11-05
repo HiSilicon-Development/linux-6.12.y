@@ -59,6 +59,7 @@
 #define  AIAO_TX_VOLUME_MASK		GENMASK(14, 8)
 #define  AIAO_TX_FADE_IN_MASK		GENMASK(19, 16)
 #define  AIAO_TX_FADE_OUT_MASK		GENMASK(23, 20)
+#define  AIAO_TX_BYPASS			BIT(27)
 #define  AIAO_TX_ENABLE		BIT(28)
 #define  AIAO_TX_DISABLE_DONE		BIT(29)
 
@@ -103,6 +104,7 @@ struct aiao_tx_config {
 	u32 period_bytes;
 	unsigned int channel;
 	bool valid;
+	unsigned int frame_bytes;
 };
 
 struct hi3798cv200_aiao {
@@ -125,9 +127,17 @@ struct hi3798cv200_aiao {
 	/* Selected by the board's audio routing. */
 	unsigned int tx_channel;
 	unsigned int analog_tx_channel;
+	bool hdmi_stream;
 	unsigned int hdmi_tx_channel;
 	int irq;
 	atomic_t opened;
+	/* Only six-channel streams need a padded hardware ring. The public
+	 * mmap ring remains six-channel; ack publishes each frame once.
+	 */
+	void *packed_area;
+	dma_addr_t packed_addr;
+	size_t packed_bytes;
+	snd_pcm_uframes_t packed_appl;
 };
 
 static inline u32 aiao_tx_reg(const struct hi3798cv200_aiao *aiao, u32 tx0_reg)
@@ -155,7 +165,7 @@ static const struct snd_pcm_hardware hi3798cv200_aiao_pcm_hardware = {
 	.rate_min = 8000,
 	.rate_max = 192000,
 	.channels_min = 2,
-	.channels_max = 2,
+	.channels_max = 8,
 	.period_bytes_min = AIAO_BUFFER_ALIGN,
 	.period_bytes_max = 64 * 1024,
 	.periods_min = 2,
@@ -339,6 +349,26 @@ static int hi3798cv200_aiao_sync_stop(struct snd_soc_component *component,
 }
 
 
+/* AIAO TX has only mono/stereo/eight-slot encodings (BSP hal_aiao_priv.c
+ * AIAO_LOW_SetI2SChNum:2265-2279). CEA slots 0..5 are FL FR LFE FC RL RR;
+ * the unused final pair must be silent, not a repeat of the next frame.
+ * This is the only unavoidable data copy; stereo/eight-channel mmap stays
+ * directly backed by the hardware DMA ring.
+ */
+static void aiao_expand_6ch(void *dst, const void *src, size_t frames,
+			    unsigned int sample_bytes)
+{
+	u8 *out = dst;
+	const u8 *in = src;
+
+	while (frames--) {
+		memcpy(out, in, 6 * sample_bytes);
+		memset(out + 6 * sample_bytes, 0, 2 * sample_bytes);
+		out += 8 * sample_bytes;
+		in += 6 * sample_bytes;
+	}
+}
+
 static int hi3798cv200_aiao_hw_params(struct snd_soc_component *component,
 				      struct snd_pcm_substream *substream,
 				      struct snd_pcm_hw_params *params)
@@ -348,10 +378,17 @@ static int hi3798cv200_aiao_hw_params(struct snd_soc_component *component,
 	u32 precision, if_attr;
 	size_t buffer_bytes = params_buffer_bytes(params);
 	size_t period_bytes = params_period_bytes(params);
+	unsigned int channels = params_channels(params);
+	unsigned int sample_bytes = snd_pcm_format_physical_width(params_format(params)) / 8;
+	unsigned int hw_channels = channels == 6 ? 8 : channels;
+	dma_addr_t dma_addr = runtime->dma_addr;
+	int ret;
 
 	if (!READ_ONCE(aiao->powered))
 		return -ESTRPIPE;
-	if (params_channels(params) != 2)
+	if (channels != 2 &&
+	    (!aiao->hdmi_stream || aiao->hdmi_tx_channel != 3 ||
+	     (channels != 6 && channels != 8)))
 		return -EINVAL;
 	if (!IS_ALIGNED(runtime->dma_addr, AIAO_BUFFER_ALIGN) ||
 	    upper_32_bits(runtime->dma_addr))
@@ -367,9 +404,32 @@ static int hi3798cv200_aiao_hw_params(struct snd_soc_component *component,
 	default:
 		return -EINVAL;
 	}
+	ret = aiao_stop_tx(aiao);
+	if (ret)
+		return ret;
+	aiao->prepared = false;
+	aiao->config.valid = false;
+	/* hw_params may be repeated without hw_free. Never leave an old
+	 * six-channel bounce buffer live after switching back to direct DMA.
+	 */
+	if (aiao->packed_area) {
+		dma_free_coherent(aiao->dev, aiao->packed_bytes,
+				  aiao->packed_area, aiao->packed_addr);
+		aiao->packed_area = NULL;
+	}
+	if (channels == 6) {
+		buffer_bytes = params_buffer_size(params) * 8 * sample_bytes;
+		period_bytes = params_period_size(params) * 8 * sample_bytes;
+		aiao->packed_area = dma_alloc_coherent(aiao->dev, buffer_bytes,
+						      &aiao->packed_addr, GFP_KERNEL);
+		if (!aiao->packed_area)
+			return -ENOMEM;
+		aiao->packed_bytes = buffer_bytes;
+		dma_addr = aiao->packed_addr;
+	}
 
 	if_attr = FIELD_PREP(AIAO_TX_PRECISION_MASK, precision) |
-		  FIELD_PREP(AIAO_TX_CHANNELS_MASK, 1) |
+		  FIELD_PREP(AIAO_TX_CHANNELS_MASK, hw_channels == 8 ? 3 : 1) |
 		  FIELD_PREP(AIAO_TX_SOURCE_MASK, aiao->tx_channel) |
 		  FIELD_PREP(AIAO_TX_SD0_MASK, 0) |
 		  FIELD_PREP(AIAO_TX_SD1_MASK, 1) |
@@ -382,17 +442,24 @@ static int hi3798cv200_aiao_hw_params(struct snd_soc_component *component,
 		.crg1 = FIELD_PREP(AIAO_CRG_BCLK_DIV_MASK, 3) |
 			FIELD_PREP(AIAO_CRG_FSCLK_DIV_MASK, 3),
 		.if_attr = if_attr,
-		.dma_addr = lower_32_bits(runtime->dma_addr),
+		.dma_addr = lower_32_bits(dma_addr),
 		.buffer_bytes = buffer_bytes,
 		.period_bytes = period_bytes,
 		.channel = aiao->tx_channel,
 		.valid = true,
+		.frame_bytes = hw_channels * sample_bytes,
 	};
 
 	aiao->dsp_ctrl = AIAO_TX_MUTE_FADE |
 		FIELD_PREP(AIAO_TX_VOLUME_MASK, 0x79) |
 		FIELD_PREP(AIAO_TX_FADE_IN_MASK, 4) |
 		FIELD_PREP(AIAO_TX_FADE_OUT_MASK, 3);
+	/* HDMI must preserve IEC61937 burst bits exactly, including start and
+	 * stop: bypass DSP volume/fades (BSP TX_DSP_CTRL.bypass_en bit 27).
+	 * LPCM uses the same unity/bypass path; analog retains its old DSP.
+	 */
+	if (aiao->hdmi_stream && aiao->hdmi_tx_channel == 3)
+		aiao->dsp_ctrl = AIAO_TX_BYPASS;
 	aiao->prepared = false;
 	aiao->last_pos = 0;
 	aiao_restore_tx_config(aiao);
@@ -409,8 +476,15 @@ static int hi3798cv200_aiao_hw_free(struct snd_soc_component *component,
 	int ret;
 
 	ret = aiao_stop_tx(aiao);
+	if (ret)
+		return ret;
 	aiao->prepared = false;
 	aiao->config.valid = false;
+	if (aiao->packed_area) {
+		dma_free_coherent(aiao->dev, aiao->packed_bytes,
+				  aiao->packed_area, aiao->packed_addr);
+		aiao->packed_area = NULL;
+	}
 	if (READ_ONCE(aiao->powered)) {
 		aiao_write(aiao, aiao_tx_crg_reg(aiao, AIAO_TX0_CRG_CFG1), 0);
 		aiao_write(aiao, aiao_tx_reg(aiao, AIAO_TX0_BUF_ADDR), 0);
@@ -437,6 +511,7 @@ static int hi3798cv200_aiao_prepare(struct snd_soc_component *component,
 	aiao_write(aiao, aiao_tx_reg(aiao, AIAO_TX0_BUF_WPTR), 0);
 	aiao_write(aiao, aiao_tx_reg(aiao, AIAO_TX0_BUF_RPTR), 0);
 	aiao->last_pos = 0;
+	aiao->packed_appl = 0;
 	aiao->prepared = true;
 	return 0;
 }
@@ -489,7 +564,8 @@ static int hi3798cv200_aiao_publish(struct snd_soc_component *component,
 {
 	struct hi3798cv200_aiao *aiao = dev_get_drvdata(component->dev);
 	struct snd_pcm_runtime *runtime = substream->runtime;
-	size_t buffer_bytes = snd_pcm_lib_buffer_bytes(substream);
+	size_t buffer_bytes = aiao->config.buffer_bytes;
+	unsigned int stride = aiao->config.frame_bytes;
 	snd_pcm_sframes_t queued_frames;
 	size_t hw_pos, advanced, queued_bytes, pos;
 
@@ -497,17 +573,21 @@ static int hi3798cv200_aiao_publish(struct snd_soc_component *component,
 		return 0;
 	if (rptr >= buffer_bytes)
 		return -EIO;
-	hw_pos = frames_to_bytes(runtime,
-		READ_ONCE(runtime->status->hw_ptr) % runtime->buffer_size);
+	/* pointer and ack share ALSA's stream lock. Only ack copies new
+	 * six-channel frames; a pointer-only update must not expose an
+	 * application pointer that has not yet reached the physical ring.
+	 */
+	if (aiao->packed_area &&
+	    READ_ONCE(runtime->control->appl_ptr) != aiao->packed_appl)
+		return 0;
+	hw_pos = (READ_ONCE(runtime->status->hw_ptr) % runtime->buffer_size) * stride;
 	advanced = (rptr + buffer_bytes - hw_pos) % buffer_bytes;
-	queued_frames = snd_pcm_playback_hw_avail(runtime) -
-		bytes_to_frames(runtime, advanced);
+	queued_frames = snd_pcm_playback_hw_avail(runtime) - advanced / stride;
 	if (queued_frames < 0 ||
 	    queued_frames > (snd_pcm_sframes_t)runtime->buffer_size)
 		return -EPIPE;
-	queued_bytes = frames_to_bytes(runtime, queued_frames);
-	pos = frames_to_bytes(runtime,
-		READ_ONCE(runtime->control->appl_ptr) % runtime->buffer_size);
+	queued_bytes = queued_frames * stride;
+	pos = (READ_ONCE(runtime->control->appl_ptr) % runtime->buffer_size) * stride;
 	if (queued_bytes > buffer_bytes - AIAO_DMA_GAP)
 		pos = (pos + buffer_bytes -
 		       (queued_bytes - (buffer_bytes - AIAO_DMA_GAP))) %
@@ -529,18 +609,17 @@ hi3798cv200_aiao_pointer(struct snd_soc_component *component,
 				struct snd_pcm_substream *substream)
 {
 	struct hi3798cv200_aiao *aiao = dev_get_drvdata(component->dev);
-	struct snd_pcm_runtime *runtime = substream->runtime;
 	u32 pos = aiao->last_pos;
 
 	if (!READ_ONCE(aiao->powered) || !aiao->prepared)
-		return bytes_to_frames(runtime, pos);
+		return aiao->config.frame_bytes ? pos / aiao->config.frame_bytes : 0;
 	pos = aiao_read(aiao, aiao_tx_reg(aiao, AIAO_TX0_BUF_RPTR)) &
 		AIAO_BUFFER_PTR_MASK;
 
 	if (hi3798cv200_aiao_publish(component, substream, pos))
 		return SNDRV_PCM_POS_XRUN;
 	aiao->last_pos = pos;
-	return bytes_to_frames(runtime, pos);
+	return pos / aiao->config.frame_bytes;
 }
 
 static int hi3798cv200_aiao_ack(struct snd_soc_component *component,
@@ -548,9 +627,27 @@ static int hi3798cv200_aiao_ack(struct snd_soc_component *component,
 {
 	struct hi3798cv200_aiao *aiao = dev_get_drvdata(component->dev);
 	u32 rptr;
+	snd_pcm_uframes_t appl = READ_ONCE(substream->runtime->control->appl_ptr);
+	snd_pcm_uframes_t frames, offset, count;
+	struct snd_pcm_runtime *runtime = substream->runtime;
 
 	if (!READ_ONCE(aiao->powered) || !aiao->prepared)
 		return -ESTRPIPE;
+	if (aiao->packed_area) {
+		frames = appl >= aiao->packed_appl ? appl - aiao->packed_appl :
+			appl + runtime->boundary - aiao->packed_appl;
+		if (frames > runtime->buffer_size)
+			return -EPIPE;
+		offset = aiao->packed_appl % runtime->buffer_size;
+		count = min(frames, runtime->buffer_size - offset);
+		aiao_expand_6ch(aiao->packed_area + offset * aiao->config.frame_bytes,
+				runtime->dma_area + frames_to_bytes(runtime, offset),
+				count, runtime->sample_bits / 8);
+		if (frames > count)
+			aiao_expand_6ch(aiao->packed_area, runtime->dma_area,
+					frames - count, runtime->sample_bits / 8);
+		aiao->packed_appl = appl;
+	}
 	rptr = aiao_read(aiao, aiao_tx_reg(aiao, AIAO_TX0_BUF_RPTR)) &
 		AIAO_BUFFER_PTR_MASK;
 
@@ -614,12 +711,22 @@ static int hi3798cv200_aiao_set_fmt(struct snd_soc_dai *dai,
 	return 0;
 }
 
+static const unsigned int aiao_hdmi_channels[] = { 2, 6, 8 };
+static const struct snd_pcm_hw_constraint_list aiao_hdmi_channel_list = {
+	.count = ARRAY_SIZE(aiao_hdmi_channels),
+	.list = aiao_hdmi_channels,
+};
+
 static int hi3798cv200_aiao_dai_startup(struct snd_pcm_substream *substream,
 				      struct snd_soc_dai *dai)
 {
 	struct hi3798cv200_aiao *aiao = snd_soc_dai_get_drvdata(dai);
 
 	aiao->tx_channel = dai->id ? aiao->hdmi_tx_channel : aiao->analog_tx_channel;
+	aiao->hdmi_stream = dai->id;
+	if (dai->id && aiao->hdmi_tx_channel == 3)
+		return snd_pcm_hw_constraint_list(substream->runtime, 0,
+			SNDRV_PCM_HW_PARAM_CHANNELS, &aiao_hdmi_channel_list);
 	return 0;
 }
 
@@ -646,7 +753,7 @@ static struct snd_soc_dai_driver hi3798cv200_aiao_dais[] = {
 		.playback = {
 			.stream_name = "HDMI Playback",
 			.channels_min = 2,
-			.channels_max = 2,
+			.channels_max = 8,
 			.rates = SNDRV_PCM_RATE_32000 | SNDRV_PCM_RATE_44100 |
 				 SNDRV_PCM_RATE_48000 | SNDRV_PCM_RATE_88200 |
 				 SNDRV_PCM_RATE_96000 | SNDRV_PCM_RATE_176400 |

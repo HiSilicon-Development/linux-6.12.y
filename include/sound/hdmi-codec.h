@@ -49,6 +49,12 @@ struct hdmi_codec_params {
 	int sample_rate;
 	int sample_width;
 	int channels;
+	/* Optional IEC61937 metadata. PCM rate/channels above describe the
+	 * DMA carrier, never the decoded compressed programme.
+	 */
+	unsigned int coding_type;
+	unsigned int content_rate;
+	unsigned int content_channels;
 };
 
 typedef void (*hdmi_codec_plugged_cb)(struct device *dev,
@@ -129,6 +135,8 @@ struct hdmi_codec_pdata {
 	uint no_spdif_playback:1;
 	uint no_spdif_capture:1;
 	int max_i2s_channels;
+	/* Expose IEC61937 codec/content controls; encoder validates its SADs. */
+	bool iec61937;
 	void *data;
 };
 

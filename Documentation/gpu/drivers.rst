@@ -67,6 +67,11 @@ SDR graphics, V1 and transfer-function/tone-map conversion are not supported
 in this HDR composition. Removing HDR metadata restores the SDR path.
 An eight-bit capture of ten-bit input proves fetch/conversion behaviour,
 not preservation of ten-bit precision or HDR transfer at the HDMI sink.
+The available CV200 sources do not establish the GDM sixteen-bit coefficient
+decoder or all VDM/GDM-to-CVM numerical shifts. Register widths alone are not
+sufficient to generate independent transfer/tone-map tables. No speculative
+LUTs or source-transfer property are exposed for those unsupported routes.
+
 
 The HDMI connector exposes Content Protection for HDCP Content Type 0.
 Authentication requires licensed, administratively trusted provisioning:
@@ -130,13 +135,72 @@ The HDMI bridges expose per-device ``hdmi-codec`` DAIs, fed by AIAO TX3
 on CV200 and TX2 on MV310. AIAO DAI 0 retains board-selected analog routing;
 DAI 1 selects native HDMI. The links share one playback owner: opening the
 other link during playback returns ``-EBUSY`` without changing the active
-TX bank. HDMI accepts
-stereo PCM at 32/44.1/48/88.2/96/176.4/192 kHz, constrained by sink ELD,
-using S16_LE or 24 significant MSBs in S32_LE. Unsupported formats are
-rejected. Matching updated DTBs are required for the one-cell AIAO DAI
-specifier; CV200 DVB-IP cards enumerate analog and HDMI as separate PCM
-devices. Neither ALSA write completion nor an active display proves that
-the sink received HDMI audio.
+TX bank. CV200 HDMI accepts 2/6/8-channel LPCM; MV310 remains stereo.
+Rates are 32/44.1/48/88.2/96/176.4/192 kHz, constrained by sink ELD,
+using S16_LE or 24 significant MSBs in S32_LE. Matching updated DTBs are
+required for the one-cell AIAO DAI specifier; CV200 DVB-IP cards enumerate
+analog and HDMI as separate PCM devices.
+
+CV200 multichannel samples follow the exposed CEA channel map:
+``FL FR LFE FC RL RR [RLC RRC]``, with allocations 0x0b and 0x13 for
+5.1 and 7.1 respectively. A conventional WAV channel order is not
+automatically equivalent. AIAO has no six-slot encoding: six-channel
+streams retain a six-channel ALSA mmap ring and are expanded, on submission,
+into a coherent eight-slot hardware ring with a silent final pair. Stereo
+and eight-channel streams remain direct DMA. Physical queue positions and
+the 32-byte guard use hardware frame stride. Playback must be prepared and
+refilled after system suspend; stale FIFO pointers are never resumed.
+
+CV200 also accepts already-packed IEC61937 bursts. The PCM-interface
+controls ``IEC61937 Codec``, ``IEC61937 Content Rate`` and
+``IEC61937 Content Channels`` describe the compressed programme, separately
+from the ALSA carrier. Codec choices are ``PCM``, ``AC-3``, ``DTS``,
+``E-AC-3``, ``DTS-HD`` and ``MLP``. Set these controls and the
+``IEC958 Playback Default`` NONAUDIO bit **before opening the PCM**;
+changed writes while open return ``-EBUSY``. PCM requires NONAUDIO clear
+and codec ``PCM``. Passthrough requires NONAUDIO set, consumer IEC958
+status and the matching codec. The driver validates codec/content channels
+and rate against the sink's SADs, not against LPCM carrier dimensions.
+
+The supported S16_LE passthrough carriers are:
+
+* AC-3: two channels at the content rate, up to 48 kHz/six content channels.
+* DTS: two channels at the content rate, up to 96 kHz/six content channels.
+* E-AC-3: two channels at four times the content rate.
+* DTS-HD/MLP HBR: eight channels at 176.4 kHz for 44.1/88.2/176.4 kHz
+  content, or 192 kHz for 48/96/192 kHz content. HBR IEC status describes
+  the 705.6/768 kHz stereo equivalent, while ACR uses the physical carrier.
+
+An unsupported 128 kHz physical carrier is rejected. The application must
+provide framed bursts, not elementary compressed packets, and must not
+resample, change software volume or remix their channels. The driver does
+not decode bursts to verify the supplied content description. MV310 does
+not expose these passthrough controls or new multichannel capabilities.
+
+For a card whose HDMI playback is ``hw:0,1``, address controls explicitly,
+for example::
+
+    amixer -c 0 cget "iface=PCM,name='IEC61937 Codec',device=1"
+    amixer -c 0 cset "iface=PCM,name='IEC61937 Codec',device=1" AC-3
+    amixer -c 0 cset "iface=PCM,name='IEC61937 Content Rate',device=1" 48000
+    amixer -c 0 cset "iface=PCM,name='IEC61937 Content Channels',device=1" 6
+
+Use libasound's IEC958 control API to set NONAUDIO on that PCM/device, or
+``iecset -D hw:0 professional off audio off`` when that card has a unique
+IEC958 playback-default control. ``amixer`` does not implement IEC958
+ASCII-value writes; ``iecset -n`` selects a control index, not a PCM device.
+Then a packed AC-3 carrier can be submitted with::
+
+    aplay -D hw:0,1 -t raw -f S16_LE -r 48000 -c 2 programme.iec61937
+
+Restore consumer audio mode (``iecset ... audio on``) and codec ``PCM``
+before opening LPCM again. Use an explicit ``hw`` PCM: ALSA ``hdmi`` or
+``iec958`` hooks which change controls after opening can fail with
+``-EBUSY`` or retain already-installed LPCM ELD constraints.
+
+Neither ALSA write completion nor an active display proves that the sink
+received HDMI audio. Multichannel and HBR positive acceptance requires a
+capable receiver/analyser; rejection on a stereo-only sink is not that proof.
 
 AIAO EMPTY is a level condition, including at normal end-of-stream drain.
 It is consumed once and rearmed when further DMA data is published; ALSA

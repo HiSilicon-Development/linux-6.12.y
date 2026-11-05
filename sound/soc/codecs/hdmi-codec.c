@@ -288,6 +288,9 @@ struct hdmi_codec_priv {
 	struct snd_soc_jack *jack;
 	unsigned int jack_status;
 	u8 iec_status[AES_IEC958_STATUS_SIZE];
+	unsigned int coding_type;
+	unsigned int content_rate;
+	unsigned int content_channels;
 };
 
 static const struct snd_soc_dapm_widget hdmi_widgets[] = {
@@ -410,6 +413,7 @@ static int hdmi_codec_iec958_default_get(struct snd_kcontrol *kcontrol,
 {
 	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
 	struct hdmi_codec_priv *hcp = snd_soc_component_get_drvdata(component);
+	guard(mutex)(&hcp->lock);
 
 	memcpy(ucontrol->value.iec958.status, hcp->iec_status,
 	       sizeof(hcp->iec_status));
@@ -422,10 +426,13 @@ static int hdmi_codec_iec958_default_put(struct snd_kcontrol *kcontrol,
 {
 	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
 	struct hdmi_codec_priv *hcp = snd_soc_component_get_drvdata(component);
+	guard(mutex)(&hcp->lock);
 
 	if (!memcmp(hcp->iec_status, ucontrol->value.iec958.status,
 		    sizeof(hcp->iec_status)))
 		return 0;
+	if (hcp->hcd.iec61937 && hcp->busy)
+		return -EBUSY;
 
 	memcpy(hcp->iec_status, ucontrol->value.iec958.status,
 	       sizeof(hcp->iec_status));
@@ -473,9 +480,15 @@ static int hdmi_codec_startup(struct snd_pcm_substream *substream,
 		if (ret)
 			goto err;
 
-		ret = snd_pcm_hw_constraint_eld(substream->runtime, hcp->eld);
-		if (ret)
-			goto err;
+		/* ELD's PCM constraints describe decoded samples, not an
+		 * IEC61937 carrier (e.g. 8 x 192 kHz for HBR).
+		 */
+		if (!(hcp->hcd.iec61937 &&
+		      (hcp->iec_status[0] & IEC958_AES0_NONAUDIO))) {
+			ret = snd_pcm_hw_constraint_eld(substream->runtime, hcp->eld);
+			if (ret)
+				goto err;
+		}
 
 		/* Select chmap supported */
 		hdmi_codec_eld_chmap(hcp);
@@ -549,6 +562,9 @@ static int hdmi_codec_fill_codec_params(struct snd_soc_dai *dai,
 	hp->sample_width = sample_width;
 	hp->sample_rate = sample_rate;
 	hp->channels = channels;
+	hp->coding_type = hcp->coding_type;
+	hp->content_rate = hcp->content_rate;
+	hp->content_channels = hcp->content_channels;
 
 	if (pcm_audio)
 		hcp->chmap_idx = ca_id;
@@ -790,6 +806,105 @@ static struct snd_kcontrol_new hdmi_codec_controls[] = {
 	},
 };
 
+static const char * const hdmi_codec_compressed_names[] = {
+	"PCM", "AC-3", "DTS", "E-AC-3", "DTS-HD", "MLP",
+};
+
+static const unsigned int hdmi_codec_compressed_types[] = {
+	HDMI_AUDIO_CODING_TYPE_PCM, HDMI_AUDIO_CODING_TYPE_AC3,
+	HDMI_AUDIO_CODING_TYPE_DTS, HDMI_AUDIO_CODING_TYPE_EAC3,
+	HDMI_AUDIO_CODING_TYPE_DTS_HD, HDMI_AUDIO_CODING_TYPE_MLP,
+};
+
+static int hdmi_codec_transport_info(struct snd_kcontrol *kcontrol,
+				   struct snd_ctl_elem_info *uinfo)
+{
+	if (!kcontrol->private_value)
+		return snd_ctl_enum_info(uinfo, 1,
+			ARRAY_SIZE(hdmi_codec_compressed_names),
+			hdmi_codec_compressed_names);
+	uinfo->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
+	uinfo->count = 1;
+	uinfo->value.integer.min = kcontrol->private_value == 1 ? 32000 : 1;
+	uinfo->value.integer.max = kcontrol->private_value == 1 ? 192000 : 8;
+	return 0;
+}
+
+static int hdmi_codec_transport_get(struct snd_kcontrol *kcontrol,
+				  struct snd_ctl_elem_value *ucontrol)
+{
+	struct hdmi_codec_priv *hcp = snd_soc_component_get_drvdata(
+		snd_kcontrol_chip(kcontrol));
+	unsigned int i;
+	guard(mutex)(&hcp->lock);
+
+	if (!kcontrol->private_value) {
+		for (i = 0; i < ARRAY_SIZE(hdmi_codec_compressed_types); i++)
+			if (hdmi_codec_compressed_types[i] == hcp->coding_type)
+				ucontrol->value.enumerated.item[0] = i;
+	} else {
+		ucontrol->value.integer.value[0] = kcontrol->private_value == 1 ?
+			hcp->content_rate : hcp->content_channels;
+	}
+	return 0;
+}
+
+static int hdmi_codec_transport_put(struct snd_kcontrol *kcontrol,
+				  struct snd_ctl_elem_value *ucontrol)
+{
+	struct hdmi_codec_priv *hcp = snd_soc_component_get_drvdata(
+		snd_kcontrol_chip(kcontrol));
+	unsigned int *value, next;
+	guard(mutex)(&hcp->lock);
+
+	if (kcontrol->private_value &&
+	    (ucontrol->value.integer.value[0] < 0 ||
+	     ucontrol->value.integer.value[0] >
+		(kcontrol->private_value == 1 ? 192000 : 8)))
+		return -EINVAL;
+
+	if (!kcontrol->private_value) {
+		next = ucontrol->value.enumerated.item[0];
+		if (next >= ARRAY_SIZE(hdmi_codec_compressed_types))
+			return -EINVAL;
+		next = hdmi_codec_compressed_types[next];
+		value = &hcp->coding_type;
+	} else if (kcontrol->private_value == 1) {
+		next = ucontrol->value.integer.value[0];
+		switch (next) {
+		case 32000: case 44100: case 48000: case 88200:
+		case 96000: case 176400: case 192000:
+			break;
+		default:
+			return -EINVAL;
+		}
+		value = &hcp->content_rate;
+	} else {
+		next = ucontrol->value.integer.value[0];
+		if (next < 1 || next > 8)
+			return -EINVAL;
+		value = &hcp->content_channels;
+	}
+	if (next == *value)
+		return 0;
+	if (hcp->busy)
+		return -EBUSY;
+	*value = next;
+	return 1;
+}
+
+static const struct snd_kcontrol_new hdmi_codec_transport_controls[] = {
+	{ .iface = SNDRV_CTL_ELEM_IFACE_PCM, .name = "IEC61937 Codec",
+	  .info = hdmi_codec_transport_info, .get = hdmi_codec_transport_get,
+	  .put = hdmi_codec_transport_put, .private_value = 0 },
+	{ .iface = SNDRV_CTL_ELEM_IFACE_PCM, .name = "IEC61937 Content Rate",
+	  .info = hdmi_codec_transport_info, .get = hdmi_codec_transport_get,
+	  .put = hdmi_codec_transport_put, .private_value = 1 },
+	{ .iface = SNDRV_CTL_ELEM_IFACE_PCM, .name = "IEC61937 Content Channels",
+	  .info = hdmi_codec_transport_info, .get = hdmi_codec_transport_get,
+	  .put = hdmi_codec_transport_put, .private_value = 2 },
+};
+
 static int hdmi_codec_pcm_new(struct snd_soc_pcm_runtime *rtd,
 			      struct snd_soc_dai *dai)
 {
@@ -824,6 +939,23 @@ static int hdmi_codec_pcm_new(struct snd_soc_pcm_runtime *rtd,
 		ret = snd_ctl_add(rtd->card->snd_card, kctl);
 		if (ret < 0)
 			return ret;
+	}
+	if (hcp->hcd.iec61937) {
+		hcp->coding_type = HDMI_AUDIO_CODING_TYPE_PCM;
+		hcp->content_rate = 48000;
+		hcp->content_channels = 2;
+		for (i = 0; i < ARRAY_SIZE(hdmi_codec_transport_controls); i++) {
+			struct snd_kcontrol *kctl;
+
+			kctl = snd_ctl_new1(&hdmi_codec_transport_controls[i],
+					    dai->component);
+			if (!kctl)
+				return -ENOMEM;
+			kctl->id.device = rtd->pcm->device;
+			ret = snd_ctl_add(rtd->card->snd_card, kctl);
+			if (ret < 0)
+				return ret;
+		}
 	}
 
 	return 0;

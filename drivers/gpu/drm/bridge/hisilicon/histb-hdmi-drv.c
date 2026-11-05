@@ -125,6 +125,8 @@
 #define HISTB_HDMI_ACR_CTRL		HISTB_HDMI_REG(0xa, 0x01)
 #define HISTB_HDMI_N_SVAL		HISTB_HDMI_REG(0xa, 0x03)
 #define HISTB_HDMI_AUD_MODE		HISTB_HDMI_REG(0xa, 0x14)
+#define HISTB_HDMI_I2S_IN_MAP		HISTB_HDMI_REG(0xa, 0x1c)
+#define HISTB_HDMI_ASRC			HISTB_HDMI_REG(0xa, 0x23)
 #define HISTB_HDMI_I2S_IN_CTRL		HISTB_HDMI_REG(0xa, 0x1d)
 #define HISTB_HDMI_I2S_CHST3		HISTB_HDMI_REG(0xa, 0x21)
 #define HISTB_HDMI_I2S_CHST4		HISTB_HDMI_REG(0xa, 0x22)
@@ -2001,8 +2003,18 @@ static int histb_hdmi_audio_program(void *data,
 	u8 buffer[HDMI_INFOFRAME_SIZE(AUDIO)];
 	u32 n = histb_audio_n(params->sample_rate);
 	u8 len = params->iec.status[4] & 0x0f;
+	bool hbr = histb_audio_hbr(params);
+	u8 lanes = GENMASK(DIV_ROUND_UP(params->channels, 2) + 3, 4);
 	int i, ret;
 
+	/* product/Hi3798CV200/hdmi_platform.h:48-53 and imagev200
+	 * hdmi_hal.c:1774-1795 select HBRA, not the LPCM I2S input ID.
+	 */
+	ret = regmap_update_bits(hdmi->perictrl, hdmi->perictrl_offset,
+				 HISTB_HDMI_PERI_AUDIO_MASK,
+				 hbr ? BIT(3) : HISTB_HDMI_PERI_AUDIO_I2S);
+	if (ret)
+		return ret;
 	ret = hdmi_audio_infoframe_pack_only(&params->cea, buffer, sizeof(buffer));
 	if (ret < 0)
 		return ret;
@@ -2010,8 +2022,12 @@ static int histb_hdmi_audio_program(void *data,
 					 buffer, ret);
 	if (ret)
 		return ret;
-	/* imagev200 si_mod_tx_hdmi.c:324-340, 1890-2002. CTS is generated
-	 * from the actual I2S clock; N is the HDMI-recommended integer value.
+	/* imagev200/driver/tx/tx_hdmi/si_mod_tx_hdmi.c:1917-2049:
+	 * HBR AUD_MODE=4, layout=0, ASRC[7:4]=0. LPCM enables one bit
+	 * per SD pair and uses layout 1 above stereo. I2S FIFO map 0xe4
+	 * is identity (si_drv_tx_regs.h:12058-12071). CTS follows the
+	 * physical 192 kHz frame clock for HBR; its four packed pairs
+	 * represent a 768 kHz two-channel IEC61937 carrier.
 	 */
 	histb_hdmi_writeb(hdmi, HISTB_HDMI_AUD_MODE, 0);
 	histb_hdmi_writeb(hdmi, HISTB_HDMI_ACR_CTRL, 0x0e);
@@ -2020,15 +2036,20 @@ static int histb_hdmi_audio_program(void *data,
 				   params->iec.status[i]);
 	histb_hdmi_writeb(hdmi, HISTB_HDMI_I2S_IN_SIZE, len);
 	histb_hdmi_writeb(hdmi, HISTB_HDMI_I2S_IN_CTRL, 0x60);
+	histb_hdmi_writeb(hdmi, HISTB_HDMI_I2S_IN_MAP, 0xe4);
+	histb_hdmi_updateb(hdmi, HISTB_HDMI_ASRC, GENMASK(7, 4),
+			   hbr ? 0 : BIT(4));
 	for (i = 0; i < 3; i++)
 		histb_hdmi_writeb(hdmi, HISTB_HDMI_N_SVAL + i * 4, n >> (i * 8));
-	histb_hdmi_writeb(hdmi, HISTB_HDMI_AUD_MODE, BIT(4));
-	histb_hdmi_updateb(hdmi, HISTB_HDMI_AUDP_TXCTRL, BIT(1), 0);
+	histb_hdmi_writeb(hdmi, HISTB_HDMI_AUD_MODE, hbr ? BIT(2) : lanes);
+	histb_hdmi_updateb(hdmi, HISTB_HDMI_AUDP_TXCTRL, BIT(1),
+			   !hbr && params->channels > 2 ? BIT(1) : 0);
 	histb_hdmi_writeb(hdmi, HISTB_HDMI_AIP_HDMI2MHL, 0);
 	histb_hdmi_updateb(hdmi, HISTB_HDMI_TPI_DOWN_SMPL_CTRL, BIT(2), 0);
 	histb_hdmi_writeb(hdmi, HISTB_HDMI_TPI_AUD_CONFIG, 0);
 	histb_hdmi_writeb(hdmi, HISTB_HDMI_TPI_AUD_FS,
-			   0x80 | (params->iec.status[3] & 0x0f));
+			   0x80 | (params->iec.status[3] & 0x0f) |
+			   ((params->iec.status[3] >> 2) & 0x30));
 	histb_hdmi_writeb(hdmi, HISTB_HDMI_AIP_RST,
 			   HISTB_HDMI_AIP_RST_AUDIO | HISTB_HDMI_AIP_RST_FIFO);
 	histb_hdmi_writeb(hdmi, HISTB_HDMI_AIP_RST, 0);
@@ -2683,6 +2704,7 @@ static int histb_hdmi_probe(struct platform_device *pdev)
 	hdmi->audio.data = hdmi;
 	hdmi->audio.program = histb_hdmi_audio_program;
 	hdmi->audio.stop = histb_hdmi_audio_stop;
+	hdmi->audio.extended = true;
 	INIT_DELAYED_WORK(&hdmi->hpd_work, histb_hdmi_hpd_work);
 #if IS_ENABLED(CONFIG_CEC_CORE)
 	INIT_DELAYED_WORK(&hdmi->cec_work, histb_hdmi_cec_work);

@@ -24,6 +24,7 @@
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/of_device.h>
+#include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/reset.h>
 #include <linux/seq_file.h>
@@ -2473,6 +2474,7 @@ static int histb_vdp_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct drm_bridge *bridge;
+	struct platform_device *bridge_pdev;
 	struct histb_vdp *vdp;
 	struct drm_device *drm;
 	unsigned int i;
@@ -2498,6 +2500,19 @@ static int histb_vdp_probe(struct platform_device *pdev)
 	if (IS_ERR(bridge))
 		return dev_err_probe(dev, PTR_ERR(bridge),
 				     "failed to find output bridge\n");
+
+	/* Atomic replay needs the transmitter's AUX/reset domain restored first.
+	 * OF graph discovery alone is insufficient with fw_devlink=off.
+	 */
+	bridge_pdev = of_find_device_by_node(bridge->of_node);
+	if (!bridge_pdev)
+		return -EPROBE_DEFER;
+	if (!device_link_add(dev, &bridge_pdev->dev,
+			     DL_FLAG_AUTOREMOVE_CONSUMER)) {
+		put_device(&bridge_pdev->dev);
+		return -ENOMEM;
+	}
+	put_device(&bridge_pdev->dev);
 
 	vdp->clks[0].id = "bus";
 	vdp->clks[1].id = "hd";

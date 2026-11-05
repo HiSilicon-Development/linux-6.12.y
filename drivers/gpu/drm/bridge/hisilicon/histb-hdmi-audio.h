@@ -7,7 +7,7 @@
 #include <drm/drm_eld.h>
 #include <sound/hdmi-codec.h>
 
-/* Both transmitters consume stereo I2S from the board-selected AIAO TX.
+/* CV200 accepts four I2S lanes; MV310 deliberately remains stereo.
  * The lock is shared with the bridge's modeset and power lifecycle.
  */
 struct histb_hdmi_audio {
@@ -18,6 +18,7 @@ struct histb_hdmi_audio {
 	void (*stop)(void *data);
 	struct hdmi_codec_params params;
 	u8 eld[MAX_ELD_BYTES];
+	bool extended;
 	bool active;
 	bool configured;
 	bool muted;
@@ -52,6 +53,59 @@ static u8 histb_audio_fs(unsigned int rate)
 	}
 }
 
+static bool histb_audio_hbr(const struct hdmi_codec_params *params)
+{
+	return (params->iec.status[0] & IEC958_AES0_NONAUDIO) &&
+		(params->coding_type == HDMI_AUDIO_CODING_TYPE_DTS_HD ||
+		 params->coding_type == HDMI_AUDIO_CODING_TYPE_MLP);
+}
+
+/* Pure carrier validation: ALSA supplies already packed IEC61937 bursts,
+ * not compressed elementary frames. HBR is four 16-bit pairs at 176.4/192
+ * kHz; its 705.6/768 kHz stereo equivalent must not be treated as LPCM.
+ */
+static bool histb_audio_carrier_valid(const struct hdmi_codec_params *p,
+				    bool extended)
+{
+	bool raw = p->iec.status[0] & IEC958_AES0_NONAUDIO;
+
+	if (!histb_audio_n(p->sample_rate) ||
+	    (p->iec.status[0] & IEC958_AES0_PROFESSIONAL))
+		return false;
+	if (!raw)
+		return (p->channels == 2 ||
+			(extended && (p->channels == 6 || p->channels == 8))) &&
+			(p->sample_width == 16 || p->sample_width == 24) &&
+			(!extended || p->coding_type == HDMI_AUDIO_CODING_TYPE_PCM);
+	if (!extended || p->sample_width != 16 ||
+	    !histb_audio_n(p->content_rate) ||
+	    p->content_channels < 1 || p->content_channels > 8)
+		return false;
+	if (histb_audio_hbr(p))
+		return p->channels == 8 &&
+			((p->sample_rate == 192000 &&
+			  (p->content_rate == 48000 || p->content_rate == 96000 ||
+			   p->content_rate == 192000)) ||
+			 (p->sample_rate == 176400 &&
+			  (p->content_rate == 44100 || p->content_rate == 88200 ||
+			   p->content_rate == 176400)));
+	if (p->channels != 2)
+		return false;
+	switch (p->coding_type) {
+	case HDMI_AUDIO_CODING_TYPE_AC3:
+		return p->content_rate <= 48000 && p->content_channels <= 6 &&
+			p->sample_rate == p->content_rate;
+	case HDMI_AUDIO_CODING_TYPE_DTS:
+		return p->content_rate <= 96000 && p->content_channels <= 6 &&
+			p->sample_rate == p->content_rate;
+	case HDMI_AUDIO_CODING_TYPE_EAC3:
+		return p->content_rate <= 48000 &&
+			p->sample_rate == 4 * p->content_rate;
+	default:
+		return false;
+	}
+}
+
 static bool histb_audio_sink_supports(struct histb_hdmi_audio *audio,
 				     const struct hdmi_codec_params *params)
 {
@@ -60,16 +114,23 @@ static bool histb_audio_sink_supports(struct histb_hdmi_audio *audio,
 	};
 	struct cea_sad sad;
 	unsigned int i, rate_bit = 0;
+	bool raw = params->iec.status[0] & IEC958_AES0_NONAUDIO;
+	unsigned int rate = raw ? params->content_rate : params->sample_rate;
+	unsigned int channels = raw ? params->content_channels : params->channels;
+	unsigned int coding = raw ? params->coding_type : HDMI_AUDIO_CODING_TYPE_PCM;
 
+	if (!histb_audio_carrier_valid(params, audio->extended))
+		return false;
 	for (i = 0; i < ARRAY_SIZE(rates); i++)
-		if (params->sample_rate == rates[i])
+		if (rate == rates[i])
 			rate_bit = BIT(i);
 	for (i = 0; i < drm_eld_sad_count(audio->eld); i++) {
 		if (drm_eld_sad_get(audio->eld, i, &sad))
 			continue;
-		if (sad.format == HDMI_AUDIO_CODING_TYPE_PCM &&
-		    sad.channels + 1 >= params->channels && (sad.freq & rate_bit) &&
-		    (sad.byte2 & (params->sample_width == 16 ? BIT(0) : BIT(2))))
+		if (sad.format == coding && sad.channels + 1 >= channels &&
+		    (sad.freq & rate_bit) &&
+		    (raw || (sad.byte2 &
+			(params->sample_width == 16 ? BIT(0) : BIT(2)))))
 			return true;
 	}
 	return false;
@@ -97,10 +158,8 @@ static int histb_audio_hw_params(struct device *dev, void *data,
 	    fmt->bit_clk_provider || fmt->frame_clk_provider ||
 	    (fmt->bit_fmt != SNDRV_PCM_FORMAT_S16_LE &&
 	     fmt->bit_fmt != SNDRV_PCM_FORMAT_S32_LE) ||
-	    params->channels != 2 ||
 	    (params->sample_width != 16 && params->sample_width != 32) ||
-	    !histb_audio_n(params->sample_rate) ||
-	    (params->iec.status[0] & (IEC958_AES0_NONAUDIO | IEC958_AES0_PROFESSIONAL)))
+	    (!audio->extended && params->channels != 2))
 		return -EINVAL;
 	guard(mutex)(audio->lock);
 	if (audio->removing || !audio->active)
@@ -109,9 +168,25 @@ static int histb_audio_hw_params(struct device *dev, void *data,
 	 * msbits to 24). Do not advertise nonexistent 32-bit HDMI LPCM.
 	 */
 	params->sample_width = params->sample_width == 32 ? 24 : 16;
-	params->iec.status[3] = (params->iec.status[3] & 0xf0) |
-		histb_audio_fs(params->sample_rate);
-	params->iec.status[4] = ((~histb_audio_fs(params->sample_rate) & 0xf) << 4) |
+	if (!histb_audio_carrier_valid(params, audio->extended))
+		return -EINVAL;
+	/* DMA words follow hdmi-codec's CEA channel-map order. Only complete
+	 * 5.1/7.1 maps are implemented, not sparse speaker allocations.
+	 */
+	if (!(params->iec.status[0] & IEC958_AES0_NONAUDIO) &&
+	    ((params->channels == 6 && params->cea.channel_allocation != 0x0b) ||
+	     (params->channels == 8 && params->cea.channel_allocation != 0x13)))
+		return -EINVAL;
+	/* si_drv_tx_regs.h I2S_CHST3: HBR's two-channel equivalent is
+	 * 768 kHz (0x09) or 705.6 kHz (FS extension 2, code 0x0d).
+	 */
+	params->iec.status[3] = (params->iec.status[3] & 0x30) |
+		(histb_audio_hbr(params) ?
+		 (params->sample_rate == 192000 ? 0x09 : 0x8d) :
+		 histb_audio_fs(params->sample_rate));
+	params->iec.status[4] =
+		((~histb_audio_fs(params->iec.status[0] & IEC958_AES0_NONAUDIO ?
+				 params->content_rate : params->sample_rate) & 0xf) << 4) |
 		(params->sample_width == 16 ? 2 : 11);
 	if (!histb_audio_sink_supports(audio, params))
 		return -EINVAL;
@@ -170,7 +245,8 @@ static int histb_audio_register(struct device *dev, struct histb_hdmi_audio *aud
 		.ops = &histb_audio_ops,
 		.i2s = 1,
 		.no_i2s_capture = 1,
-		.max_i2s_channels = 2,
+		.max_i2s_channels = audio->extended ? 8 : 2,
+		.iec61937 = audio->extended,
 		.data = audio,
 	};
 
