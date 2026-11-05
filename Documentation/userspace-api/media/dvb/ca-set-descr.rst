@@ -34,6 +34,11 @@ Description
 CA_SET_DESCR is used for feeding descrambler CA slots with descrambling
 keys (referred as control words).
 
+The Hi3798CV200 driver accepts the eight-byte CSA2 control word from this
+ABI and submits the complete four-word hardware key-register transaction,
+zeroing the unused final eight bytes. Slot clearing uses the same complete
+transaction. Applications must not extend or alter the standard structure.
+
 Return Value
 ------------
 

@@ -401,7 +401,10 @@ static void histb_dmx_write_cw_locked(struct histb_dmx *dmx,
 	unsigned int word;
 	u32 ctrl;
 
-	for (word = 0; word < 2; word++) {
+	/* CV200 consumes the BSP's complete 16-byte key-register transaction.
+	 * The DVB CSA2 ABI supplies eight bytes; zero the unused tail without
+	 * reading past the userspace CW, including when clearing a key slot. */
+	for (word = 0; word < 4; word++) {
 		ctrl = readl(dmx->regs + HISTB_DMX_CW_SET);
 		ctrl &= ~(HISTB_DMX_CW_WORD | HISTB_DMX_CW_PARITY |
 			  HISTB_DMX_CW_GROUP | HISTB_DMX_CW_TYPE |
@@ -412,7 +415,7 @@ static void histb_dmx_write_cw_locked(struct histb_dmx *dmx,
 			ctrl |= HISTB_DMX_CW_PARITY;
 
 		writel(ctrl, dmx->regs + HISTB_DMX_CW_SET);
-		writel(get_unaligned_le32(cw + word * sizeof(u32)),
+		writel(word < 2 ? get_unaligned_le32(cw + word * sizeof(u32)) : 0,
 		       dmx->regs + HISTB_DMX_CW_DATA);
 	}
 
