@@ -53,6 +53,7 @@
 #define HISTB_SCI_TXCOUNT		0x64
 #define HISTB_SCI_RXCOUNT		0x68
 #define HISTB_SCI_IMSC			0x6c
+#define HISTB_SCI_RIS			0x70
 #define HISTB_SCI_MIS			0x74
 #define HISTB_SCI_ICR			0x78
 #define HISTB_SCI_SYNCACT		0x7c
@@ -1270,6 +1271,54 @@ static ssize_t card_present_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(card_present);
 
+/*
+ * Observe only non-consuming status/configuration registers. In particular,
+ * never read DATA, change power/polarity, acknowledge IRQs or refresh the
+ * software card cache here. SYNCACT is the controller's conditioned presence
+ * indication, not an independent measurement of the socket DET voltage.
+ */
+static ssize_t hardware_status_show(struct device *dev,
+				    struct device_attribute *attr, char *buf)
+{
+	struct histb_sci_port *sci = dev_get_drvdata(dev);
+	struct uart_port *port = &sci->port;
+	unsigned long flags;
+	u32 cr0, cr1, clkicc, etu, baud, stable;
+	u32 txcount, rxcount, imsc, ris, mis, syncact, iso_flags;
+	enum histb_sci_state state;
+	bool present;
+
+	uart_port_lock_irqsave(port, &flags);
+	/* Shutdown clears opened under this lock before gating clocks/reset. */
+	if (!sci->opened || READ_ONCE(sci->pm_blocked)) {
+		uart_port_unlock_irqrestore(port, flags);
+		return -EHOSTDOWN;
+	}
+	cr0 = histb_sci_read(sci, HISTB_SCI_CR0) & GENMASK(10, 0);
+	cr1 = histb_sci_read(sci, HISTB_SCI_CR1) & GENMASK(8, 0);
+	clkicc = histb_sci_read(sci, HISTB_SCI_CLKICC);
+	etu = histb_sci_read(sci, HISTB_SCI_ETU);
+	baud = histb_sci_read(sci, HISTB_SCI_BAUD);
+	stable = histb_sci_read(sci, HISTB_SCI_STABLE);
+	txcount = histb_sci_read(sci, HISTB_SCI_TXCOUNT) & HISTB_SCI_FIFO_COUNT;
+	rxcount = histb_sci_read(sci, HISTB_SCI_RXCOUNT) & HISTB_SCI_FIFO_COUNT;
+	imsc = histb_sci_read(sci, HISTB_SCI_IMSC) & HISTB_SCI_INT_ALL;
+	ris = histb_sci_read(sci, HISTB_SCI_RIS) & HISTB_SCI_INT_ALL;
+	mis = histb_sci_read(sci, HISTB_SCI_MIS) & HISTB_SCI_INT_ALL;
+	syncact = histb_sci_read(sci, HISTB_SCI_SYNCACT) & GENMASK(10, 0);
+	present = sci->card_present;
+	state = sci->state;
+	iso_flags = port->iso7816.flags;
+	uart_port_unlock_irqrestore(port, flags);
+
+	return sysfs_emit(buf,
+		"cached_card_present=%u hardware_card_present=%u state=%s iso7816_flags=%#x cr0=%#x cr1=%#x clkicc=%u etu=%u baud=%u stable=%u txcount=%u rxcount=%u imsc=%#x ris=%#x mis=%#x syncact=%#x\n",
+		present, !!(syncact & HISTB_SCI_CARD_PRESENT),
+		histb_sci_state_name(state), iso_flags, cr0, cr1, clkicc, etu,
+		baud, stable, txcount, rxcount, imsc, ris, mis, syncact);
+}
+static DEVICE_ATTR_RO(hardware_status);
+
 static ssize_t tx_active_show(struct device *dev,
 			      struct device_attribute *attr, char *buf)
 {
@@ -1394,6 +1443,7 @@ static DEVICE_ATTR_WO(recover);
 static struct attribute *histb_sci_attrs[] = {
 	&dev_attr_state.attr,
 	&dev_attr_card_present.attr,
+	&dev_attr_hardware_status.attr,
 	&dev_attr_tx_active.attr,
 	&dev_attr_atr.attr,
 	&dev_attr_atr_protocol.attr,

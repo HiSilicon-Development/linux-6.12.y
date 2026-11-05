@@ -9,7 +9,25 @@ What:		/sys/bus/platform/devices/*/sci/card_present
 Date:		August 2026
 Contact:	linux-serial@vger.kernel.org
 Description:
-		Read-only card-detect state.  One means that a card is present.
+		Read-only cached card-detect state maintained by the driver state
+		machine. One means the last observed state was present. Use
+		hardware_status while the port is open to distinguish this cache
+		from the controller's current conditioned detection signal.
+
+What:		/sys/bus/platform/devices/*/sci/hardware_status
+Date:		November 2026
+Contact:	linux-serial@vger.kernel.org
+Description:
+		Read-only, driver-locked snapshot of non-consuming SCI status and
+		configuration. The space-separated key=value fields report cached
+		and live controller card presence, state, ISO7816 flags, CR0/CR1,
+		clock/ETU/baud/debounce configuration, FIFO counts, IMSC/RIS/MIS
+		and SYNCACT. Hardware presence is SYNCACT bit 10 after the configured
+		detect inversion; it is not an independent socket voltage reading.
+		The read returns EHOSTDOWN while the TTY is closed or PM-blocked.
+		It never enables clocks, changes card power or polarity, refreshes
+		the software cache, acknowledges interrupts, or reads DATA/ATR
+		contents. Reading this attribute cannot activate or recover a card.
 
 What:		/sys/bus/platform/devices/*/sci/tx_active
 Date:		August 2026
