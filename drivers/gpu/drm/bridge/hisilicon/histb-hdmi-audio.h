@@ -16,6 +16,7 @@ struct histb_hdmi_audio {
 	void *data;
 	int (*program)(void *data, const struct hdmi_codec_params *params);
 	void (*stop)(void *data);
+	int (*restore)(void *data);
 	struct hdmi_codec_params params;
 	u8 eld[MAX_ELD_BYTES];
 	bool extended;
@@ -223,9 +224,19 @@ static int histb_audio_mute(struct device *dev, void *data, bool mute, int direc
 static int histb_audio_get_eld(struct device *dev, void *data, u8 *buf, size_t len)
 {
 	struct histb_hdmi_audio *audio = data;
+	int ret;
 
 	guard(mutex)(audio->lock);
-	if (audio->removing || !audio->active)
+	if (audio->removing)
+		return -ENODEV;
+	/* HPD can drop without a modeset. Revalidate the existing live link
+	 * before exposing its ELD to a newly opened PCM stream. */
+	if (audio->restore) {
+		ret = audio->restore(audio->data);
+		if (ret)
+			return ret;
+	}
+	if (!audio->active)
 		return -ENODEV;
 	memcpy(buf, audio->eld, min(len, sizeof(audio->eld)));
 	return 0;

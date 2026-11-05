@@ -312,6 +312,9 @@ struct histb_hdmi_phy_config {
 	u8 fall_time;
 };
 
+/* CV200 STB hdmi_hal.c:412-420, selected by HalHdmiPhyParamGet():
+ * 74.25, 165, 190, 297 and 340 MHz are distinct TMDS boundaries.
+ */
 static const struct histb_hdmi_phy_config histb_hdmi_phy_configs[] = {
 	{
 		.data_swing = 0x19, .clk_swing = 0x1f,
@@ -328,6 +331,14 @@ static const struct histb_hdmi_phy_config histb_hdmi_phy_configs[] = {
 		.pll_pi = 0x40, .bgr_bias = 0xc4, .data_fine = 0x01,
 		.data_drive = 0x31, .pll_ldo = 0x06, .pll_zone = 0x04,
 		.pll_charge = 0x68, .input_bgr = 0x0f, .tx_reg_zone = 0x02,
+		.rise_time = 0x00, .fall_time = 0x10,
+	}, {
+		.data_swing = 0x19, .clk_swing = 0x1f,
+		.src_termination = 0xd5, .vnb = 0x02, .clk_fine = 0x01,
+		.pll_band = 0x14, .pll_loop = 0x32, .pll_vco = 0x68,
+		.pll_pi = 0x40, .bgr_bias = 0xc4, .data_fine = 0x01,
+		.data_drive = 0x31, .pll_ldo = 0x06, .pll_zone = 0x04,
+		.pll_charge = 0x68, .input_bgr = 0x0f, .tx_reg_zone = 0x01,
 		.rise_time = 0x00, .fall_time = 0x10,
 	}, {
 		.data_swing = 0x20, .clk_swing = 0x1f,
@@ -1024,12 +1035,14 @@ static void histb_hdmi_phy_configure(struct histb_hdmi *hdmi, u64 tmds_rate)
 		config = &histb_hdmi_phy_configs[0];
 	else if (tmds_rate < 165000000)
 		config = &histb_hdmi_phy_configs[1];
-	else if (tmds_rate < 297000000)
+	else if (tmds_rate < 190000000)
 		config = &histb_hdmi_phy_configs[2];
-	else if (tmds_rate < 340000000)
+	else if (tmds_rate < 297000000)
 		config = &histb_hdmi_phy_configs[3];
-	else
+	else if (tmds_rate < 340000000)
 		config = &histb_hdmi_phy_configs[4];
+	else
+		config = &histb_hdmi_phy_configs[5];
 
 	histb_hdmi_writeb(hdmi, HISTB_HDMI_PHY_DATA_SWING,
 			  config->data_swing);
@@ -1515,6 +1528,25 @@ static enum drm_connector_status histb_hdmi_bridge_detect(struct drm_bridge *bri
 		       connector_status_connected : connector_status_disconnected;
 }
 
+/* Called with audio_lock held. Never revive audio on a disabled display or
+ * trust a cached ELD while HPD is low. A live link may survive an HPD pulse
+ * without another atomic_enable, so PCM startup must restore that case too.
+ */
+static int histb_hdmi_audio_restore(void *data)
+{
+	struct histb_hdmi *hdmi = data;
+	struct drm_connector *connector = hdmi->active_connector;
+
+	lockdep_assert_held(&hdmi->audio_lock);
+	if (!hdmi->aux_enabled || !hdmi->pixel_enabled || !hdmi->mode_ready ||
+	    !connector || histb_hdmi_bridge_detect(&hdmi->bridge) !=
+			 connector_status_connected ||
+	    !connector->display_info.is_hdmi || !connector->display_info.has_audio)
+		return -ENODEV;
+
+	return histb_audio_enable(&hdmi->audio, connector);
+}
+
 /* Stop under audio_lock, before dropping pixel/auxiliary clocks. A queued
  * property worker observes hdcp_requested=false after the modeset unlocks.
  */
@@ -1736,6 +1768,15 @@ static void histb_hdmi_hpd_work(struct work_struct *work)
 	if (READ_ONCE(hdmi->last_reported_status) != status) {
 		WRITE_ONCE(hdmi->last_reported_status, status);
 		drm_bridge_hpd_notify(&hdmi->bridge, status);
+	}
+	if (status == connector_status_connected) {
+		mutex_lock(&hdmi->audio_lock);
+		/* An already-running PCM keeps its configuration across HPD loss. */
+		if (!hdmi->audio.active && hdmi->mode_ready && hdmi->pixel_enabled &&
+		    histb_hdmi_audio_restore(hdmi) && hdmi->audio.configured)
+			dev_warn_ratelimited(hdmi->dev,
+					     "HDMI PCM hotplug restore failed\n");
+		mutex_unlock(&hdmi->audio_lock);
 	}
 
 	if (hdmi->hpd_polling && READ_ONCE(hdmi->hpd_enabled))
@@ -2704,6 +2745,7 @@ static int histb_hdmi_probe(struct platform_device *pdev)
 	hdmi->audio.data = hdmi;
 	hdmi->audio.program = histb_hdmi_audio_program;
 	hdmi->audio.stop = histb_hdmi_audio_stop;
+	hdmi->audio.restore = histb_hdmi_audio_restore;
 	hdmi->audio.extended = true;
 	INIT_DELAYED_WORK(&hdmi->hpd_work, histb_hdmi_hpd_work);
 #if IS_ENABLED(CONFIG_CEC_CORE)
