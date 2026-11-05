@@ -5,6 +5,8 @@
 #include <linux/types.h>
 
 #define HISTB_VDP_CV200_ZME_SIZE 1024
+#define HISTB_VDP_CV200_GP0_COEF_SIZE 1024
+#define HISTB_VDP_CV200_GP0_VCOEF_OFFSET 512
 
 /**
  * histb_vdp_cv200_build_zme - build the normal CV200 full-tap FIR DMA image
@@ -48,5 +50,21 @@
  */
 void histb_vdp_cv200_build_zme(void *buffer, u32 src_width, u32 src_height,
 			     u32 dst_width, u32 dst_height);
+
+/**
+ * histb_vdp_cv200_build_gp0_bilinear - build an immutable graphics FIR image
+ * @buffer: at least HISTB_VDP_CV200_GP0_COEF_SIZE writable bytes
+ *
+ * Independently generated bilinear weights, not the vendor's sharpness tables.
+ * H: eight phases of eight signed LE16 taps for L, then the same for C.
+ * V: sixteen phases, each four C taps followed by four L taps, signed LE16.
+ * Only the central pair is nonzero. Each phase sums to Q9 unity (512);
+ * phase zero uses 511/1 to stay within signed ten-bit coefficient limits.
+ * This quantization adds 1/512 of the adjacent sample, not a DC-level error.
+ * Both 512-byte slots include zero DTI trailers; the caller disables LTI/CTI.
+ * DMA base and V base must be 64-byte aligned. Build once before scanout and
+ * retain unchanged until device teardown; this is not a V0 coefficient image.
+ */
+void histb_vdp_cv200_build_gp0_bilinear(void *buffer);
 
 #endif /* __HISTB_VDP_ZME_H__ */

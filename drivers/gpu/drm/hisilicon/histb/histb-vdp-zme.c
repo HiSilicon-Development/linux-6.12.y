@@ -419,3 +419,36 @@ void histb_vdp_cv200_build_zme(void *buffer, u32 src_width, u32 src_height,
 	histb_zme_pack(dst + 512, cv200_coefficients[v].lv6, 9);
 	histb_zme_pack(dst + 768, cv200_coefficients[cv].c4, 6);
 }
+
+/* GP0 transport follows the selected CV200 CONFIG_GFX_PQ provider:
+ * pq_v4_0/mng/3798cv200/pq_mng_gfxzme.c:49-59,201-280 (SPC060).
+ * The weights below are generated from linear interpolation, not BSP rows.
+ */
+void histb_vdp_cv200_build_gp0_bilinear(void *buffer)
+{
+	u8 *dst = buffer;
+	unsigned int phase, channel;
+
+	memset(buffer, 0, HISTB_VDP_CV200_GP0_COEF_SIZE);
+	for (phase = 0; phase < 8; phase++) {
+		u16 right = phase ? phase * 64 : 1;
+
+		for (channel = 0; channel < 2; channel++) {
+			u8 *row = dst + channel * 128 + phase * 16;
+
+			put_unaligned_le16(512 - right, row + 3 * 2);
+			put_unaligned_le16(right, row + 4 * 2);
+		}
+	}
+	for (phase = 0; phase < 16; phase++) {
+		u16 right = phase ? phase * 32 : 1;
+
+		for (channel = 0; channel < 2; channel++) {
+			u8 *row = dst + HISTB_VDP_CV200_GP0_VCOEF_OFFSET +
+				  phase * 16 + channel * 8;
+
+			put_unaligned_le16(512 - right, row + 1 * 2);
+			put_unaligned_le16(right, row + 2 * 2);
+		}
+	}
+}

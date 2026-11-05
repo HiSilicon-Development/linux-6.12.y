@@ -30,6 +30,8 @@ struct histb_vpss_frame {
 	u32 output_stride;
 	bool input_ten_bit;
 	bool output_ten_bit;
+	/* CV200 native NV15 DMA destination; output_ten_bit must also be set. */
+	bool output_packed_ten_bit;
 	bool input_packed_yuv;
 	bool output_packed_yuv;
 	bool hdr10_to_sdr;
@@ -42,12 +44,17 @@ struct histb_vpss_frame {
 	 * input_height_align is a power of two (TILE >= 16, LINEAR >= 1);
 	 * C has half the aligned Y height. No CV200 layout is inferred.
 	 *
-	 * NV12 output_dma requires a 64-byte-aligned output_stride. P010
-	 * requires output_cpu and at least width * 2 bytes per output row:
-	 * CF/OUT detile to packed linear 10-bit, then software packs words.
+	 * NV12 output_dma requires a 64-byte-aligned output_stride. CV200 NV15
+	 * additionally sets output_packed_ten_bit and output_ten_bit: native-size
+	 * ten-bit CV200 input only, 64-byte-aligned output_dma mandatory, no CPU
+	 * unpack/fallback.
+	 * Its pitch is ALIGN(DIV_ROUND_UP(width, 4) * 5, 64), with UV immediately
+	 * after output_stride * height. P010 instead requires output_cpu and at
+	 * least width * 2 bytes per row: hardware writes packed linear 10-bit
+	 * staging, then software packs words. MV310 rejects the NV15 flag.
 	 * LINEAR ten-bit -> NV12 also requires output_cpu for truncation.
 	 * CPU-written outputs require caller-managed DMA cache ownership.
-	 * output_size covers output_stride * height * 3 / 2 for NV12/P010,
+	 * output_size covers output_stride * height * 3 / 2 for NV12/NV15/P010,
 	 * or output_stride * height for packed YUV output.
 	 * Ten-bit output and LINEAR ten-bit -> NV12 are native-size only;
 	 * eight-bit output from TILE can be resized through the MV310 ZME.

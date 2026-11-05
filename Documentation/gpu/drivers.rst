@@ -52,6 +52,12 @@ normalization bypassed. Legacy V0 CSC registers are not the active SDR
 conversion path. No CRTC gamma LUT is exposed: the available CV200 DHD
 sources do not establish its RGB sampling and packed-table contract.
 
+For imported subsampled images, plane extents and shadow copies use each
+plane's sample width, not the full luma width. This permits tightly sized
+NV12/NV15 chroma objects without weakening the DMA bounds checks.
+Linear decoder imports require the exporter's persistent CPU mapping even
+when scanout itself uses the original contiguous DMA storage.
+
 V0 additionally accepts native packed NV15 ten-bit video. P010 input is
 repacked without reducing its ten significant bits into double-buffered
 NV15 storage owned by the framebuffer; native NV15 remains zero-copy when
@@ -71,6 +77,44 @@ The available CV200 sources do not establish the GDM sixteen-bit coefficient
 decoder or all VDM/GDM-to-CVM numerical shifts. Register widths alone are not
 sufficient to generate independent transfer/tone-map tables. No speculative
 LUTs or source-transfer property are exposed for those unsupported routes.
+
+The cached decoder exporter maps its existing allocation for PRIME CPU
+access; this does not allocate or copy a second video image. HEVC staging
+returns the actual staged bitstream DMA base, and CPU-produced P010 samples
+are published to the device before capture completion. Mapping, cache
+ownership and decoded-buffer lifetime remain separate requirements.
+
+CV200 V0 also accepts the native VDH Main10 reconstruction surface as
+``DRM_FORMAT_YUV420_10BIT`` with the explicit, project-local experimental
+``DRM_FORMAT_MOD_HISTB_VDH_10BIT`` modifier. Its canonical contract is
+``include/uapi/drm/histb_drm.h``; vendor byte 0x7e is not upstream assigned.
+This is neither linear NV15/P010 nor the older SP_TILE layout. One DMA object
+and one plane contain high-eight luma/chroma followed by low-two luma/chroma,
+with raw interleaved Cr,Cb. Framebuffer dimensions are exact coded dimensions;
+pitch is width aligned to 256 and allocation height is height aligned to 64.
+The complete four-region surface occupies 15/8 * pitch * allocation height.
+Visible geometry belongs in plane SRC, never in inferred allocation offsets.
+
+The decoder advertises this CAPTURE format as ``HT10`` for progressive CV200
+HEVC Main10 4:2:0. CAPTURE is the VDH reconstruction/reference storage itself;
+the DPB borrows it without freeing exported pages, while PMV remains private.
+This route bypasses VPSS and pixel detiling/repacking. Native V0 imports bypass
+CPU mappings and shadow copies, reject fragmented storage, and validate all
+four region bounds, 64-byte addresses and DMA32 endpoints. V1, graphics and
+MV310 cannot consume this modifier. Rotation, interlaced/stereo scanout and
+unsupported crop alignment are rejected; returning to linear scanout clears
+the stale tile registers.
+
+MMAP CAPTURE storage and its borrowed reconstruction alias remain valid when
+userspace requeues the buffer: an older submitted request may still reference
+that picture. HEVC resets failure taint only when execution prepares a new
+target, after the previous APC reference has retired. Imported storage is
+revalidated independently. STREAMOFF first joins decode/postprocess work;
+close handles CAPTURE being released before OUTPUT without accessing its
+released buffer array. Neither path frees exported capture pages through the
+private reconstruction allocator.
+
+
 
 
 The HDMI connector exposes Content Protection for HDCP Content Type 0.

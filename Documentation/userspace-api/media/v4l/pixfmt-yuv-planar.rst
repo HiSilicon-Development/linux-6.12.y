@@ -109,6 +109,13 @@ All components are stored with the same number of bits per component.
       - Cb, Cr
       - No
       - 16x16 tiles
+    * - V4L2_PIX_FMT_NV15
+      - 'NV15'
+      - 10
+      - 4:2:0
+      - Cb, Cr
+      - Yes
+      - Linear
     * - V4L2_PIX_FMT_P010
       - 'P010'
       - 10
@@ -378,6 +385,35 @@ in 16x16 tiles. The line stride must be aligned to a multiple of 16 and the
 image height must be aligned to a multiple of 32. The number of luma and chroma
 tiles are identical, even though the tile size differ. The image is formed of
 two non-contiguous planes.
+
+
+.. _V4L2-PIX-FMT-NV15:
+
+Linear NV15
+-----------
+
+``V4L2_PIX_FMT_NV15`` is linear semi-planar YUV 4:2:0 with ten bits per
+component. Four consecutive components occupy five bytes in little-endian
+bit order, without the six low padding bits of P010. For components
+``s0`` through ``s3``, each in the range 0 to 1023, the bytes are::
+
+    b0 = s0 & 0xff
+    b1 = (s0 >> 8) | ((s1 & 0x3f) << 2)
+    b2 = (s1 >> 6) | ((s2 & 0x0f) << 4)
+    b3 = (s2 >> 4) | ((s3 & 0x03) << 6)
+    b4 = s3 >> 2
+
+The luma components are followed by interleaved Cb, Cr components. Both
+planes use the negotiated byte stride; chroma has half as many rows, with
+its first byte at ``bytesperline * height``. Contiguous storage requires
+``bytesperline * (height + height / 2)`` bytes. The minimum row size for
+widths divisible by four is ``width * 5 / 4`` bytes; drivers may require
+additional stride alignment.
+
+The Hi3798CV200 HEVC decoder advertises this destination only for coded
+widths divisible by four and even coded heights, with 64-byte-aligned
+stride. Unsupported explicit NV15 requests fail instead of changing bit
+depth or picture dimensions. P010 remains available to other consumers.
 
 
 .. _V4L2-PIX-FMT-NV15-4L4:

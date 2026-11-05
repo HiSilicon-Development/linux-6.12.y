@@ -13,6 +13,7 @@
 #include <linux/firmware.h>
 #include <linux/interrupt.h>
 #include <linux/histb-vpss.h>
+#include <linux/iosys-map.h>
 #include <linux/iopoll.h>
 #include <linux/ktime.h>
 #include <linux/log2.h>
@@ -437,6 +438,18 @@ struct histb_vdec_avs_metadata {
 	u16 picture_distance;
 };
 
+/* Four regions in one full-coded CV200 Main10 reconstruction allocation. */
+struct histb_vdec_tiled_layout {
+	u32 coded_width;
+	u32 coded_height;
+	u32 stride;
+	u32 alloc_height;
+	u32 high8_uv;
+	u32 low2_y;
+	u32 low2_uv;
+	u32 size;
+};
+
 struct histb_vdec_decoded_buffer {
 	/* Must be first for the v4l2-mem2mem ready-queue helpers. */
 	struct v4l2_m2m_buffer base;
@@ -445,7 +458,10 @@ struct histb_vdec_decoded_buffer {
 	struct histb_vdec_avs_metadata avs;
 	bool tile_noncoherent;
 	bool pmv_noncoherent;
-	/* A decoded surface remains bad until userspace QBUF starts a new life. */
+	/* tile aliases this buffer's vb2 storage; only vb2 may release it. */
+	bool tile_borrowed;
+	struct histb_vdec_tiled_layout tiled;
+	/* Stateless references stay tainted until execution starts a new target. */
 	bool error_tainted;
 	/* MPEG-2 field pairs are stored in one full-frame reconstruction surface. */
 	bool mpeg2_field_saved;
@@ -973,6 +989,16 @@ static int histb_vdec_cached_dmabuf_mmap(struct dma_buf *dbuf,
 	return histb_vdec_cached_mmap(dbuf->priv, vma);
 }
 
+static int histb_vdec_cached_dmabuf_vmap(struct dma_buf *dbuf,
+					 struct iosys_map *map)
+{
+	struct histb_vdec_cached_buf *buf = dbuf->priv;
+
+	/* The allocation already has a cacheable kernel mapping for its lifetime. */
+	iosys_map_set_vaddr(map, buf->cpu);
+	return 0;
+}
+
 static int histb_vdec_cached_dmabuf_begin_cpu_access(struct dma_buf *dbuf,
 					 enum dma_data_direction dir)
 {
@@ -1000,6 +1026,7 @@ static const struct dma_buf_ops histb_vdec_cached_dmabuf_ops = {
 	.map_dma_buf = histb_vdec_cached_dmabuf_map,
 	.unmap_dma_buf = histb_vdec_cached_dmabuf_unmap,
 	.mmap = histb_vdec_cached_dmabuf_mmap,
+	.vmap = histb_vdec_cached_dmabuf_vmap,
 	.begin_cpu_access = histb_vdec_cached_dmabuf_begin_cpu_access,
 	.end_cpu_access = histb_vdec_cached_dmabuf_end_cpu_access,
 	.release = histb_vdec_cached_dmabuf_release,
@@ -1046,7 +1073,9 @@ histb_vdec_capture_backend(const struct vb2_buffer *vb)
 	    vb->vb2_queue->memory == VB2_MEMORY_MMAP)
 		return &histb_vdec_cached_memops;
 
-	return ctx->dst.pix.pixelformat == V4L2_PIX_FMT_NV12 ?
+	return (ctx->dst.pix.pixelformat == V4L2_PIX_FMT_NV12 ||
+		ctx->dst.pix.pixelformat == V4L2_PIX_FMT_NV15 ||
+		ctx->dst.pix.pixelformat == V4L2_PIX_FMT_HISTB_TILED_10) ?
 		&vb2_dma_contig_memops : &vb2_vmalloc_memops;
 }
 
@@ -1126,6 +1155,18 @@ static int histb_vdec_capture_begin_cpu_access(struct vb2_buffer *vb)
 		mem->cpu_synced = true;
 	}
 	return 0;
+}
+
+/* P010 unpack writes the cached CAPTURE allocation on the CPU. Publish those
+ * writes before DMA-BUF readers can invalidate or hand it to another device.
+ * DQBUF must then perform its normal finish to reacquire CPU ownership.
+ */
+static void histb_vdec_capture_publish_cpu_write(struct vb2_buffer *vb)
+{
+	struct histb_vdec_capture_mem *mem = vb->planes[0].mem_priv;
+
+	if (mem->ops == &histb_vdec_cached_memops)
+		histb_vdec_capture_prepare(mem);
 }
 
 static void *histb_vdec_capture_attach_dmabuf(struct vb2_buffer *vb,
@@ -1232,6 +1273,21 @@ static const struct vb2_mem_ops histb_vdec_capture_memops = {
 	.num_users = histb_vdec_capture_num_users,
 	.mmap = histb_vdec_capture_mmap,
 };
+/* The wrapper's cookie callback delegates to the selected DMA backend. */
+static dma_addr_t histb_vdec_capture_dma(struct vb2_buffer *vb,
+					 unsigned int plane)
+{
+	struct histb_vdec_capture_mem *mem = vb->planes[plane].mem_priv;
+
+	if (mem->ops == &histb_vdec_cached_memops)
+		return ((struct histb_vdec_cached_buf *)mem->priv)->dma;
+
+	/* Vmalloc capture storage has no device address. */
+	if (mem->ops == &vb2_vmalloc_memops)
+		return 0;
+
+	return vb2_dma_contig_plane_dma_addr(vb, plane);
+}
 
 static const u32 histb_vdec_cv200_formats[] = {
 	V4L2_PIX_FMT_H264_SLICE, V4L2_PIX_FMT_HEVC_SLICE,
@@ -1289,6 +1345,43 @@ static bool histb_vdec_is_stateless_format(u32 pixelformat)
 	default:
 		return false;
 	}
+}
+
+static bool histb_vdec_supports_ht10(const struct histb_vdec_ctx *ctx)
+{
+	return !ctx->vdec->mv310 &&
+		ctx->src.pix.pixelformat == V4L2_PIX_FMT_HEVC_SLICE &&
+		!(ctx->src.pix.width & 3) && !(ctx->src.pix.height & 1);
+}
+
+static int histb_vdec_ht10_layout(const struct histb_vdec_ctx *ctx,
+				 struct histb_vdec_tiled_layout *layout)
+{
+	u32 luma, low_luma, high_size, low_size, size;
+
+	if (!histb_vdec_supports_ht10(ctx) ||
+	    ctx->src.pix.width < HISTB_VDEC_MIN_WIDTH ||
+	    ctx->src.pix.height < HISTB_VDEC_MIN_HEIGHT ||
+	    ctx->src.pix.width > HISTB_VDEC_HEVC_MAX_WIDTH ||
+	    ctx->src.pix.height > HISTB_VDEC_HEVC_MAX_HEIGHT)
+		return -EINVAL;
+	layout->coded_width = ctx->src.pix.width;
+	layout->coded_height = ctx->src.pix.height;
+	layout->stride = ALIGN(layout->coded_width, 256);
+	layout->alloc_height = ALIGN(layout->coded_height, 64);
+	if (check_mul_overflow(layout->stride, layout->alloc_height, &luma) ||
+	    check_mul_overflow(layout->stride / 4, layout->alloc_height,
+			       &low_luma) ||
+	    check_add_overflow(luma, luma / 2, &high_size) ||
+	    check_add_overflow(low_luma, low_luma / 2, &low_size) ||
+	    check_add_overflow(high_size, low_size, &size) ||
+	    check_add_overflow(size, ctx->vdec->backend->surface_tail_guard,
+			       &layout->size) ||
+	    check_add_overflow(high_size, low_luma, &layout->low2_uv))
+		return -EOVERFLOW;
+	layout->high8_uv = luma;
+	layout->low2_y = high_size;
+	return 0;
 }
 
 static u32 histb_vdec_tile_stride(u32 width)
@@ -2631,6 +2724,7 @@ static int histb_vdec_copy_hevc_bitstream(
 	/* Pad the final DMA burst beyond the valid stream bits. */
 	memset(stream->cpu + dst_offset, 0,
 	       ctx->vdec->backend->stream_guard(ctx->src.pix.pixelformat));
+	*stream_dma = stream->dma;
 
 	return 0;
 }
@@ -2654,7 +2748,9 @@ static size_t histb_vdec_tile_size(struct histb_vdec_ctx *ctx)
 
 	/* Main10 stores high-eight-bit planes followed by packed two-bit planes. */
 	if ((ctx->src.pix.pixelformat == V4L2_PIX_FMT_HEVC_SLICE ||
-	     ctx->src.pix.pixelformat == V4L2_PIX_FMT_AVS2) && ctx->hevc_main10)
+	     ctx->src.pix.pixelformat == V4L2_PIX_FMT_AVS2) &&
+	    (ctx->hevc_main10 ||
+	     ctx->dst.pix.pixelformat == V4L2_PIX_FMT_HISTB_TILED_10))
 		size += (stride / 4) * height * 3 / 2;
 
 	/* Backend-owned surface tail guard follows the native allocator contract. */
@@ -2770,12 +2866,81 @@ histb_vdec_free_decoded_buffers(struct histb_vdec_ctx *ctx,
 	struct device *dev = ctx->vdec->dev;
 
 	histb_vdec_free_dma_buffer(dev, &decoded->pmv, decoded->pmv_noncoherent);
-	histb_vdec_free_dma_buffer(dev, &decoded->tile, decoded->tile_noncoherent);
+	if (decoded->tile_borrowed) {
+		/* Exported vb2 pages can outlive the decoder fd and this alias. */
+		decoded->tile.cpu = NULL;
+		decoded->tile.dma = 0;
+		decoded->tile.cpu_owned = false;
+	} else {
+		histb_vdec_free_dma_buffer(dev, &decoded->tile,
+					    decoded->tile_noncoherent);
+	}
+	decoded->tile_borrowed = false;
+	memset(&decoded->tiled, 0, sizeof(decoded->tiled));
 	decoded->tile_noncoherent = true;
 	decoded->pmv_noncoherent = true;
 	memset(&decoded->avs, 0, sizeof(decoded->avs));
 	decoded->vp9_dpb_valid = false;
 	decoded->vp9_logic_id = HISTB_VDEC_APC_INVALID;
+}
+
+static int histb_vdec_alloc_tiled_capture(struct histb_vdec_ctx *ctx,
+				  struct histb_vdec_decoded_buffer *decoded)
+{
+	struct vb2_buffer *vb = &decoded->base.vb.vb2_buf;
+	struct histb_vdec_tiled_layout layout;
+	struct device *dev = ctx->vdec->dev;
+	dma_addr_t dma, end;
+	void *cpu;
+	int ret;
+
+	ret = histb_vdec_ht10_layout(ctx, &layout);
+	if (ret)
+		return ret;
+	if (!ctx->hevc || !ctx->hevc_main10 || vb->num_planes != 1 ||
+	    vb->planes[0].data_offset ||
+	    ctx->dst.pix.width != layout.coded_width ||
+	    ctx->dst.pix.height != layout.coded_height ||
+	    ctx->dst.pix.bytesperline != layout.stride ||
+	    ctx->dst.pix.sizeimage != layout.size ||
+	    decoded->tile.size != layout.size ||
+	    vb2_plane_size(vb, 0) < layout.size)
+		return -EINVAL;
+	dma = histb_vdec_capture_dma(vb, 0);
+	cpu = vb2_plane_vaddr(vb, 0);
+	if (!cpu || !dma)
+		return -EOPNOTSUPP;
+	if (!IS_ALIGNED(dma, 256) ||
+	    check_add_overflow(dma, (dma_addr_t)layout.size - 1, &end) ||
+	    upper_32_bits(end))
+		return -ERANGE;
+	if (decoded->tile.cpu &&
+	    (!decoded->tile_borrowed || decoded->tile.cpu != cpu ||
+	     decoded->tile.dma != dma))
+		return -EINVAL;
+	/* PMV stays private in the existing reserved coherent VDH pool. */
+	if (!decoded->pmv.cpu) {
+		decoded->pmv_noncoherent = false;
+		decoded->pmv.cpu = dma_alloc_coherent(dev, decoded->pmv.size,
+						   &decoded->pmv.dma, GFP_KERNEL);
+		if (!decoded->pmv.cpu)
+			return -ENOMEM;
+		if (check_add_overflow(decoded->pmv.dma,
+				       (dma_addr_t)decoded->pmv.size - 1, &end) ||
+		    upper_32_bits(end) || !IS_ALIGNED(decoded->pmv.dma, 16)) {
+			histb_vdec_free_dma_buffer(dev, &decoded->pmv, false);
+			return -ERANGE;
+		}
+		memset(decoded->pmv.cpu, 0, decoded->pmv.size);
+	}
+	decoded->tile.cpu = cpu;
+	decoded->tile.dma = dma;
+	decoded->tile.cpu_owned = false;
+	decoded->tile_borrowed = true;
+	/* vb2/capture_dev, not the private VDH allocator, owns cache sync. */
+	decoded->tile_noncoherent = false;
+	decoded->tiled = layout;
+	return 0;
 }
 
 static int
@@ -2786,20 +2951,24 @@ histb_vdec_alloc_decoded_buffers(struct histb_vdec_ctx *ctx,
 	bool reserved_pool = false;
 	bool hevc_vpss_surface;
 
+	if (ctx->dst.pix.pixelformat == V4L2_PIX_FMT_HISTB_TILED_10)
+		return histb_vdec_alloc_tiled_capture(ctx, decoded);
+
 #ifdef CONFIG_DMA_DECLARE_COHERENT
 	reserved_pool = dev->dma_mem != NULL;
 #endif
 	hevc_vpss_surface = reserved_pool &&
 		ctx->src.pix.pixelformat == V4L2_PIX_FMT_HEVC_SLICE &&
-		ctx->dst.pix.pixelformat == V4L2_PIX_FMT_NV12;
+		(ctx->dst.pix.pixelformat == V4L2_PIX_FMT_NV12 ||
+		 ctx->dst.pix.pixelformat == V4L2_PIX_FMT_NV15);
 	if (decoded->tile.cpu && (!decoded->pmv.size || decoded->pmv.cpu))
 		return 0;
 	if (decoded->tile.cpu || decoded->pmv.cpu)
 		histb_vdec_free_decoded_buffers(ctx, decoded);
 
-	/* VPSS consumes native and downscaled NV12 reconstruction surfaces by
-	 * DMA. Keep their coded-size storage in the reserved VDH pool rather
-	 * than competing with capture buffers for CMA. P010 CPU postprocessing
+	/* VPSS consumes NV12 and native NV15 reconstruction surfaces by DMA.
+	 * Keep their coded-size storage in the reserved VDH pool rather than
+	 * competing with capture buffers for CMA. P010 CPU postprocessing
 	 * retains cacheable storage for UHD surfaces.
 	 */
 	decoded->tile_noncoherent = !hevc_vpss_surface &&
@@ -3104,9 +3273,16 @@ static void histb_vdec_sync_tile_for_device(
 		struct histb_vdec_ctx *ctx,
 		struct histb_vdec_decoded_buffer *decoded)
 {
-	if (decoded && decoded->tile.cpu)
+	if (decoded && decoded->tile_borrowed) {
+		struct vb2_buffer *vb = &decoded->base.vb.vb2_buf;
+
+		/* A dequeued/exported DPB surface may have acquired CPU ownership. */
+		histb_vdec_capture_prepare(vb->planes[0].mem_priv);
+		decoded->tile.cpu_owned = false;
+	} else if (decoded && decoded->tile.cpu) {
 		histb_vdec_sync_surface_for_device(ctx, &decoded->tile,
 						    decoded->tile_noncoherent);
+	}
 	if (decoded && decoded->pmv.cpu)
 		histb_vdec_sync_surface_for_device(ctx, &decoded->pmv,
 						    decoded->pmv_noncoherent);
@@ -3473,6 +3649,7 @@ static bool histb_vdec_use_hevc_surface_pool(const struct histb_vdec_ctx *ctx)
 {
 	return ctx->src.pix.pixelformat == V4L2_PIX_FMT_HEVC_SLICE &&
 		(ctx->dst.pix.pixelformat == V4L2_PIX_FMT_NV12 ||
+		 ctx->dst.pix.pixelformat == V4L2_PIX_FMT_NV15 ||
 		 ctx->dst.pix.width < ctx->src.pix.width ||
 		 ctx->dst.pix.height < ctx->src.pix.height);
 }
@@ -3494,6 +3671,13 @@ histb_vdec_sync_hevc_apc(struct histb_vdec_ctx *ctx,
 		active[i] = histb_vdec_find_reference(ctx, decode->dpb[i].timestamp);
 		if (!active[i] || !histb_vdec_decoded_buffer_valid(active[i]))
 			return -EINVAL;
+		if (ctx->dst.pix.pixelformat == V4L2_PIX_FMT_HISTB_TILED_10 &&
+		    (!active[i]->tile_borrowed ||
+		     active[i]->tiled.coded_width != ctx->src.pix.width ||
+		     active[i]->tiled.coded_height != ctx->src.pix.height ||
+		     active[i]->tiled.stride != ctx->dst.pix.bytesperline ||
+		     active[i]->tiled.size != ctx->dst.pix.sizeimage))
+			return -EINVAL;
 		for (j = 0; j < i; j++)
 			if (active[j] == active[i])
 				return -EINVAL;
@@ -3509,7 +3693,8 @@ histb_vdec_sync_hevc_apc(struct histb_vdec_ctx *ctx,
 		if (!ctx->apc[slot] || (slot < ARRAY_SIZE(keep) && keep[slot]))
 			continue;
 		ctx->apc[slot]->apc_slot = HISTB_VDEC_APC_INVALID;
-		if (!histb_vdec_use_hevc_surface_pool(ctx) &&
+		if (!ctx->apc[slot]->tile_borrowed &&
+		    !histb_vdec_use_hevc_surface_pool(ctx) &&
 		    !histb_vdec_post_owns_decoded(ctx, ctx->apc[slot]))
 			histb_vdec_free_decoded_buffers(ctx, ctx->apc[slot]);
 		ctx->apc[slot] = NULL;
@@ -3703,6 +3888,11 @@ histb_vdec_reclaim_decoded_buffers(struct histb_vdec_ctx *ctx,
 	struct vb2_queue *queue = v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx);
 	bool hevc_pool = histb_vdec_use_hevc_surface_pool(ctx);
 	unsigned int i;
+
+	/* vb2 + the userspace AVFrame own native DPB/scanout storage until QBUF.
+	 * Never detach, move, or reclaim it when a request's DPB list shrinks. */
+	if (ctx->dst.pix.pixelformat == V4L2_PIX_FMT_HISTB_TILED_10)
+		return;
 
 	for (i = 0; i < queue->max_num_buffers; i++) {
 		struct vb2_buffer *buffer = queue->bufs[i];
@@ -4107,21 +4297,6 @@ static void histb_vdec_scale_vc1_respic_nv12(u8 *dst, u32 stride,
 				       output_height / 2, 2);
 }
 
-/* The wrapper's cookie callback delegates to the selected DMA backend. */
-static dma_addr_t histb_vdec_capture_dma(struct vb2_buffer *vb,
-					 unsigned int plane)
-{
-	struct histb_vdec_capture_mem *mem = vb->planes[plane].mem_priv;
-
-	if (mem->ops == &histb_vdec_cached_memops)
-		return ((struct histb_vdec_cached_buf *)mem->priv)->dma;
-
-	/* Vmalloc capture storage has no device address. */
-	if (mem->ops == &vb2_vmalloc_memops)
-		return 0;
-
-	return vb2_dma_contig_plane_dma_addr(vb, plane);
-}
 
 
 static int histb_vdec_copy_capture(struct histb_vdec_ctx *ctx,
@@ -4129,6 +4304,7 @@ static int histb_vdec_copy_capture(struct histb_vdec_ctx *ctx,
 {
 	struct histb_vdec_decoded_buffer *decoded;
 	struct histb_vpss_frame frame;
+	bool nv15 = ctx->dst.pix.pixelformat == V4L2_PIX_FMT_NV15;
 	dma_addr_t dst_dma;
 	u8 *dst;
 	int ret;
@@ -4138,17 +4314,38 @@ static int histb_vdec_copy_capture(struct histb_vdec_ctx *ctx,
 	if (!dst_buf)
 		return -EPIPE;
 	decoded = histb_vdec_decoded_buffer(dst_buf);
+	if (ctx->dst.pix.pixelformat == V4L2_PIX_FMT_HISTB_TILED_10) {
+		if (!histb_vdec_supports_ht10(ctx) || !ctx->hevc_main10 ||
+		    !decoded->tile_borrowed ||
+		    decoded->tile.dma != histb_vdec_capture_dma(&dst_buf->vb2_buf, 0) ||
+		    decoded->tile.size != ctx->dst.pix.sizeimage)
+			return -EINVAL;
+		/* VDH already wrote this exact exported allocation. No VPSS, CPU
+		 * detile, staging copy or CPU-write publication is involved. vb2
+		 * finish and dma-buf begin_cpu_access perform the real acquire. */
+		dma_rmb();
+		return 0;
+	}
 	if (ctx->avs2 && ctx->avs2->output_slot >= 0)
 		decoded = &ctx->avs2->surface[ctx->avs2->output_slot];
 	if (ctx->mpeg1 && ctx->mpeg1->output_slot >= 0)
 		decoded = &ctx->mpeg1->surface[ctx->mpeg1->output_slot];
-	dst = vb2_plane_vaddr(&dst_buf->vb2_buf, 0);
+	if (nv15 && (ctx->vdec->mv310 || !ctx->hevc || !ctx->hevc_main10 ||
+		     ctx->src.pix.width != ctx->dst.pix.width ||
+		     ctx->src.pix.height != ctx->dst.pix.height))
+		return -EOPNOTSUPP;
+	dst = nv15 ? NULL : vb2_plane_vaddr(&dst_buf->vb2_buf, 0);
 	if (!decoded->tile.cpu)
 		return -EOPNOTSUPP;
 	dst_dma = 0;
-	if (ctx->dst.pix.pixelformat == V4L2_PIX_FMT_NV12) {
+	if (ctx->dst.pix.pixelformat == V4L2_PIX_FMT_NV12 || nv15) {
 		dst_dma = histb_vdec_capture_dma(&dst_buf->vb2_buf, 0);
-		dst_dma += dst_buf->vb2_buf.planes[0].data_offset;
+		if (nv15 && !dst_dma)
+			return -EOPNOTSUPP;
+		if (check_add_overflow(dst_dma,
+				       (dma_addr_t)dst_buf->vb2_buf.planes[0].data_offset,
+				       &dst_dma))
+			return -ERANGE;
 	}
 	if (dst)
 		dst += dst_buf->vb2_buf.planes[0].data_offset;
@@ -4178,6 +4375,7 @@ static int histb_vdec_copy_capture(struct histb_vdec_ctx *ctx,
 		histb_vdec_detile_p010(ctx, decoded->tile.cpu, (__le16 *)dst);
 		/* References remain device-owned after this synchronous copy. */
 		histb_vdec_sync_tile_for_device(ctx, decoded);
+		histb_vdec_capture_publish_cpu_write(&dst_buf->vb2_buf);
 		return 0;
 	}
 	/* Transfer CPU-owned reconstruction storage back to the DMA domain. */
@@ -4185,8 +4383,9 @@ static int histb_vdec_copy_capture(struct histb_vdec_ctx *ctx,
 	memset(&frame, 0, sizeof(frame));
 	frame.input_dma = decoded->tile.dma;
 	frame.input_size = decoded->tile.size;
-	frame.output_size = vb2_plane_size(&dst_buf->vb2_buf, 0);
-	if (ctx->dst.pix.pixelformat == V4L2_PIX_FMT_NV12)
+	frame.output_size = vb2_plane_size(&dst_buf->vb2_buf, 0) -
+		dst_buf->vb2_buf.planes[0].data_offset;
+	if (ctx->dst.pix.pixelformat == V4L2_PIX_FMT_NV12 || nv15)
 		frame.output_dma = dst_dma;
 	frame.output_cpu = dst;
 	/* VDH reconstructs at the coded size; VPSS writes the negotiated size. */
@@ -4203,8 +4402,9 @@ static int histb_vdec_copy_capture(struct histb_vdec_ctx *ctx,
 	frame.input_height_align = histb_vdec_surface_height_align(ctx);
 	frame.output_stride = ctx->dst.pix.bytesperline;
 	frame.input_ten_bit = ctx->hevc_main10;
-	frame.output_ten_bit =
+	frame.output_ten_bit = nv15 ||
 		ctx->dst.pix.pixelformat == V4L2_PIX_FMT_P010;
+	frame.output_packed_ten_bit = nv15;
 	frame.hdr10_to_sdr = ctx->hevc_main10 && !frame.output_ten_bit;
 	if (ctx->vdec->mv310) {
 		u32 height = ALIGN(ctx->src.pix.height, frame.input_height_align);
@@ -4227,16 +4427,21 @@ static int histb_vdec_copy_capture(struct histb_vdec_ctx *ctx,
 	}
 	ret = histb_vpss_detile(ctx->vdec->vpss, &frame);
 	if (!ret) {
+		/* Native NV15 is device-written; vb2 finish acquires CPU ownership. */
+		if (nv15)
+			return 0;
 		/* Acquire CPU ownership before range mapping or userspace access. */
 		ret = histb_vdec_capture_begin_cpu_access(&dst_buf->vb2_buf);
 		if (ret)
 			return ret;
+		if (frame.output_ten_bit)
+			histb_vdec_capture_publish_cpu_write(&dst_buf->vb2_buf);
 		return histb_vdec_apply_vc1_range_map(ctx, dst_buf, dst);
 	}
 	/* MV310 must never read its tiles through CV200's CPU address tables. */
 	if (ctx->vdec->mv310)
 		return ret;
-	if (dst_dma && ctx->dst.pix.pixelformat == V4L2_PIX_FMT_NV12)
+	if (nv15 || (dst_dma && ctx->dst.pix.pixelformat == V4L2_PIX_FMT_NV12))
 		return ret;
 	dev_warn_ratelimited(ctx->vdec->dev,
 			     "VPSS post-process failed (%d), using CPU fallback\n",
@@ -4269,6 +4474,7 @@ static int histb_vdec_copy_capture(struct histb_vdec_ctx *ctx,
 		if (!ctx->hevc_main10)
 			return ret;
 		histb_vdec_detile_p010(ctx, decoded->tile.cpu, (__le16 *)dst);
+		histb_vdec_capture_publish_cpu_write(&dst_buf->vb2_buf);
 	} else {
 		histb_vdec_detile_nv12(ctx, decoded->tile.cpu, dst, true);
 		if (frame.input_width != frame.width ||
@@ -7299,8 +7505,19 @@ histb_vdec_validate_hevc(struct histb_vdec_ctx *ctx,
 	    sps->bit_depth_luma_minus8 != sps->bit_depth_chroma_minus8 ||
 	    (sps->bit_depth_luma_minus8 != 0 &&
 	     sps->bit_depth_luma_minus8 != 2) ||
-	    (ctx->dst.pix.pixelformat == V4L2_PIX_FMT_P010 &&
+	    ((ctx->dst.pix.pixelformat == V4L2_PIX_FMT_P010 ||
+	      ctx->dst.pix.pixelformat == V4L2_PIX_FMT_NV15 ||
+	      ctx->dst.pix.pixelformat == V4L2_PIX_FMT_HISTB_TILED_10) &&
 	     sps->bit_depth_luma_minus8 != 2) ||
+	    (ctx->dst.pix.pixelformat == V4L2_PIX_FMT_NV15 &&
+	     (ctx->vdec->mv310 || (ctx->src.pix.width & 3) ||
+	      (ctx->src.pix.height & 1) ||
+	      ctx->dst.pix.width != ctx->src.pix.width ||
+	      ctx->dst.pix.height != ctx->src.pix.height)) ||
+	    (ctx->dst.pix.pixelformat == V4L2_PIX_FMT_HISTB_TILED_10 &&
+	     (!histb_vdec_supports_ht10(ctx) || slice->pic_struct ||
+	      ctx->dst.pix.width != ctx->src.pix.width ||
+	      ctx->dst.pix.height != ctx->src.pix.height)) ||
 	    (sps->flags & unsupported_sps) ||
 	    ((slice->flags &
 	      V4L2_HEVC_SLICE_PARAMS_FLAG_DEPENDENT_SLICE_SEGMENT) &&
@@ -7370,6 +7587,9 @@ histb_vdec_validate_hevc(struct histb_vdec_ctx *ctx,
 			return -EINVAL;
 	}
 	for (i = 0; i < decode->num_active_dpb_entries; i++) {
+		if (ctx->dst.pix.pixelformat == V4L2_PIX_FMT_HISTB_TILED_10 &&
+		    decode->dpb[i].field_pic)
+			return -EINVAL;
 		if (decode->dpb[i].flags &
 		    ~V4L2_HEVC_DPB_ENTRY_LONG_TERM_REFERENCE)
 			return -EINVAL;
@@ -7968,6 +8188,8 @@ histb_vdec_prepare_hevc_messages(
 			ret, ctx->dst.pix.width, ctx->dst.pix.height);
 		return ret;
 	}
+	/* Earlier queued requests may still need this surface after its QBUF. */
+	decoded->error_tainted = false;
 	/* Only the report, picture and active slice slots belong to this request. */
 	memset(histb_vdec_hevc_msg_slot(msg_base, HISTB_VDEC_UP_MSG_SLOT), 0,
 	       HISTB_VDEC_HEVC_MSG_SLOT_SIZE);
@@ -14128,6 +14350,11 @@ static int histb_vdec_buf_prepare(struct vb2_buffer *vb)
 	      ctx->src.pix.pixelformat != V4L2_PIX_FMT_AVS2 &&
 	      ctx->src.pix.pixelformat != V4L2_PIX_FMT_MPEG1)))
 		return -EINVAL;
+	/* The private tiled ABI exports offset zero for the complete object. */
+	if (V4L2_TYPE_IS_CAPTURE(vb->vb2_queue->type) &&
+	    ctx->dst.pix.pixelformat == V4L2_PIX_FMT_HISTB_TILED_10 &&
+	    (vb->num_planes != 1 || data_offset))
+		return -EINVAL;
 
 	vbuf->field = V4L2_FIELD_NONE;
 	if (V4L2_TYPE_IS_CAPTURE(vb->vb2_queue->type))
@@ -14147,6 +14374,8 @@ static int histb_vdec_buf_init(struct vb2_buffer *vb)
 	decoded = container_of(vb, struct histb_vdec_decoded_buffer,
 			       base.vb.vb2_buf);
 	decoded->apc_slot = HISTB_VDEC_APC_INVALID;
+	decoded->tile_borrowed = false;
+	memset(&decoded->tiled, 0, sizeof(decoded->tiled));
 	decoded->error_tainted = false;
 	decoded->mpeg2_field_saved = false;
 	memset(&decoded->avs, 0, sizeof(decoded->avs));
@@ -14219,8 +14448,20 @@ static void histb_vdec_buf_queue(struct vb2_buffer *vb)
 		histb_mvc_ingress_requeue(&ctx->mvc_ingress, decoded);
 		mutex_unlock(&ctx->mvc_lock);
 		decoded->avs.valid = false;
+		/* MMAP storage is stable: QBUF must not invalidate the old tile
+		 * while earlier queued requests still reference it. Actual target
+		 * reuse revalidates its mapping after retiring the old APC entry.
+		 * Imported storage may change, so do not retain that alias. */
+		if (decoded->tile_borrowed && vb->memory != VB2_MEMORY_MMAP) {
+			decoded->tile.cpu = NULL;
+			decoded->tile.dma = 0;
+			decoded->tile.cpu_owned = false;
+			decoded->tile_borrowed = false;
+			memset(&decoded->tiled, 0, sizeof(decoded->tiled));
+		}
 		/* Stateless reference formats clear this only for a new target. */
 		if (ctx->src.pix.pixelformat != V4L2_PIX_FMT_H264_SLICE &&
+		    ctx->src.pix.pixelformat != V4L2_PIX_FMT_HEVC_SLICE &&
 		    ctx->src.pix.pixelformat != V4L2_PIX_FMT_MPEG2_SLICE &&
 		    ctx->src.pix.pixelformat != V4L2_PIX_FMT_VP8_FRAME &&
 		    ctx->src.pix.pixelformat != V4L2_PIX_FMT_VP9_FRAME)
@@ -14359,6 +14600,26 @@ static void histb_vdec_stop_streaming(struct vb2_queue *vq)
 	if (histb_vdec_is_vc1_format(ctx->src.pix.pixelformat))
 		histb_vdec_reset_vc1_state(ctx);
 	histb_vdec_return_buffers(ctx, vq->type);
+	if (ctx->dst.pix.pixelformat == V4L2_PIX_FMT_HISTB_TILED_10) {
+		struct vb2_queue *capture = v4l2_m2m_get_dst_vq(m2m_ctx);
+		unsigned int i;
+
+		/* abort() has joined VDH and postprocess before either queue stops.
+		 * Drop private PMV and aliases, never the exported capture pages.
+		 * STREAMON/QBUF rebind the same vb2 allocation on the next decode. */
+		histb_vdec_reset_apc(ctx);
+		for (i = 0; i < capture->max_num_buffers; i++) {
+			struct vb2_buffer *vb = vb2_get_buffer(capture, i);
+			struct histb_vdec_decoded_buffer *decoded;
+
+			/* CAPTURE may already be released when OUTPUT stops. */
+			if (!vb)
+				continue;
+			decoded = container_of(vb, struct histb_vdec_decoded_buffer,
+					       base.vb.vb2_buf);
+			histb_vdec_free_decoded_buffers(ctx, decoded);
+		}
+	}
 	if (V4L2_TYPE_IS_CAPTURE(vq->type))
 		histb_vdec_reset_apc(ctx);
 	histb_vdec_reset_vp8_state(ctx);
@@ -14435,6 +14696,11 @@ static int histb_vdec_querycap(struct file *file, void *priv,
 	return 0;
 }
 
+static bool histb_vdec_supports_nv15(const struct histb_vdec_ctx *ctx)
+{
+	return histb_vdec_supports_ht10(ctx);
+}
+
 static int histb_vdec_enum_fmt(struct file *file, void *priv,
 			       struct v4l2_fmtdesc *f)
 {
@@ -14448,6 +14714,20 @@ static int histb_vdec_enum_fmt(struct file *file, void *priv,
 			break;
 		case 1:
 			f->pixelformat = V4L2_PIX_FMT_P010;
+			break;
+		case 2:
+			if (!histb_vdec_supports_nv15(ctx))
+				return -EINVAL;
+			f->pixelformat = V4L2_PIX_FMT_NV15;
+			strscpy(f->description, "10-bit Y/UV 4:2:0 (NV15)",
+				sizeof(f->description));
+			break;
+		case 3:
+			if (!histb_vdec_supports_ht10(ctx))
+				return -EINVAL;
+			f->pixelformat = V4L2_PIX_FMT_HISTB_TILED_10;
+			strscpy(f->description, "CV200 VDH tiled 10-bit 4:2:0",
+				sizeof(f->description));
 			break;
 		default:
 			return -EINVAL;
@@ -14469,6 +14749,15 @@ static int histb_vdec_enum_framesizes(struct file *file, void *priv,
 	/* H.264 controls describe macroblocks; other codecs carry pixel sizes. */
 	u32 step = 1;
 
+	if (fsize->pixel_format == V4L2_PIX_FMT_NV15 ||
+	    fsize->pixel_format == V4L2_PIX_FMT_HISTB_TILED_10) {
+		if (fsize->index || !histb_vdec_supports_ht10(ctx))
+			return -EINVAL;
+		fsize->type = V4L2_FRMSIZE_TYPE_DISCRETE;
+		fsize->discrete.width = ctx->src.pix.width;
+		fsize->discrete.height = ctx->src.pix.height;
+		return 0;
+	}
 	if (fsize->pixel_format != V4L2_PIX_FMT_NV12 &&
 	    fsize->pixel_format != V4L2_PIX_FMT_P010 &&
 	    !histb_vdec_backend_supports_format(backend, fsize->pixel_format))
@@ -14593,9 +14882,14 @@ static void histb_vdec_try_output_format(struct histb_vdec_ctx *ctx,
 static void histb_vdec_try_capture_format(struct histb_vdec_ctx *ctx,
 					  struct v4l2_pix_format *pix)
 {
+	struct histb_vdec_tiled_layout tiled;
+	bool ht10 = pix->pixelformat == V4L2_PIX_FMT_HISTB_TILED_10 &&
+		!histb_vdec_ht10_layout(ctx, &tiled);
 	bool p010 = (ctx->src.pix.pixelformat == V4L2_PIX_FMT_HEVC_SLICE ||
 		ctx->src.pix.pixelformat == V4L2_PIX_FMT_AVS2) &&
 		pix->pixelformat == V4L2_PIX_FMT_P010;
+	bool nv15 = histb_vdec_supports_nv15(ctx) &&
+		pix->pixelformat == V4L2_PIX_FMT_NV15;
 	u32 width = pix->width ?: ctx->src.pix.width;
 	u32 height = pix->height ?: ctx->src.pix.height;
 	u32 min_width;
@@ -14607,7 +14901,7 @@ static void histb_vdec_try_capture_format(struct histb_vdec_ctx *ctx,
 	 * Upscaling remains an internal VC-1 RESPIC operation, not a public
 	 * capture-format promise.
 	 */
-	if ((ctx->vdec->mv310 && p010) ||
+	if (ht10 || nv15 || (ctx->vdec->mv310 && p010) ||
 	    ctx->src.pix.pixelformat == V4L2_PIX_FMT_AVS2 ||
 	    (ctx->src.pix.width & 3) || (ctx->src.pix.height & 1)) {
 		width = ctx->src.pix.width;
@@ -14622,13 +14916,22 @@ static void histb_vdec_try_capture_format(struct histb_vdec_ctx *ctx,
 	}
 	pix->width = width;
 	pix->height = height;
-	pix->pixelformat = p010 ? V4L2_PIX_FMT_P010 : V4L2_PIX_FMT_NV12;
+	pix->pixelformat = ht10 ? V4L2_PIX_FMT_HISTB_TILED_10 :
+		nv15 ? V4L2_PIX_FMT_NV15 :
+		p010 ? V4L2_PIX_FMT_P010 : V4L2_PIX_FMT_NV12;
 	pix->field = V4L2_FIELD_NONE;
-	/* Both public capture formats are linear; CV200 tile storage is internal. */
-	pix->bytesperline = p010 ? ALIGN(pix->width, 2) * 2 :
-		ALIGN(pix->width, 64);
-	pix->sizeimage = pix->bytesperline *
-		(pix->height + DIV_ROUND_UP(pix->height, 2));
+	if (ht10) {
+		/* Full coded height is ABI metadata: never substitute a crop here. */
+		pix->bytesperline = tiled.stride;
+		pix->sizeimage = tiled.size;
+	} else {
+		/* All other capture formats retain their existing linear layout. */
+		pix->bytesperline = nv15 ?
+			ALIGN(DIV_ROUND_UP(pix->width, 4) * 5, 64) :
+			p010 ? ALIGN(pix->width, 2) * 2 : ALIGN(pix->width, 64);
+		pix->sizeimage = pix->bytesperline *
+			(pix->height + DIV_ROUND_UP(pix->height, 2));
+	}
 	pix->colorspace = ctx->src.pix.colorspace;
 	pix->ycbcr_enc = ctx->src.pix.ycbcr_enc;
 	pix->quantization = ctx->src.pix.quantization;
@@ -14639,6 +14942,20 @@ static int histb_vdec_try_fmt(struct file *file, void *priv,
 			      struct v4l2_format *f)
 {
 	struct histb_vdec_ctx *ctx = fh_to_histb_vdec_ctx(priv);
+
+	/* An unsupported explicit ten-bit packed request must not become NV12. */
+	if (V4L2_TYPE_IS_CAPTURE(f->type) &&
+	    f->fmt.pix.pixelformat == V4L2_PIX_FMT_NV15 &&
+	    !histb_vdec_supports_nv15(ctx))
+		return -EINVAL;
+	if (V4L2_TYPE_IS_CAPTURE(f->type) &&
+	    f->fmt.pix.pixelformat == V4L2_PIX_FMT_HISTB_TILED_10) {
+		struct histb_vdec_tiled_layout tiled;
+		int ret = histb_vdec_ht10_layout(ctx, &tiled);
+
+		if (ret)
+			return ret;
+	}
 
 	if (V4L2_TYPE_IS_OUTPUT(f->type))
 		histb_vdec_try_output_format(ctx, &f->fmt.pix);

@@ -813,7 +813,7 @@ static irqreturn_t histb_vpss_irq(int irq, void *data)
 static size_t histb_vpss_output_stride(const struct histb_vpss_frame *frame)
 {
 	if (frame->output_ten_bit)
-		return ALIGN(DIV_ROUND_UP((size_t)frame->width * 10, 8), 64);
+		return ALIGN(DIV_ROUND_UP((size_t)frame->width, 4) * 5, 64);
 
 	return ALIGN(frame->width, 64);
 }
@@ -1404,7 +1404,7 @@ static int histb_vpss_mv310_detile(struct histb_vpss *vpss,
 	    frame->input_layout != HISTB_VPSS_INPUT_MV310_LINEAR)
 		return -EINVAL;
 	if (frame->input_packed_yuv || frame->output_packed_yuv ||
-	    frame->hdr10_to_sdr)
+	    frame->output_packed_ten_bit || frame->hdr10_to_sdr)
 		return -EOPNOTSUPP;
 	tile = frame->input_layout == HISTB_VPSS_INPUT_MV310_TILE;
 	downconvert = !tile && frame->input_ten_bit && !frame->output_ten_bit;
@@ -2440,6 +2440,17 @@ int histb_vpss_detile(struct histb_vpss *vpss,
 	    (u64)input_height >=
 		(u64)frame->height * HISTB_VPSS_ZME_MAX_REDUCTION)
 		return -EINVAL;
+	/* Only the proven native CV200 ten-bit route may expose packed NV15. */
+	if (frame->output_packed_ten_bit &&
+	    (frame->input_layout != HISTB_VPSS_INPUT_CV200 ||
+	     !frame->input_ten_bit || !frame->output_ten_bit ||
+	     frame->input_packed_yuv || frame->output_packed_yuv ||
+	     frame->input_nv21 || frame->hdr10_to_sdr || !frame->input_size ||
+	     input_width != frame->width || input_height != frame->height ||
+	     frame->width > 4096 || frame->height > 2304 ||
+	     !frame->output_dma || (frame->output_dma & 63) ||
+	     frame->output_stride != histb_vpss_output_stride(frame)))
+		return -EOPNOTSUPP;
 	ret = histb_vpss_input_size(frame, &required_input_size);
 	if (ret)
 		return ret;
@@ -2454,10 +2465,12 @@ int histb_vpss_detile(struct histb_vpss *vpss,
 	if (frame->output_size < required_output_size)
 		return -EINVAL;
 	if (frame->output_stride <
-	    frame->width * (frame->output_ten_bit ? 2 : 1) ||
+	    (frame->output_packed_ten_bit ? histb_vpss_output_stride(frame) :
+	     frame->width * (frame->output_ten_bit ? 2 : 1)) ||
 	    upper_32_bits(frame->output_dma))
 		return -EINVAL;
-	direct_output = !frame->output_ten_bit && frame->output_dma;
+	direct_output = (!frame->output_ten_bit ||
+			 frame->output_packed_ten_bit) && frame->output_dma;
 	if ((!direct_output && !frame->output_cpu) ||
 	    (direct_output &&
 	     frame->output_stride < histb_vpss_output_stride(frame)))

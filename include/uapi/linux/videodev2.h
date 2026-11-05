@@ -643,6 +643,8 @@ struct v4l2_pix_format {
 /* two planes -- one Y, one Cr + Cb interleaved  */
 #define V4L2_PIX_FMT_NV12    v4l2_fourcc('N', 'V', '1', '2') /* 12  Y/CbCr 4:2:0  */
 #define V4L2_PIX_FMT_NV21    v4l2_fourcc('N', 'V', '2', '1') /* 12  Y/CrCb 4:2:0  */
+/* Linear little-endian 10-bit: four samples per five bytes, UV interleaved. */
+#define V4L2_PIX_FMT_NV15    v4l2_fourcc('N', 'V', '1', '5') /* 15  Y/CbCr 4:2:0 */
 #define V4L2_PIX_FMT_NV16    v4l2_fourcc('N', 'V', '1', '6') /* 16  Y/CbCr 4:2:2  */
 #define V4L2_PIX_FMT_NV61    v4l2_fourcc('N', 'V', '6', '1') /* 16  Y/CrCb 4:2:2  */
 #define V4L2_PIX_FMT_NV24    v4l2_fourcc('N', 'V', '2', '4') /* 24  Y/CbCr 4:4:4  */
@@ -681,6 +683,18 @@ struct v4l2_pix_format {
 #define V4L2_PIX_FMT_P010_4L4 v4l2_fourcc('T', '0', '1', '0') /* 12  Y/CbCr 4:2:0 10-bit 4x4 macroblocks */
 #define V4L2_PIX_FMT_NV12_8L128       v4l2_fourcc('A', 'T', '1', '2') /* Y/CbCr 4:2:0 8x128 tiles */
 #define V4L2_PIX_FMT_NV12_10BE_8L128  v4l2_fourcc_be('A', 'X', '1', '2') /* Y/CbCr 4:2:0 10-bit 8x128 tiles */
+/*
+ * Project-private CV200 VDH HEVC Main10 reconstruction, not linear YUV.
+ * One contiguous memory plane; width/height are full coded dimensions.
+ * Width is a multiple of four, height is even; progressive 4:2:0 only.
+ * S = ALIGN(width, 256), H = ALIGN(height, 64), bytesperline = S.
+ * High-eight Y starts at 0, interleaved Cr,Cb at S * H; packed low-two Y
+ * starts at S * H * 3 / 2, low-two Cr,Cb at S * H * 3 / 2 + S / 4 * H.
+ * The four tiled regions occupy S * H * 15 / 8 bytes; sizeimage may also
+ * include a backend tail guard. Cropping never changes their offsets.
+ * The matching private DRM modifier is defined by drm/histb_drm.h.
+ */
+#define V4L2_PIX_FMT_HISTB_TILED_10 v4l2_fourcc('H', 'T', '1', '0')
 
 /* Tiled YUV formats, non contiguous planes */
 #define V4L2_PIX_FMT_NV12MT  v4l2_fourcc('T', 'M', '1', '2') /* 12  Y/CbCr 4:2:0 64x32 tiles */
