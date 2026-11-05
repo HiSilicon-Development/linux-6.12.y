@@ -381,6 +381,12 @@ The upper 16 bits are the vendor,
 and the lower 16 bits are the vendor-specific bits. This protocol is
 for the non-Microsoft MCE variant (vendor != 0x800f).
 
+For example, the Gehua remote uses vendor 0x8010. Its keymap, ``rc-gehua``,
+retains full 32-bit scancodes such as 0x80102658 (up) and 0x8010260c
+(power). The leading 0x80 is part of the scancode, not a protocol prefix
+to remove. Selecting NECX and truncating these codes to 24 bits does not
+describe the same IR messages.
+
 
 rc-6-mce (RC_PROTO_RC6_MCE)
 ---------------------------
