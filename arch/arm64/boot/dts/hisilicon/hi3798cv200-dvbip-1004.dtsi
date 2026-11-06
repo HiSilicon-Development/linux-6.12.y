@@ -1,0 +1,196 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/* Common platform wiring for the DVBIP-1004 receiver variants. */
+
+#include "hi3798cv200-dvbip.dtsi"
+
+/ {
+	model = "DVBIP 1004 ARM64";
+	compatible = "dvbip,1004", "hisilicon,hi3798cv200";
+
+	aliases {
+		mmc1 = &sd0;
+	};
+
+	chosen {
+		bootargs = "console=tty0 console=ttyAMA0,115200n8 earlycon=pl011,mmio32,0xf8b00000,115200n8 root=/dev/mmcblk0p6 rootfstype=ext4 rootwait rw blkdevparts=mmcblk0:1M(boot),1M(bootargs),11M(recovery),1M(misc),4M(hwconfig),-(rootfs) mem=2G loglevel=7 clk_ignore_unused fw_devlink=off dvbip.model=1004";
+		stdout-path = "serial0:115200n8";
+	};
+
+
+};
+
+
+&dvbip_sound {
+	simple-audio-card,name = "DVBIP-1004";
+};
+
+/* Keep the original polling policy and restore CPU cooling at the passive trip. */
+&{/thermal-zones/soc-thermal} {
+	polling-delay-passive = <1000>;
+	/delete-property/ sustainable-power;
+};
+
+
+/*
+ * The 8GME4R and 004G60 variants use the CV200 pin controls at 1.8 V.
+ * Linux has validated HS400 at 150 MHz on the 004G60 after an HS200
+ * bootloader hand-off. Validate inherited sample/strobe values and retune
+ * when the firmware hand-off is stale.
+ */
+&emmc {
+	pinctrl-names = "default", "hs200", "hs400";
+	pinctrl-0 = <&ip1004_emmc_default_pins
+		     &ip1004_emmc_reset_pin &ip1004_emmc_strobe_pin>;
+	pinctrl-1 = <&ip1004_emmc_hs200_data_cmd_pins
+		     &ip1004_emmc_hs200_clk_pin
+		     &ip1004_emmc_reset_pin &ip1004_emmc_strobe_pin>;
+	pinctrl-2 = <&ip1004_emmc_hs400_pins
+		     &ip1004_emmc_reset_pin &ip1004_emmc_strobe_pin>;
+	hisilicon,io-voltage-reg = <&sysctrl 0xf4>;
+	hisilicon,hs400-strobe-reg = <&crg 0x290>;
+	hisilicon,inherit-boot-tuning;
+	fifo-depth = <256>;
+	clock-frequency = <100000000>;
+	max-frequency = <150000000>;
+	cap-mmc-highspeed;
+	cap-mmc-hw-reset;
+	mmc-ddr-1_8v;
+	mmc-hs200-1_8v;
+	mmc-hs400-1_8v;
+	no-sd;
+	no-sdio;
+	non-removable;
+	bus-width = <8>;
+	status = "okay";
+};
+
+&sd0 {
+	bus-width = <4>;
+	cap-sd-highspeed;
+	disable-wp;
+	max-frequency = <50000000>;
+	no-1-8-v;
+	no-mmc;
+	no-sdio;
+	status = "okay";
+};
+
+
+&gmac1 {
+	phy-mode = "rgmii-id";
+	hisilicon,phy-reset-delays-us = <10000 20000 50000>;
+};
+
+&tianlai {
+	mute-gpios = <&gpio9 0 GPIO_ACTIVE_LOW>;
+};
+
+&ir {
+	status = "okay";
+};
+
+&pmx0 {
+	ip1004_emmc_default_pins: ip1004-emmc-default-pins {
+		pinctrl-single,pins = <
+			0x000 MUX_M0
+			0x004 MUX_M0
+			0x008 MUX_M0
+			0x00c MUX_M0
+			0x010 MUX_M0
+			0x014 MUX_M0
+			0x018 MUX_M0
+			0x01c MUX_M0
+			0x024 MUX_M0
+			0x028 MUX_M0
+		>;
+		pinctrl-single,bias-pulldown = <
+			PINCTRL_PULLDOWN(0, 1, 0, 1)
+		>;
+		pinctrl-single,bias-pullup = <
+			PINCTRL_PULLUP(0, 1, 0, 1)
+		>;
+		pinctrl-single,slew-rate = <PINCTRL_SLEW_RATE(1, 1)>;
+		pinctrl-single,drive-strength = <PINCTRL_DRV_STRENGTH(0xd, 0xf)>;
+	};
+
+	ip1004_emmc_hs200_data_cmd_pins: ip1004-emmc-hs200-data-cmd-pins {
+		pinctrl-single,pins = <
+			0x000 MUX_M0
+			0x004 MUX_M0
+			0x008 MUX_M0
+			0x00c MUX_M0
+			0x010 MUX_M0
+			0x014 MUX_M0
+			0x018 MUX_M0
+			0x01c MUX_M0
+			0x024 MUX_M0
+		>;
+		pinctrl-single,bias-pulldown = <
+			PINCTRL_PULLDOWN(0, 1, 0, 1)
+		>;
+		pinctrl-single,bias-pullup = <
+			PINCTRL_PULLUP(0, 1, 0, 1)
+		>;
+		pinctrl-single,slew-rate = <PINCTRL_SLEW_RATE(1, 1)>;
+		pinctrl-single,drive-strength = <PINCTRL_DRV_STRENGTH(0xb, 0xf)>;
+	};
+
+	ip1004_emmc_hs200_clk_pin: ip1004-emmc-hs200-clk-pin {
+		pinctrl-single,pins = <0x028 MUX_M0>;
+		pinctrl-single,bias-pulldown = <
+			PINCTRL_PULLDOWN(0, 1, 0, 1)
+		>;
+		pinctrl-single,bias-pullup = <
+			PINCTRL_PULLUP(0, 1, 0, 1)
+		>;
+		pinctrl-single,slew-rate = <PINCTRL_SLEW_RATE(0, 1)>;
+		pinctrl-single,drive-strength = <PINCTRL_DRV_STRENGTH(0x9, 0xf)>;
+	};
+
+	ip1004_emmc_hs400_pins: ip1004-emmc-hs400-pins {
+		pinctrl-single,pins = <
+			0x000 MUX_M0
+			0x004 MUX_M0
+			0x008 MUX_M0
+			0x00c MUX_M0
+			0x010 MUX_M0
+			0x014 MUX_M0
+			0x018 MUX_M0
+			0x01c MUX_M0
+			0x024 MUX_M0
+			0x028 MUX_M0
+		>;
+		pinctrl-single,bias-pulldown = <
+			PINCTRL_PULLDOWN(0, 1, 0, 1)
+		>;
+		pinctrl-single,bias-pullup = <
+			PINCTRL_PULLUP(0, 1, 0, 1)
+		>;
+		pinctrl-single,slew-rate = <PINCTRL_SLEW_RATE(0, 1)>;
+		pinctrl-single,drive-strength = <PINCTRL_DRV_STRENGTH(0x9, 0xf)>;
+	};
+
+	ip1004_emmc_reset_pin: ip1004-emmc-reset-pin {
+		pinctrl-single,pins = <0x02c MUX_M0>;
+		pinctrl-single,bias-pulldown = <
+			PINCTRL_PULLDOWN(0, 1, 0, 1)
+		>;
+		pinctrl-single,bias-pullup = <
+			PINCTRL_PULLUP(0, 1, 0, 1)
+		>;
+		pinctrl-single,slew-rate = <PINCTRL_SLEW_RATE(1, 1)>;
+		pinctrl-single,drive-strength = <PINCTRL_DRV_STRENGTH(0x3, 0xf)>;
+	};
+
+	ip1004_emmc_strobe_pin: ip1004-emmc-strobe-pin {
+		pinctrl-single,pins = <0x030 MUX_M2>;
+		pinctrl-single,bias-pulldown = <
+			PINCTRL_PULLDOWN(1, 1, 0, 1)
+		>;
+		pinctrl-single,bias-pullup = <
+			PINCTRL_PULLUP(0, 1, 0, 1)
+		>;
+		pinctrl-single,slew-rate = <PINCTRL_SLEW_RATE(1, 1)>;
+		pinctrl-single,drive-strength = <PINCTRL_DRV_STRENGTH(0x3, 0xf)>;
+	};
+};
