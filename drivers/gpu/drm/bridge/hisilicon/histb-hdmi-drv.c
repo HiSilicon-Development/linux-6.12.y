@@ -1738,11 +1738,15 @@ int histb_hdmi_connector_init(struct drm_bridge *bridge,
 }
 EXPORT_SYMBOL_GPL(histb_hdmi_connector_init);
 
+static bool histb_hdmi_scdc_enable(struct histb_hdmi *hdmi,
+				   struct drm_connector *connector);
+
 static void histb_hdmi_hpd_work(struct work_struct *work)
 {
 	struct histb_hdmi *hdmi = container_of(to_delayed_work(work),
 					      struct histb_hdmi, hpd_work);
 	enum drm_connector_status status;
+	bool status_changed;
 	u8 intr1;
 
 	if (!READ_ONCE(hdmi->hpd_enabled))
@@ -1759,8 +1763,10 @@ static void histb_hdmi_hpd_work(struct work_struct *work)
 	}
 
 	status = histb_hdmi_bridge_detect(&hdmi->bridge);
+	status_changed = READ_ONCE(hdmi->last_reported_status) != status;
 	if (status != connector_status_connected) {
 		mutex_lock(&hdmi->audio_lock);
+		hdmi->scdc_enabled = false;
 		histb_audio_disable(&hdmi->audio);
 		histb_hdmi_hdcp_stop(hdmi);
 		histb_hdmi_hdcp_queue(hdmi, 0);
@@ -1770,18 +1776,30 @@ static void histb_hdmi_hpd_work(struct work_struct *work)
 	if (status != connector_status_connected)
 		cec_phys_addr_invalidate(hdmi->cec_adap);
 #endif
-	if (READ_ONCE(hdmi->last_reported_status) != status) {
-		WRITE_ONCE(hdmi->last_reported_status, status);
-		drm_bridge_hpd_notify(&hdmi->bridge, status);
-	}
 	if (status == connector_status_connected) {
 		mutex_lock(&hdmi->audio_lock);
+		/* A TV can lose SCDC while KMS keeps the same active mode. */
+		if (status_changed && hdmi->mode_ready && hdmi->pixel_enabled &&
+		    hdmi->high_tmds && hdmi->active_connector) {
+			histb_hdmi_tmds_enable(hdmi, false);
+			hdmi->scdc_enabled = false;
+			if (histb_hdmi_scdc_enable(hdmi, hdmi->active_connector))
+				histb_hdmi_tmds_enable(hdmi, true);
+			else
+				dev_err(hdmi->dev,
+					"HDMI SCDC hotplug restore failed; keeping TMDS disabled\n");
+		}
 		/* An already-running PCM keeps its configuration across HPD loss. */
 		if (!hdmi->audio.active && hdmi->mode_ready && hdmi->pixel_enabled &&
+		    (!hdmi->high_tmds || hdmi->scdc_enabled) &&
 		    histb_hdmi_audio_restore(hdmi) && hdmi->audio.configured)
 			dev_warn_ratelimited(hdmi->dev,
 					     "HDMI PCM hotplug restore failed\n");
 		mutex_unlock(&hdmi->audio_lock);
+	}
+	if (status_changed) {
+		WRITE_ONCE(hdmi->last_reported_status, status);
+		drm_bridge_hpd_notify(&hdmi->bridge, status);
 	}
 
 	if (hdmi->hpd_polling && READ_ONCE(hdmi->hpd_enabled))
