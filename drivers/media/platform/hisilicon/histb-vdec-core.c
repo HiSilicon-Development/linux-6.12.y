@@ -13230,12 +13230,13 @@ static void histb_vdec_run(void *priv)
 {
 	struct histb_vdec_ctx *ctx = priv;
 	struct histb_vdec_dev *vdec = ctx->vdec;
-	const struct v4l2_ctrl_h264_decode_params *decode;
-	const struct v4l2_ctrl_h264_slice_params *slice;
-	const struct v4l2_ctrl_h264_scaling_matrix *scaling;
-	const struct v4l2_ctrl_h264_sps *sps;
-	const struct v4l2_ctrl_h264_pps *pps;
-	const struct v4l2_ctrl_h264_pred_weights *pred_weights;
+	const struct v4l2_ctrl_h264_decode_params *decode = NULL;
+	const struct v4l2_ctrl_h264_slice_params *slice = NULL;
+	const struct v4l2_ctrl_h264_scaling_matrix *scaling = NULL;
+	const struct v4l2_ctrl_h264_sps *sps = NULL;
+	const struct v4l2_ctrl_h264_pps *pps = NULL;
+	const struct v4l2_ctrl_h264_pred_weights *pred_weights = NULL;
+	const char *stage = "generic";
 	struct histb_vdec_decoded_buffer *decoded;
 	struct vb2_v4l2_buffer *src, *dst;
 	struct media_request *request;
@@ -13282,6 +13283,7 @@ static void histb_vdec_run(void *priv)
 	ctx->mpeg2_picture_valid = false;
 
 	request = src->vb2_buf.req_obj.req;
+	stage = "request-controls";
 	if (request) {
 		ret = v4l2_ctrl_request_setup(request, &ctx->ctrl_handler);
 		if (ret)
@@ -13291,6 +13293,7 @@ static void histb_vdec_run(void *priv)
 		ret = -EINVAL;
 		goto finish_request;
 	}
+	stage = "generic";
 	bytesused = vb2_get_plane_payload(&src->vb2_buf, 0);
 	if (src->vb2_buf.planes[0].data_offset > bytesused) {
 		dev_err_ratelimited(vdec->dev,
@@ -13714,6 +13717,7 @@ static void histb_vdec_run(void *priv)
 		goto start_hardware;
 	}
 
+	stage = "h264-controls";
 	decode = histb_vdec_ctrl_data(ctx,
 				      V4L2_CID_STATELESS_H264_DECODE_PARAMS);
 	sps = histb_vdec_ctrl_data(ctx, V4L2_CID_STATELESS_H264_SPS);
@@ -13724,6 +13728,11 @@ static void histb_vdec_run(void *priv)
 				     V4L2_CID_STATELESS_H264_SLICE_PARAMS);
 	pred_weights = histb_vdec_ctrl_data(
 		ctx, V4L2_CID_STATELESS_H264_PRED_WEIGHTS);
+	if (!decode || !sps || !pps || !scaling || !slice) {
+		ret = -EINVAL;
+		goto finish_request;
+	}
+	stage = "h264-packet";
 	ret = histb_vdec_h264_packet(ctx, src, &payload, &h264_offset, &h264_identity);
 	if (ret)
 		goto finish_request;
@@ -13732,16 +13741,19 @@ static void histb_vdec_run(void *priv)
 	ctx->h264_last_slice =
 		!(src->flags & V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF);
 	ctx->h264_first_mb = slice ? slice->first_mb_in_slice : 0;
+	stage = "h264-validate";
 	ret = histb_vdec_validate_h264(ctx, decode, sps, pps, slice,
 				      pred_weights, payload, ctx->h264_new_frame);
 	if (ret)
 		goto finish_request;
+	stage = "h264-slice-limit";
 	if (ctx->h264_slices >= HISTB_VDEC_H264_MAX_SLICES) {
 		ret = -E2BIG;
 		goto finish_request;
 	}
 	if (ctx->h264_new_frame) {
 		if (ctx->mvc_ingress.subset.is_valid) {
+			stage = "h264-mvc-prepare";
 			mutex_lock(&ctx->mvc_lock);
 			ret = histb_mvc_ingress_prepare(&ctx->mvc_ingress,
 						      &h264_identity, decode, decoded);
@@ -13750,17 +13762,20 @@ static void histb_vdec_run(void *priv)
 				goto finish_request;
 			histb_vdec_mvc_reap(ctx);
 			/* Request timestamps identify the user's exact CAPTURE target. */
+			stage = "h264-mvc-target-busy";
 			if (histb_vdec_mvc_busy(ctx, decoded)) {
 				ret = -EBUSY;
 				goto finish_request;
 			}
 		}
+		stage = "h264-begin-picture";
 		ret = histb_vdec_begin_h264_picture(
 			ctx, decoded, src->vb2_buf.timestamp, decode, sps);
 		if (ret)
 			goto finish_request;
 	}
 
+	stage = "h264-dma";
 	if (!histb_vdec_dma_buffers_valid(ctx)) {
 		ret = -EINVAL;
 		goto finish_request;
@@ -13768,6 +13783,7 @@ static void histb_vdec_run(void *priv)
 	{
 		u32 tail_bits;
 
+		stage = "h264-append";
 		ret = histb_vdec_append_h264_bitstream(ctx, src, h264_offset,
 						       &payload, &src_dma, &tail_bits);
 		if (ret)
@@ -13775,6 +13791,7 @@ static void histb_vdec_run(void *priv)
 		/* CABAC retains rbsp_stop_one_bit and removes trailing zero bits. */
 		if (pps->flags & V4L2_H264_PPS_FLAG_ENTROPY_CODING_MODE)
 			tail_bits--;
+		stage = "h264-messages";
 		ret = histb_vdec_prepare_messages(ctx, decoded, decode, sps, pps,
 					  scaling, slice, pred_weights,
 					  ctx->bitstream.dma, src_dma,
@@ -13939,8 +13956,8 @@ start_hardware:
 	return;
 
 finish_request:
-	dev_err(vdec->dev, "%4.4s request setup failed: %d\n",
-			    (char *)&ctx->src.pix.pixelformat, ret);
+	dev_err(vdec->dev, "%4.4s request setup failed: %d stage=%s\n",
+		(char *)&ctx->src.pix.pixelformat, ret, stage);
 	kfree(avs_streams);
 	kfree(hevc_streams);
 	kfree(mpeg2_slices);
