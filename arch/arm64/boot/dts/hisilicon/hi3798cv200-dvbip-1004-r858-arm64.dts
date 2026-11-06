@@ -1,0 +1,201 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/* DVBIP-1004 with two external Hi3130v200 demodulators and an R858 pair. */
+
+/dts-v1/;
+
+#include "hi3798cv200-dvbip-1004.dtsi"
+
+/ {
+	compatible = "dvbip,1004-r858", "dvbip,1004", "hisilicon,hi3798cv200";
+};
+
+/* Factory SCI uses CMOS clock/reset and an open-drain VCC enable. */
+&sci0 {
+	hisilicon,vcc-enable-open-drain;
+};
+
+/* Factory tuner 1 feeds TSI0; factory tuner 0 feeds TSI1. */
+&dvbip_demux_input0 {
+	status = "okay";
+	/delete-property/ hisilicon,clock-inverted;
+	hisilicon,ts-mode = "serial-nosync";
+	hisilicon,cv200-legacy-ts-tuning;
+	hisilicon,hardware-pid-filtering;
+
+	port {
+		ip1004_r858_input0: endpoint {
+			remote-endpoint = <&ip1004_hi3130_output1>;
+		};
+	};
+};
+
+&dvbip_demux_input1 {
+	status = "okay";
+	/delete-property/ hisilicon,clock-inverted;
+	hisilicon,ts-mode = "serial-nosync";
+	hisilicon,cv200-legacy-ts-tuning;
+	hisilicon,hardware-pid-filtering;
+
+	port {
+		ip1004_r858_input1: endpoint {
+			remote-endpoint = <&ip1004_hi3130_output0>;
+		};
+	};
+};
+
+&dvbip_demux_input2 {
+	status = "disabled";
+};
+
+&dvbip_demux_input3 {
+	status = "disabled";
+};
+
+&demux {
+	pinctrl-names = "default";
+	pinctrl-0 = <&ip1004_r858_tsi_pins &ip1004_r858_tsi1_clk_pin>;
+	assigned-clock-parents = <&crg HISTB_TSI_INDEPENDENT_CLK>;
+};
+
+&pmx0 {
+	ip1004_r858_i2c1_pins: ip1004-r858-i2c1-pins {
+		pinctrl-single,pins = <
+			0x0f8 MUX_M3 /* I2C1_SCL alternate route */
+			0x0fc MUX_M3 /* I2C1_SDA alternate route */
+		>;
+		pinctrl-single,slew-rate = <PINCTRL_SLEW_RATE(1, 1)>;
+		pinctrl-single,drive-strength = <PINCTRL_DRV_STRENGTH(3, 0xf)>;
+	};
+
+	ip1004_r858_i2c2_pins: ip1004-r858-i2c2-pins {
+		pinctrl-single,pins = <
+			0x0dc MUX_M4 /* I2C2_SCL */
+			0x0e0 MUX_M4 /* I2C2_SDA */
+		>;
+		pinctrl-single,slew-rate = <PINCTRL_SLEW_RATE(1, 1)>;
+		pinctrl-single,drive-strength = <PINCTRL_DRV_STRENGTH(3, 0xf)>;
+	};
+
+	ip1004_r858_i2c3_clk_pin: ip1004-r858-i2c3-clk-pin {
+		pinctrl-single,pins = <0x0b0 MUX_M5>;
+		pinctrl-single,slew-rate = <PINCTRL_SLEW_RATE(1, 1)>;
+		pinctrl-single,drive-strength = <PINCTRL_DRV_STRENGTH(7, 0xf)>;
+	};
+
+	ip1004_r858_i2c3_data_pin: ip1004-r858-i2c3-data-pin {
+		pinctrl-single,pins = <0x0b4 MUX_M5>;
+		pinctrl-single,slew-rate = <PINCTRL_SLEW_RATE(1, 1)>;
+		pinctrl-single,drive-strength = <PINCTRL_DRV_STRENGTH(0xf, 0xf)>;
+	};
+
+	ip1004_hi3130_reset0_pin: ip1004-hi3130-reset0-pin {
+		pinctrl-single,pins = <0x0c8 MUX_M0>; /* GPIO7_4 */
+		pinctrl-single,slew-rate = <PINCTRL_SLEW_RATE(1, 1)>;
+		pinctrl-single,drive-strength = <PINCTRL_DRV_STRENGTH(3, 0xf)>;
+	};
+
+	ip1004_hi3130_reset1_pin: ip1004-hi3130-reset1-pin {
+		pinctrl-single,pins = <0x0e4 MUX_M0>; /* GPIO8_3 */
+		pinctrl-single,slew-rate = <PINCTRL_SLEW_RATE(1, 1)>;
+		pinctrl-single,drive-strength = <PINCTRL_DRV_STRENGTH(3, 0xf)>;
+	};
+
+	ip1004_r858_tsi_pins: ip1004-r858-tsi-pins {
+		pinctrl-single,pins = <
+			0x0cc MUX_M5 /* TSI1_SYNC */
+			0x0d0 MUX_M5 /* TSI1_D0 */
+			0x0e8 MUX_M5 /* TSI0_SYNC */
+			0x0ec MUX_M5 /* TSI0_D0 */
+			0x0f0 MUX_M5 /* TSI0_CLK */
+		>;
+		pinctrl-single,slew-rate = <PINCTRL_SLEW_RATE(1, 1)>;
+		pinctrl-single,drive-strength = <PINCTRL_DRV_STRENGTH(3, 0xf)>;
+	};
+
+	ip1004_r858_tsi1_clk_pin: ip1004-r858-tsi1-clk-pin {
+		pinctrl-single,pins = <0x0d4 MUX_M5>;
+		pinctrl-single,slew-rate = <PINCTRL_SLEW_RATE(1, 1)>;
+		pinctrl-single,drive-strength = <PINCTRL_DRV_STRENGTH(7, 0xf)>;
+	};
+};
+
+&i2c2 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&ip1004_r858_i2c2_pins>;
+	status = "okay";
+
+	ip1004_hi3130_0: demodulator@50 {
+		compatible = "hisilicon,hi3130";
+		reg = <0x50>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&ip1004_hi3130_reset0_pin>;
+		reset-gpios = <&gpio7 4 GPIO_ACTIVE_LOW>;
+		clock-frequency = <28800000>;
+		hisilicon,ts-mode = "serial-nosync";
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		ip1004_r858_0: tuner@a {
+			reg = <0x0a>;
+			i2c-parent = <&i2c3>;
+			clock-frequency = <24000000>;
+			rafael,tuner-index = <0>;
+			rafael,peer = <&ip1004_r858_1>;
+			rafael,if-frequency-hz = <5000000>;
+			rafael,xtal-role = <1>;
+			rafael,xtal-cap = <25>;
+			rafael,loop-through;
+			rafael,clock-out;
+		};
+
+		port {
+			ip1004_hi3130_output0: endpoint {
+				remote-endpoint = <&ip1004_r858_input1>;
+			};
+		};
+	};
+};
+
+&i2c1 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&ip1004_r858_i2c1_pins>;
+	status = "okay";
+
+	ip1004_hi3130_1: demodulator@50 {
+		compatible = "hisilicon,hi3130";
+		reg = <0x50>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&ip1004_hi3130_reset1_pin>;
+		reset-gpios = <&gpio8 3 GPIO_ACTIVE_LOW>;
+		clock-frequency = <28800000>;
+		hisilicon,ts-mode = "serial-nosync";
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		ip1004_r858_1: tuner@1a {
+			reg = <0x1a>;
+			i2c-parent = <&i2c3>;
+			clock-frequency = <24000000>;
+			rafael,tuner-index = <1>;
+			rafael,peer = <&ip1004_r858_0>;
+			rafael,if-frequency-hz = <5500000>;
+			rafael,xtal-role = <1>;
+			rafael,xtal-cap = <25>;
+			rafael,loop-through;
+			rafael,clock-out;
+		};
+
+		port {
+			ip1004_hi3130_output1: endpoint {
+				remote-endpoint = <&ip1004_r858_input0>;
+			};
+		};
+	};
+};
+
+/* Factory hardware detection reads the R858 directly on I2C3. */
+&i2c3 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&ip1004_r858_i2c3_clk_pin &ip1004_r858_i2c3_data_pin>;
+	status = "okay";
+};

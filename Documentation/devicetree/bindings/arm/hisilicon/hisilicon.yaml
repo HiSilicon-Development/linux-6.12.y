@@ -35,6 +35,12 @@ properties:
               - hisilicon,hi3798cv200-poplar
           - const: hisilicon,hi3798cv200
 
+      - description: Hi3798CV200 DVBIP-1004 with dual Hi3130 and R858 receivers.
+        items:
+          - const: dvbip,1004-r858
+          - const: dvbip,1004
+          - const: hisilicon,hi3798cv200
+
       - description: Hi3798MV310 based boards.
         items:
           - const: huawei,ec6110t
