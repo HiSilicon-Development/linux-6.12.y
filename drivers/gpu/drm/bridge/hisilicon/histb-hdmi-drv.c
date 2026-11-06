@@ -2902,10 +2902,10 @@ static int histb_hdmi_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, ret, "failed to register HDMI codec\n");
 	}
 #if IS_ENABLED(CONFIG_CEC_CORE)
+	/* The auxiliary domain keeps CEC usable while a sleeping TV drops HPD. */
 	hdmi->cec_adap = cec_allocate_adapter(&histb_hdmi_cec_ops, hdmi,
 					      dev_name(dev),
-					      CEC_CAP_DEFAULTS | CEC_CAP_CONNECTOR_INFO |
-					      CEC_CAP_NEEDS_HPD,
+					      CEC_CAP_DEFAULTS | CEC_CAP_CONNECTOR_INFO,
 					      1);
 	if (IS_ERR(hdmi->cec_adap)) {
 		ret = PTR_ERR(hdmi->cec_adap);
