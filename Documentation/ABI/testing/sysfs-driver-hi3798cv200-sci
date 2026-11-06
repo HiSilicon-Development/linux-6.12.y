@@ -44,6 +44,11 @@ Contact:	linux-serial@vger.kernel.org
 Description:
 		Last answer-to-reset captured by the controller driver.  The first
 		field is the byte count followed by hexadecimal bytes.
+		This is the driver's cache, not the TTY receive queue; reading it
+		does not consume bytes from /dev/ttySCI0. A complete cached ATR or
+		an incremented atr_complete counter does not guarantee that a single
+		TTY read returns the complete ATR. Userspace must handle positive
+		short reads and collect the expected ATR length independently.
 
 What:		/sys/bus/platform/devices/*/sci/atr_protocol
 Date:		August 2026
