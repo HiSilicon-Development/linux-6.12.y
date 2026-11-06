@@ -124,6 +124,7 @@
 #define  HISTB_HDMI_AIP_RST_AUDIO		BIT(0)
 #define  HISTB_HDMI_AIP_RST_FIFO		BIT(1)
 #define HISTB_HDMI_ACR_CTRL		HISTB_HDMI_REG(0xa, 0x01)
+#define  HISTB_HDMI_ACR_CTS_REQ_EN	BIT(1)
 #define HISTB_HDMI_N_SVAL		HISTB_HDMI_REG(0xa, 0x03)
 #define HISTB_HDMI_AUD_MODE		HISTB_HDMI_REG(0xa, 0x14)
 #define HISTB_HDMI_I2S_IN_MAP		HISTB_HDMI_REG(0xa, 0x1c)
@@ -1076,6 +1077,9 @@ static void histb_hdmi_audio_stop(void *data)
 	if (!hdmi->aux_enabled)
 		return;
 	histb_hdmi_updateb(hdmi, HISTB_HDMI_AUDP_TXCTRL, BIT(7), BIT(7));
+	/* CTS/N requests have their own gate, independent of audio sample packets. */
+	histb_hdmi_updateb(hdmi, HISTB_HDMI_ACR_CTRL,
+			   HISTB_HDMI_ACR_CTS_REQ_EN, 0);
 	histb_hdmi_updateb(hdmi, HISTB_HDMI_AUD_EN, HISTB_HDMI_AUD_IN_EN, 0);
 	histb_hdmi_updateb(hdmi, HISTB_HDMI_PKT_FILTER1,
 			   HISTB_HDMI_AUDIO_PKT_ENABLE, 0);
@@ -2072,7 +2076,8 @@ static int histb_hdmi_audio_program(void *data,
 	 * represent a 768 kHz two-channel IEC61937 carrier.
 	 */
 	histb_hdmi_writeb(hdmi, HISTB_HDMI_AUD_MODE, 0);
-	histb_hdmi_writeb(hdmi, HISTB_HDMI_ACR_CTRL, 0x0e);
+	/* Keep CTS/N requests off until N, I2S and the input FIFO are ready. */
+	histb_hdmi_writeb(hdmi, HISTB_HDMI_ACR_CTRL, 0x0c);
 	for (i = 0; i < 5; i++)
 		histb_hdmi_writeb(hdmi, HISTB_HDMI_REG(0xa, 0x1e + i),
 				   params->iec.status[i]);
@@ -2097,6 +2102,8 @@ static int histb_hdmi_audio_program(void *data,
 	histb_hdmi_writeb(hdmi, HISTB_HDMI_AIP_RST, 0);
 	histb_hdmi_updateb(hdmi, HISTB_HDMI_AUD_EN,
 			   HISTB_HDMI_AUD_IN_EN, HISTB_HDMI_AUD_IN_EN);
+	histb_hdmi_updateb(hdmi, HISTB_HDMI_ACR_CTRL,
+			   HISTB_HDMI_ACR_CTS_REQ_EN, HISTB_HDMI_ACR_CTS_REQ_EN);
 	histb_hdmi_updateb(hdmi, HISTB_HDMI_PKT_FILTER1,
 			   HISTB_HDMI_AUDIO_PKT_ENABLE, HISTB_HDMI_AUDIO_PKT_ENABLE);
 	histb_hdmi_updateb(hdmi, HISTB_HDMI_AUDP_TXCTRL, BIT(7), 0);

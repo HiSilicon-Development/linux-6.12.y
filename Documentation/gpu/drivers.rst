@@ -191,6 +191,14 @@ active. It refreshes ELD and reapplies the configured stream after a modeset;
 it never revives audio on a disabled link. This lifecycle does not by itself
 prove continuous sound or recovery at the physical receiver.
 
+CV200 audio stop gates CTS/N requests in ``ACR_CTRL`` as well as sample
+input, audio-packet pass-through and the audio infoframe. These are separate
+hardware controls: disabled sample packets do not prove disabled clock
+packets. Programming keeps CTS/N requests gated until N, I2S and the FIFO
+configuration are ready. No stream volume, sink capability or CEC policy is
+changed. This shutdown invariant does not establish silence at a physical
+receiver or fix PREPARED/trigger-state ownership by itself.
+
 CV200 multichannel samples follow the exposed CEA channel map:
 ``FL FR LFE FC RL RR [RLC RRC]``, with allocations 0x0b and 0x13 for
 5.1 and 7.1 respectively. A conventional WAV channel order is not
