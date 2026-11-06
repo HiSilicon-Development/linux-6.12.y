@@ -16,6 +16,7 @@
 #include <linux/i2c.h>
 #include <linux/iopoll.h>
 #include <linux/interrupt.h>
+#include <linux/kref.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
@@ -31,6 +32,7 @@
 #include <media/dvb_demux.h>
 #include <media/dvb_frontend.h>
 #include <media/dvbdev.h>
+#include <media/hi3130.h>
 #include <media/mxl214.h>
 
 #define HISTB_DMX_MAX_INPUTS		6
@@ -286,6 +288,7 @@ struct histb_dmx_input {
 	u8 rec_id;
 
 	struct dvb_adapter adapter;
+	char adapter_name[32];
 	struct dvb_device *ca_devs[HISTB_DMX_CA_ALIASES];
 	struct dvb_demux demux;
 	struct dmxdev dmxdev;
@@ -293,6 +296,7 @@ struct histb_dmx_input {
 	struct dmx_frontend mem_frontend;
 	struct i2c_client *frontend_client;
 	struct dvb_frontend *frontend;
+	void (*frontend_release)(struct dvb_frontend *frontend);
 	bool adapter_registered;
 	unsigned int ca_registered;
 	unsigned int ca_open_count;
@@ -334,6 +338,7 @@ static int histb_dmx_flush_channel(struct histb_dmx *dmx,
 				   unsigned int channel_id);
 
 struct histb_dmx {
+	struct kref ref;
 	struct device *dev;
 	struct delayed_work partial_work;
 	void __iomem *regs;
@@ -354,7 +359,23 @@ struct histb_dmx {
 	u32 active_oqs;
 	bool irq_live;
 	bool clear_engine_faulted;
+	bool removed; /* Admission and CA MMIO are serialized by ca_lock. */
 };
+
+static void histb_dmx_free_context(struct kref *ref)
+{
+	struct histb_dmx *dmx = container_of(ref, struct histb_dmx, ref);
+
+	put_device(dmx->dev);
+	kfree(dmx);
+}
+
+static void histb_dmx_put_context(void *data)
+{
+	struct histb_dmx *dmx = data;
+
+	kref_put(&dmx->ref, histb_dmx_free_context);
+}
 
 DVB_DEFINE_MOD_OPT_ADAPTER_NR(adapter_nr);
 
@@ -727,13 +748,20 @@ static int histb_dmx_ca_ioctl(struct file *file, unsigned int cmd, void *arg)
 	struct histb_dmx *dmx = input->dmx;
 	int ret = 0;
 
+	if (READ_ONCE(dmx->removed))
+		return -ENODEV;
+
 	switch (cmd) {
 	case CA_RESET:
 		mutex_lock(&input->lock);
 		mutex_lock(&dmx->ca_lock);
-		histb_dmx_reset_ca_locked(input);
-		if (input->running)
-			ret = histb_dmx_update_stream_mode_locked(input);
+		if (dmx->removed) {
+			ret = -ENODEV;
+		} else {
+			histb_dmx_reset_ca_locked(input);
+			if (input->running)
+				ret = histb_dmx_update_stream_mode_locked(input);
+		}
 		mutex_unlock(&dmx->ca_lock);
 		mutex_unlock(&input->lock);
 		break;
@@ -761,6 +789,10 @@ static int histb_dmx_ca_ioctl(struct file *file, unsigned int cmd, void *arg)
 			return -EINVAL;
 
 		mutex_lock(&dmx->ca_lock);
+		if (dmx->removed) {
+			ret = -ENODEV;
+			goto unlock_descr;
+		}
 		slot = histb_dmx_alloc_ca_slot_locked(input, descr->index);
 		if (slot < 0)
 			ret = slot;
@@ -772,13 +804,15 @@ static int histb_dmx_ca_ioctl(struct file *file, unsigned int cmd, void *arg)
 			       descr->cw, sizeof(descr->cw));
 			input->ca_cw_valid[descr->index][descr->parity] = true;
 		}
+unlock_descr:
 		mutex_unlock(&dmx->ca_lock);
 		break;
 	}
 	case HISTB_CA_SET_PID:
 		mutex_lock(&input->lock);
 		mutex_lock(&dmx->ca_lock);
-		ret = histb_dmx_ca_set_pid_locked(input, arg);
+		ret = dmx->removed ? -ENODEV :
+			histb_dmx_ca_set_pid_locked(input, arg);
 		mutex_unlock(&dmx->ca_lock);
 		mutex_unlock(&input->lock);
 		break;
@@ -800,6 +834,7 @@ static int histb_dmx_ca_release(struct inode *inode, struct file *file)
 	struct dvb_device *dvbdev = file->private_data;
 	struct histb_dmx_input *input;
 	struct histb_dmx *dmx;
+	int ret;
 
 	if (!dvbdev)
 		return -ENODEV;
@@ -809,23 +844,23 @@ static int histb_dmx_ca_release(struct inode *inode, struct file *file)
 
 	mutex_lock(&input->lock);
 	mutex_lock(&dmx->ca_lock);
-	if (WARN_ON(!input->ca_open_count)) {
-		mutex_unlock(&dmx->ca_lock);
-		mutex_unlock(&input->lock);
-		return dvb_generic_release(inode, file);
-	}
+	if (WARN_ON(!input->ca_open_count))
+		goto unlock;
 
 	input->ca_open_count--;
 	/* Drop stale PID/CW state after the final CA alias is closed. */
-	if (!input->ca_open_count) {
+	if (!input->ca_open_count && !dmx->removed) {
 		histb_dmx_reset_ca_locked(input);
 		if (input->running)
 			histb_dmx_update_stream_mode_locked(input);
 	}
+unlock:
 	mutex_unlock(&dmx->ca_lock);
 	mutex_unlock(&input->lock);
 
-	return dvb_generic_release(inode, file);
+	ret = dvb_generic_release(inode, file);
+	histb_dmx_put_context(dmx);
+	return ret;
 }
 
 static int histb_dmx_ca_open(struct inode *inode, struct file *file)
@@ -835,19 +870,25 @@ static int histb_dmx_ca_open(struct inode *inode, struct file *file)
 	struct histb_dmx *dmx;
 	int ret;
 
-	ret = dvb_generic_open(inode, file);
-	if (ret)
-		return ret;
-
 	dvbdev = file->private_data;
+	if (!dvbdev)
+		return -ENODEV;
 	input = dvbdev->priv;
 	dmx = input->dmx;
 
 	mutex_lock(&dmx->ca_lock);
-	input->ca_open_count++;
+	if (dmx->removed) {
+		ret = -ENODEV;
+	} else {
+		ret = dvb_generic_open(inode, file);
+		if (!ret) {
+			kref_get(&dmx->ref);
+			input->ca_open_count++;
+		}
+	}
 	mutex_unlock(&dmx->ca_lock);
 
-	return 0;
+	return ret;
 }
 
 static const struct file_operations histb_dmx_ca_fops = {
@@ -1718,6 +1759,10 @@ static int histb_dmx_start_feed(struct dvb_demux_feed *feed)
 
 	mutex_lock(&input->lock);
 	mutex_lock(&dmx->ca_lock);
+	if (dmx->removed) {
+		ret = -ENODEV;
+		goto unlock;
+	}
 	if (input->queue_faulted) {
 		ret = -EIO;
 		goto unlock;
@@ -2164,6 +2209,27 @@ static void histb_dmx_put_i2c_client(void *data)
 	put_device(&client->dev);
 }
 
+static void histb_dmx_release_frontend(struct dvb_frontend *frontend)
+{
+	struct histb_dmx_input *input =
+		container_of(frontend->dvb, struct histb_dmx_input, adapter);
+	struct histb_dmx *dmx = input->dmx;
+	void (*release)(struct dvb_frontend *) = input->frontend_release;
+
+#ifdef CONFIG_MEDIA_ATTACH
+	/* The core puts this wrapper after it returns, not the provider. */
+	__module_get(THIS_MODULE);
+#endif
+	input->frontend_release = NULL;
+	frontend->ops.release = release;
+	if (release) {
+		release(frontend);
+		dvb_detach(release);
+	}
+	/* The provider may have freed frontend; do not access it again. */
+	histb_dmx_put_context(dmx);
+}
+
 static void histb_dmx_put_frontend(void *data)
 {
 	struct histb_dmx_input *input = data;
@@ -2184,6 +2250,7 @@ static int histb_dmx_parse_frontend(struct histb_dmx_input *input,
 	struct i2c_client *client;
 	struct dvb_frontend *frontend;
 	struct of_endpoint remote = { };
+	bool is_hi3130;
 	int ret;
 
 	endpoint = of_graph_get_next_endpoint(np, NULL);
@@ -2206,7 +2273,9 @@ static int histb_dmx_parse_frontend(struct histb_dmx_input *input,
 				     np);
 	}
 
-	if (!of_device_is_compatible(frontend_node, "maxlinear,mxl214")) {
+	is_hi3130 = of_device_is_compatible(frontend_node, "hisilicon,hi3130");
+	if (!is_hi3130 &&
+	    !of_device_is_compatible(frontend_node, "maxlinear,mxl214")) {
 		ret = dev_err_probe(dev, -ENODEV,
 				    "%pOF: unsupported frontend %pOF\n",
 				    np, frontend_node);
@@ -2224,7 +2293,8 @@ static int histb_dmx_parse_frontend(struct histb_dmx_input *input,
 		return -ENOMEM;
 	}
 
-	frontend = mxl214_get_frontend(client, remote.port);
+	frontend = is_hi3130 ? hi3130_get_frontend(client, remote.port) :
+			     mxl214_get_frontend(client, remote.port);
 	if (IS_ERR(frontend)) {
 		ret = dev_err_probe(dev, PTR_ERR(frontend),
 				    "%pOF: frontend channel %u is not ready\n",
@@ -2232,6 +2302,10 @@ static int histb_dmx_parse_frontend(struct histb_dmx_input *input,
 		put_device(&client->dev);
 		return ret;
 	}
+	frontend->dvb = &input->adapter;
+	input->frontend_release = frontend->ops.release;
+	frontend->ops.release = histb_dmx_release_frontend;
+	kref_get(&input->dmx->ref);
 	input->frontend_client = client;
 	input->frontend = frontend;
 	ret = devm_add_action_or_reset(dev, histb_dmx_put_i2c_client, client);
@@ -2278,16 +2352,12 @@ static int histb_dmx_register_input(struct histb_dmx_input *input)
 {
 	struct device *dev = input->dmx->dev;
 	unsigned int id;
-	char *name;
 	int ret;
 
-	name = devm_kasprintf(dev, GFP_KERNEL, "HiSilicon HiSTB TS input %u",
-			      input->port);
-	if (!name)
-		return -ENOMEM;
-
-	ret = dvb_register_adapter(&input->adapter, name, THIS_MODULE, dev,
-				   adapter_nr);
+	snprintf(input->adapter_name, sizeof(input->adapter_name),
+		 "HiSilicon HiSTB TS input %u", input->port);
+	ret = dvb_register_adapter(&input->adapter, input->adapter_name,
+				   THIS_MODULE, dev, adapter_nr);
 	if (ret < 0)
 		return ret;
 	input->adapter_registered = true;
@@ -2358,6 +2428,10 @@ static int histb_dmx_register_input(struct histb_dmx_input *input)
 	return 0;
 
 error:
+	/* Published CA files can outlive this failed probe and its MMIO. */
+	mutex_lock(&input->dmx->ca_lock);
+	WRITE_ONCE(input->dmx->removed, true);
+	mutex_unlock(&input->dmx->ca_lock);
 	histb_dmx_unregister_input(input);
 	return ret;
 }
@@ -2582,11 +2656,16 @@ static int histb_dmx_probe(struct platform_device *pdev)
 	unsigned int port;
 	int ret;
 
-	dmx = devm_kzalloc(dev, sizeof(*dmx), GFP_KERNEL);
+	dmx = kzalloc(sizeof(*dmx), GFP_KERNEL);
 	if (!dmx)
 		return -ENOMEM;
 
-	dmx->dev = dev;
+	kref_init(&dmx->ref);
+	dmx->dev = get_device(dev);
+	/* Registered first so every other devres cleanup precedes base put. */
+	ret = devm_add_action_or_reset(dev, histb_dmx_put_context, dmx);
+	if (ret)
+		return ret;
 	INIT_DELAYED_WORK(&dmx->partial_work, histb_dmx_partial_work);
 	spin_lock_init(&dmx->reg_lock);
 	mutex_init(&dmx->ca_lock);
@@ -2789,6 +2868,10 @@ static void histb_dmx_remove(struct platform_device *pdev)
 {
 	struct histb_dmx *dmx = platform_get_drvdata(pdev);
 	unsigned int port;
+
+	mutex_lock(&dmx->ca_lock);
+	WRITE_ONCE(dmx->removed, true);
+	mutex_unlock(&dmx->ca_lock);
 
 	cancel_delayed_work_sync(&dmx->partial_work);
 	histb_dmx_disable_interrupts(dmx);

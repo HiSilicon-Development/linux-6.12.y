@@ -16,6 +16,7 @@ config DVB_HISTB_DMX
 	depends on DVB_CORE && I2C && OF && HAS_DMA
 	depends on ARCH_HISI || COMPILE_TEST
 	select DVB_MXL214 if MEDIA_SUBDRV_AUTOSELECT && GPIOLIB
+	select DVB_HI3130 if MEDIA_SUBDRV_AUTOSELECT && GPIOLIB
 	help
 	  Support the transport stream input and descriptor DMA engine found in
 	  HiSilicon HiSTB SoCs. The hardware DMA engine supplies complete MPEG
