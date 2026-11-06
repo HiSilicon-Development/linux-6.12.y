@@ -1218,6 +1218,8 @@ patternProperties:
     description: Quanta Computer Inc.
   "^radxa,.*":
     description: Radxa
+  "^rafael,.*":
+    description: Rafael Micro, Inc.
   "^raidsonic,.*":
     description: RaidSonic Technology GmbH
   "^ralink,.*":

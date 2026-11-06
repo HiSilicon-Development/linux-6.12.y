@@ -304,4 +304,16 @@ config MEDIA_TUNER_XC5000
 	  This device is only used inside a SiP called together with a
 	  demodulator for now.
 
+config MEDIA_TUNER_R858
+	tristate "Rafael Micro R858 dual DVB-C tuner"
+	depends on MEDIA_SUPPORT && DVB_CORE && I2C
+	help
+	  Support the R858 dual receiver with a 24 MHz reference, DVB-C Annex A,
+	  8 MHz channels and 5 MHz or 5.5 MHz IF. Both I2C endpoints must be
+	  described by the board driver for shared crystal, LNA and calibration
+	  resources.
+
+	  This independently written Linux implementation is GPL licensed.
+	  Hardware-reference attribution does not relicense Rafael's sources.
+
 endmenu

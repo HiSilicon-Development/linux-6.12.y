@@ -1,0 +1,117 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/media/tuners/rafael,r858.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Rafael Micro R858 internal DVB-C receiver
+
+maintainers:
+  - Linux Media Mailing List <linux-media@vger.kernel.org>
+
+description: |
+  An R858 package contains two addressed receivers with shared LNA, ring PLL
+  and crystal resources. Receiver configuration nodes can be children of a
+  demodulator without sharing its I2C bus. Each receiver explicitly identifies
+  its tuner adapter with i2c-parent; no demodulator repeater is implied. The
+  parent binding may reference this schema without requiring compatible on
+  that child. Each endpoint describes its other internal receiver with peer.
+  Different demodulator I2C controllers do not identify R858 package wiring.
+
+  Linux addresses are seven-bit. Vendor addresses 0x14 and 0x34 correspond to
+  0x0a and 0x1a. They must not be confused with internal receiver indices or
+  an external package's crystal role. Both endpoints must be reachable for
+  calibration, including when only one frontend is in use. Shared package
+  configuration (reference frequency, crystal role/capacitance, clock output
+  and RF loop-through) must agree in both endpoint nodes.
+  The supported profiles use a 24 MHz reference, DVB-C Annex A, an 8 MHz
+  channel filter and either 5 MHz or 5.5 MHz IF. Both internal receivers
+  complete their explicitly selected profile's LPF and image-rejection
+  calibration before the package becomes ready. Each endpoint's profile
+  remains fixed for the package lifetime, including while the peer frontend
+  is unattached. The endpoint properties, not the internal receiver indices,
+  select the IF profiles.
+
+properties:
+  compatible:
+    const: rafael,r858
+
+  reg:
+    maxItems: 1
+    description: Seven-bit I2C address of this internal receiver.
+
+  i2c-parent:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: |
+      I2C controller or adapter carrying this internal tuner endpoint. This
+      can differ from the demodulator's parent bus. Both internal receivers
+      on a directly connected R858 package reference the same tuner adapter.
+
+  rafael,tuner-index:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    enum: [0, 1]
+    description: Internal receiver number, not a package number.
+
+  rafael,peer:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: |
+      The other internal receiver node in this same package. The reference
+      must be reciprocal. Its reg and i2c-parent identify the peer address
+      and adapter. Receiver index zero owns the shared primary registers.
+
+  clock-frequency:
+    const: 24000000
+    description: R858 crystal or externally supplied reference frequency in Hz.
+
+  rafael,if-frequency-hz:
+    enum: [5000000, 5500000]
+    description: |
+      Analog IF presented to this receiver's demodulator, in Hz. The
+      integrating driver must resolve both endpoint IF values before the
+      first tuner initialization.
+
+  rafael,xtal-role:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    enum: [0, 1, 2, 3]
+    description: |
+      Package crystal wiring per the Rafael reference. 0 is an independent
+      self-oscillating package; 1 is a master forwarding its reference to a
+      slave package; 2 is an external-reference input forwarding the reference;
+      3 is an external-reference input without forwarding. This is not the
+      internal receiver number. Roles 1 and 2 require clock-out.
+
+  rafael,xtal-cap:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    minimum: 0
+    maximum: 31
+    description: Vendor crystal-capacitance code, not a capacitance in pF.
+
+  rafael,loop-through:
+    type: boolean
+    description: Keep active RF loop-through enabled, including in standby.
+
+  rafael,clock-out:
+    type: boolean
+    description: Enable the outgoing reference for a chained package.
+
+required:
+  - reg
+  - i2c-parent
+  - rafael,tuner-index
+  - rafael,peer
+  - clock-frequency
+  - rafael,if-frequency-hz
+  - rafael,xtal-role
+  - rafael,xtal-cap
+
+allOf:
+  - if:
+      properties:
+        rafael,xtal-role:
+          enum: [1, 2]
+    then:
+      required:
+        - rafael,clock-out
+
+additionalProperties: false
+...
