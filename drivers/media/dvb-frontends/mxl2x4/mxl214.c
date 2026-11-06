@@ -57,7 +57,8 @@ static void mxl214_release(struct dvb_frontend *frontend)
 	channel->claimed = false;
 	mutex_unlock(&state->lock);
 	kref_put(&state->refcount, mxl214_free_state);
-	module_put(THIS_MODULE);
+	if (!IS_ENABLED(CONFIG_MEDIA_ATTACH))
+		module_put(THIS_MODULE);
 }
 
 static unsigned int mxl214_expected_xpt_output(unsigned int channel)
