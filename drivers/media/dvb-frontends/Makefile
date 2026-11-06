@@ -87,6 +87,7 @@ obj-$(CONFIG_DVB_MN88472) += mn88472.o
 obj-$(CONFIG_DVB_MN88473) += mn88473.o
 obj-$(CONFIG_DVB_MT312) += mt312.o
 obj-$(CONFIG_DVB_MT352) += mt352.o
+obj-$(CONFIG_DVB_HI3130) += hi3130.o
 obj-$(CONFIG_DVB_MXL214) += mxl214.o
 obj-$(CONFIG_DVB_MXL5XX) += mxl5xx.o
 obj-$(CONFIG_DVB_MXL692) += mxl692.o

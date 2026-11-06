@@ -1,0 +1,86 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/media/hisilicon,hi3130.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: HiSilicon external Hi3130 DVB-C demodulator
+
+maintainers:
+  - linux-media@vger.kernel.org
+
+description: |
+  One external DVB-C Annex A demodulator with an R858 RF receiver. The
+  implemented silicon is v200, identified by register 0x40 bits 7:5 equal
+  to 5; the vendor's 3130_outside board enum does not identify a revision.
+  Other silicon revisions are not supported. The programming data requires
+  a 28.8 MHz demodulator sample/master clock, an internal ADC, CMOS AGC,
+  two's-complement ADC data and 5 MHz or 5.5 MHz tuner IF. These are not
+  defaults for undocumented boards. Serial-nosync describes the receiver
+  connection:
+  packet synchronization is obtained in-band, not from a wired SYNC pin.
+  The demodulator serial clock selection is the SDK's 74.25 MHz setting.
+  The standard demodulator pad assignment is used: all six IOSHARE
+  selectors for TS data, valid, sync and clock are programmed to zero,
+  corresponding to the vendor TSOUT identity assignment 0 through 10.
+  Tuner control uses the direct I2C adapter explicitly referenced by each
+  tuner child's i2c-parent property, independently of the demodulator's
+  host adapter. No demodulator repeater is required for this connection.
+
+  An R858 package contains two internal receivers. Calibration accesses
+  both. Each tuner child therefore references its peer explicitly; neither
+  the enclosing demodulator nor its host bus establishes tuner routing.
+  Both internal receivers of a directly connected package reference the
+  same tuner I2C controller and describe the same package crystal wiring,
+  capacitance, clock output and loop-through. The peer need not have an
+  enabled or acquired DVB frontend, but its I2C bus must exist and the
+  physical endpoint must be reachable.
+
+properties:
+  compatible:
+    const: hisilicon,hi3130
+
+  reg:
+    maxItems: 1
+
+  reset-gpios:
+    description: Active-low external demodulator reset (100 ms assertion)
+    maxItems: 1
+
+  clock-frequency:
+    description: Demodulator master/sample clock frequency in Hz
+    const: 28800000
+
+  hisilicon,ts-mode:
+    const: serial-nosync
+
+  '#address-cells':
+    const: 1
+
+  '#size-cells':
+    const: 0
+
+  port:
+    $ref: /schemas/graph.yaml#/properties/port
+    description: Serial MPEG transport stream output
+
+patternProperties:
+  '^tuner@[0-9a-f]+$':
+    $ref: /schemas/media/tuners/rafael,r858.yaml#
+    properties:
+      rafael,if-frequency-hz:
+        enum: [5000000, 5500000]
+    required:
+      - i2c-parent
+required:
+  - compatible
+  - reg
+  - reset-gpios
+  - clock-frequency
+  - hisilicon,ts-mode
+  - '#address-cells'
+  - '#size-cells'
+  - port
+
+additionalProperties: false
+...

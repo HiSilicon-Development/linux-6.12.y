@@ -558,6 +558,17 @@ config DVB_MXL214
 	  To compile this driver as a module, choose M here. The module will
 	  be called mxl214.
 
+config DVB_HI3130
+	tristate "HiSilicon external Hi3130 v200 DVB-C receiver"
+	depends on DVB_CORE && I2C && GPIOLIB && OF
+	select MEDIA_TUNER_R858
+	help
+	  Support the external Hi3130 revision 5 (v200) DVB-C Annex A
+	  demodulator with a Rafael R858 tuner, a 28.8 MHz ADC clock and
+	  serial transport stream output. Other silicon revisions are rejected.
+	  Board reset and both internal R858 endpoints must be described in DT.
+	  The module is called hi3130.
+
 config DVB_STV0297
 	tristate "ST STV0297 based"
 	depends on DVB_CORE && I2C
