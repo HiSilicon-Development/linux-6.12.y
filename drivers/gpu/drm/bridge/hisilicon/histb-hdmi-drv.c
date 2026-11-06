@@ -28,6 +28,7 @@
 #include <linux/property.h>
 #include <linux/regmap.h>
 #include <linux/reset.h>
+#include <linux/sysfs.h>
 #include <linux/workqueue.h>
 #include "histb-hdmi-audio.h"
 #include "histb-hdmi-hdcp.h"

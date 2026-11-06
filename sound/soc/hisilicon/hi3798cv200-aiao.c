@@ -24,6 +24,7 @@
 #include <linux/rcupdate.h>
 #include <linux/reset.h>
 #include <linux/spinlock.h>
+#include <linux/sysfs.h>
 
 #include <sound/pcm.h>
 #include <sound/pcm_params.h>

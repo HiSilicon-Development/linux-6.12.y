@@ -5,6 +5,7 @@
  * per engine. MV310 definitions follow the recovered shipped VFMW v5.1 HAL.
  */
 
+#include <linux/atomic.h>
 #include <linux/bitfield.h>
 #include <linux/clk.h>
 #include <linux/completion.h>
@@ -3591,11 +3592,13 @@ histb_vdec_sync_apc(struct histb_vdec_ctx *ctx,
 		else
 			active[i] = histb_vdec_find_reference(
 				ctx, decode->dpb[i].reference_ts);
-		if (!active[i] || !histb_vdec_decoded_buffer_valid(active[i]))
+		if (!active[i] || !histb_vdec_decoded_buffer_valid(active[i])) {
 			return -EINVAL;
+		}
 		for (j = 0; j < i; j++)
-			if (active[j] == active[i])
+			if (active[j] == active[i]) {
 				return -EINVAL;
+			}
 		if (active[i]->apc_slot >= 0 &&
 		    active[i]->apc_slot < ARRAY_SIZE(ctx->apc) &&
 		    ctx->apc[active[i]->apc_slot] == active[i])
@@ -3619,8 +3622,9 @@ histb_vdec_sync_apc(struct histb_vdec_ctx *ctx,
 			for (slot = 0; slot < ARRAY_SIZE(ctx->apc); slot++)
 				if (!ctx->apc[slot])
 					break;
-			if (slot == ARRAY_SIZE(ctx->apc))
+			if (slot == ARRAY_SIZE(ctx->apc)) {
 				return -ENOSPC;
+			}
 			ctx->apc[slot] = active[i];
 			active[i]->apc_slot = slot;
 		}
@@ -7262,8 +7266,9 @@ histb_vdec_validate_h264(struct histb_vdec_ctx *ctx,
 	unsigned int active = 0, i, references_l0 = 0, references_l1 = 0;
 	bool pframe, bframe, field_pic, bottom_field, mbaff;
 
-	if (!decode || !sps || !pps || !slice || decode->nal_ref_idc > 3)
+	if (!decode || !sps || !pps || !slice || decode->nal_ref_idc > 3) {
 		return -EINVAL;
+	}
 	field_pic = decode->flags & V4L2_H264_DECODE_PARAM_FLAG_FIELD_PIC;
 	bottom_field = decode->flags & V4L2_H264_DECODE_PARAM_FLAG_BOTTOM_FIELD;
 
@@ -7279,8 +7284,9 @@ histb_vdec_validate_h264(struct histb_vdec_ctx *ctx,
 	     (sps->flags & V4L2_H264_SPS_FLAG_MB_ADAPTIVE_FRAME_FIELD)) ||
 	    (bottom_field && !field_pic) ||
 	    (field_pic &&
-	     (sps->flags & V4L2_H264_SPS_FLAG_FRAME_MBS_ONLY)))
+	     (sps->flags & V4L2_H264_SPS_FLAG_FRAME_MBS_ONLY))) {
 		return -EINVAL;
+	}
 	width_mbs = sps->pic_width_in_mbs_minus1 + 1;
 	map_height = sps->pic_height_in_map_units_minus1 + 1;
 	frame_height = map_height *
@@ -7292,11 +7298,13 @@ histb_vdec_validate_h264(struct histb_vdec_ctx *ctx,
 	if (width_mbs * 16 != ctx->src.pix.width ||
 	    frame_height * 16 != ctx->src.pix.height ||
 	    slice->first_mb_in_slice >= units || decode->reserved ||
-	    slice->reserved)
+	    slice->reserved) {
 		return -EINVAL;
+	}
 	if (new_frame) {
-		if (slice->first_mb_in_slice || ctx->h264_partial)
+		if (slice->first_mb_in_slice || ctx->h264_partial) {
 			return -EINVAL;
+		}
 	} else if (!ctx->h264_partial ||
 		   slice->first_mb_in_slice <= ctx->h264_last_first_mb) {
 		return -EINVAL;
@@ -7305,8 +7313,9 @@ histb_vdec_validate_h264(struct histb_vdec_ctx *ctx,
 	pframe = decode->flags & V4L2_H264_DECODE_PARAM_FLAG_PFRAME;
 	bframe = decode->flags & V4L2_H264_DECODE_PARAM_FLAG_BFRAME;
 	if (pps->num_slice_groups_minus1 || pps->weighted_bipred_idc > 2 ||
-	    (pps->flags & V4L2_H264_PPS_FLAG_REDUNDANT_PIC_CNT_PRESENT))
+	    (pps->flags & V4L2_H264_PPS_FLAG_REDUNDANT_PIC_CNT_PRESENT)) {
 		return -EINVAL;
+	}
 
 	if ((pframe && bframe) ||
 	    (!pframe && !bframe &&
@@ -7315,8 +7324,9 @@ histb_vdec_validate_h264(struct histb_vdec_ctx *ctx,
 	    (bframe && slice->slice_type != V4L2_H264_SLICE_TYPE_B) ||
 	    slice->colour_plane_id ||
 	    slice->redundant_pic_cnt ||
-	    slice->header_bit_size >= payload * 8ULL)
+	    slice->header_bit_size >= payload * 8ULL) {
 		return -EINVAL;
+	}
 
 	for (i = 0; i < ARRAY_SIZE(decode->dpb); i++) {
 		const struct v4l2_h264_dpb_entry *entry = &decode->dpb[i];
@@ -7326,8 +7336,9 @@ histb_vdec_validate_h264(struct histb_vdec_ctx *ctx,
 			V4L2_H264_DPB_ENTRY_FLAG_FIELD;
 
 		if (memchr_inv(entry->reserved, 0, sizeof(entry->reserved)) ||
-		    (entry->flags & ~allowed_flags))
+		    (entry->flags & ~allowed_flags)) {
 			return -EINVAL;
+		}
 		if (!(entry->flags & V4L2_H264_DPB_ENTRY_FLAG_ACTIVE))
 			continue;
 		/* Request userspace has already applied MMCO/reordering.  The VDH
@@ -7335,8 +7346,9 @@ histb_vdec_validate_h264(struct histb_vdec_ctx *ctx,
 		if (!(entry->flags & V4L2_H264_DPB_ENTRY_FLAG_VALID) ||
 		    (entry->fields & ~V4L2_H264_FRAME_REF) || !entry->fields ||
 		    (!(entry->flags & V4L2_H264_DPB_ENTRY_FLAG_FIELD) &&
-		     entry->fields != V4L2_H264_FRAME_REF))
+		     entry->fields != V4L2_H264_FRAME_REF)) {
 			return -EINVAL;
+		}
 		active++;
 	}
 
@@ -7354,43 +7366,49 @@ histb_vdec_validate_h264(struct histb_vdec_ctx *ctx,
 		 */
 		if (!active || active > ARRAY_SIZE(decode->dpb) ||
 		    references_l0 > ARRAY_SIZE(slice->ref_pic_list0) ||
-		    (!bframe && slice->num_ref_idx_l1_active_minus1))
+		    (!bframe && slice->num_ref_idx_l1_active_minus1)) {
 			return -EINVAL;
+		}
 		for (i = 0; i < references_l0; i++) {
 			const struct v4l2_h264_reference *ref =
 				&slice->ref_pic_list0[i];
 			const struct v4l2_h264_dpb_entry *entry;
 
-			if (ref->index >= ARRAY_SIZE(decode->dpb))
+			if (ref->index >= ARRAY_SIZE(decode->dpb)) {
 				return -EINVAL;
+			}
 			entry = &decode->dpb[ref->index];
 			if (!(entry->flags & V4L2_H264_DPB_ENTRY_FLAG_ACTIVE) ||
 			    !ref->fields ||
 			    (ref->fields & ~V4L2_H264_FRAME_REF) ||
 			    (ref->fields & ~entry->fields) ||
 			    (field_pic && ref->fields == V4L2_H264_FRAME_REF) ||
-			    (!field_pic && ref->fields != V4L2_H264_FRAME_REF))
+			    (!field_pic && ref->fields != V4L2_H264_FRAME_REF)) {
 				return -EINVAL;
+			}
 		}
 	}
 	if (bframe) {
-		if (references_l1 > ARRAY_SIZE(slice->ref_pic_list1))
+		if (references_l1 > ARRAY_SIZE(slice->ref_pic_list1)) {
 			return -EINVAL;
+		}
 		for (i = 0; i < references_l1; i++) {
 			const struct v4l2_h264_reference *ref =
 				&slice->ref_pic_list1[i];
 			const struct v4l2_h264_dpb_entry *entry;
 
-			if (ref->index >= ARRAY_SIZE(decode->dpb))
+			if (ref->index >= ARRAY_SIZE(decode->dpb)) {
 				return -EINVAL;
+			}
 			entry = &decode->dpb[ref->index];
 			if (!(entry->flags & V4L2_H264_DPB_ENTRY_FLAG_ACTIVE) ||
 			    !ref->fields ||
 			    (ref->fields & ~V4L2_H264_FRAME_REF) ||
 			    (ref->fields & ~entry->fields) ||
 			    (field_pic && ref->fields == V4L2_H264_FRAME_REF) ||
-			    (!field_pic && ref->fields != V4L2_H264_FRAME_REF))
+			    (!field_pic && ref->fields != V4L2_H264_FRAME_REF)) {
 				return -EINVAL;
+			}
 		}
 	}
 	if (V4L2_H264_CTRL_PRED_WEIGHTS_REQUIRED(pps, slice)) {
@@ -7399,8 +7417,9 @@ histb_vdec_validate_h264(struct histb_vdec_ctx *ctx,
 		};
 
 		if (!pred_weights || pred_weights->luma_log2_weight_denom > 7 ||
-		    pred_weights->chroma_log2_weight_denom > 7)
+		    pred_weights->chroma_log2_weight_denom > 7) {
 			return -EINVAL;
+		}
 		for (list = 0; list < ARRAY_SIZE(references); list++) {
 			const struct v4l2_h264_weight_factors *factors =
 				&pred_weights->weight_factors[list];
@@ -7424,8 +7443,9 @@ histb_vdec_validate_h264(struct histb_vdec_ctx *ctx,
 	}
 
 	qp = 26 + pps->pic_init_qp_minus26 + slice->slice_qp_delta;
-	if (qp > 51)
+	if (qp > 51) {
 		return -EINVAL;
+	}
 
 	return 0;
 }
@@ -9606,8 +9626,9 @@ static int histb_vdec_begin_h264_picture(
 	ctx->h264_field_width_mbs = width_mbs;
 	ctx->h264_field_height_map_units = height_map_units;
 	ctx->h264_field_transaction = true;
-	if (second_field && ctx->h264_pending_failed)
+	if (second_field && ctx->h264_pending_failed) {
 		return -EIO;
+	}
 	if (!second_field)
 		decoded->error_tainted = false;
 	return 0;
