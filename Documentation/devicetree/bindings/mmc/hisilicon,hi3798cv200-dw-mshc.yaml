@@ -78,10 +78,23 @@ properties:
       inheritance and actively retunes the sample and data-strobe windows.
       Validated values are restored whenever the card returns to HS400.
 
+  hisilicon,hold-reset-on-reboot:
+    type: boolean
+    description: |
+      Hold the non-removable eMMC's active-low reset output asserted after
+      normal card shutdown, before a system restart. Some CV200 boards need
+      this handoff even when power-off notification completed successfully.
+      The next bootloader must release the reset during card initialization.
+      Requires a card with hardware reset already enabled; the driver never
+      changes RST_N_FUNCTION. Suspend and system power-off are unaffected.
+
 dependencies:
   hisilicon,inherit-boot-tuning:
     - hisilicon,hs400-strobe-reg
     - hisilicon,io-voltage-reg
+  hisilicon,hold-reset-on-reboot:
+    - non-removable
+    - cap-mmc-hw-reset
 
 required:
   - compatible
@@ -107,6 +120,7 @@ allOf:
         hisilicon,io-voltage-reg: false
         hisilicon,hs400-strobe-reg: false
         hisilicon,inherit-boot-tuning: false
+        hisilicon,hold-reset-on-reboot: false
     else:
       properties:
         hisilicon,sap-dll-reg: false

@@ -7,6 +7,11 @@
 
 #include "hi3798cv200-dvbip-1004.dtsi"
 
+/* Keep the 8GME4R in reset for the original bootloader's warm-reboot path. */
+&emmc {
+	hisilicon,hold-reset-on-reboot;
+};
+
 /* The fitted MxL214 uses four independent three-wire outputs. */
 &dvbip_demux_input0 {
 	status = "okay";

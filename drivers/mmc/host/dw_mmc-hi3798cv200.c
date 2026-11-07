@@ -11,6 +11,7 @@
 #include <linux/bitfield.h>
 #include <linux/delay.h>
 #include <linux/io.h>
+#include <linux/kernel.h>
 #include <linux/mfd/syscon.h>
 #include <linux/mmc/card.h>
 #include <linux/mmc/host.h>
@@ -55,6 +56,7 @@ struct hi3798cv200_priv {
 	struct pinctrl_state *pins_hs200;
 	struct pinctrl_state *pins_hs400;
 	bool inherit_boot_tuning;
+	bool hold_reset_on_reboot;
 	int boot_sample_phase;
 	unsigned int boot_strobe_phase;
 };
@@ -605,6 +607,9 @@ static int dw_mci_hi3798cv200_init(struct dw_mci *host)
 	if (!priv)
 		return -ENOMEM;
 	host->priv = priv;
+	priv->hold_reset_on_reboot =
+		of_property_read_bool(host->dev->of_node,
+				     "hisilicon,hold-reset-on-reboot");
 
 	priv->sample_clk = devm_clk_get(host->dev, "ciu-sample");
 	if (IS_ERR(priv->sample_clk)) {
@@ -724,6 +729,57 @@ static void dw_mci_hi3798cv200_remove(struct platform_device *pdev)
 	dw_mci_pltfm_remove(pdev);
 }
 
+static void dw_mci_hi3798cv200_shutdown(struct platform_device *pdev)
+{
+	struct dw_mci *host = platform_get_drvdata(pdev);
+	struct hi3798cv200_priv *priv = host->priv;
+	struct dw_mci_slot *slot = host->slot;
+	struct mmc_host *mmc;
+	struct mmc_card *card;
+	u32 mask, reset;
+
+	if (!priv->hold_reset_on_reboot || system_state != SYSTEM_RESTART || !slot)
+		return;
+
+	/* The card device is shut down before its parent controller. Do not
+	 * reset a card whose shutdown failed or which still has active I/O.
+	 */
+	mmc = slot->mmc;
+	card = mmc->card;
+	if (!card || card->type != MMC_TYPE_MMC ||
+	    card->ext_csd.rst_n_function != 1 ||
+	    card->ext_csd.power_off_notification ||
+	    mmc->ios.power_mode != MMC_POWER_OFF || mmc->ios.clock ||
+	    mmc->ongoing_mrq || host->mrq || slot->mrq) {
+		dev_warn(&pdev->dev, "cannot hold eMMC reset: card not powered off\n");
+		return;
+	}
+
+	mask = SDMMC_RST_HWACTIVE << slot->id;
+	if ((mci_readl(host, PWREN) & mask) ||
+	    (mci_readl(host, CLKENA) & mask) ||
+	    (mci_readl(host, STATUS) & (SDMMC_STATUS_BUSY | SDMMC_STATUS_DMA_REQ)) ||
+	    (mci_readl(host, CMD) & SDMMC_CMD_START)) {
+		dev_warn(&pdev->dev, "cannot hold eMMC reset: controller not idle\n");
+		return;
+	}
+
+	/* Match the board's original power-off handoff: leave RST_N asserted
+	 * across the SoC watchdog reset, rather than pulsing and releasing it.
+	 * Firmware releases the card during the next boot. Do not reset the
+	 * controller/DMA, change tuning, or alter the card's OTP configuration.
+	 */
+	reset = mci_readl(host, RST_N);
+	if (!(reset & mask))
+		return;
+	mci_writel(host, RST_N, reset & ~mask);
+	if (mci_readl(host, RST_N) & mask) {
+		dev_err(&pdev->dev, "failed to hold eMMC reset for reboot\n");
+		return;
+	}
+	udelay(10);
+}
+
 /* Host runtime PM is not enabled here. Force-runtime helpers would see the
  * default SUSPENDED status and skip restoring registers lost in deep sleep.
  * The card's runtime resume must find interrupts and IDMAC ready for CMD0.
@@ -740,6 +796,7 @@ MODULE_DEVICE_TABLE(of, dw_mci_hi3798cv200_match);
 static struct platform_driver dw_mci_hi3798cv200_driver = {
 	.probe = dw_mci_hi3798cv200_probe,
 	.remove_new = dw_mci_hi3798cv200_remove,
+	.shutdown = dw_mci_hi3798cv200_shutdown,
 	.driver = {
 		.name = "dwmmc_hi3798cv200",
 		.probe_type = PROBE_PREFER_ASYNCHRONOUS,
