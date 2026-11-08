@@ -878,6 +878,43 @@ static void hix5hd2_free_dma_desc_rings(struct hix5hd2_priv *priv)
 	}
 }
 
+static int hix5hd2_phy_connect(struct net_device *dev)
+{
+	struct hix5hd2_priv *priv = netdev_priv(dev);
+	struct phy_device *phy = of_phy_find_device(priv->phy_node);
+	int ret;
+
+	if (!phy)
+		return -ENODEV;
+
+	if (priv->variant->cv200_policy) {
+		/* Keep PHY power transitions inside the MAC's clocked window. */
+		phy->mac_managed_pm = true;
+		/* Attachment configures and may soft-reset the PHY before its
+		 * implicit resume. Wake a parked PHY before that configuration.
+		 */
+		if (phy->suspended) {
+			ret = phy_resume(phy);
+			if (ret)
+				goto out_put;
+		}
+	}
+
+	ret = phy_connect_direct(dev, phy, hix5hd2_adjust_link, priv->phy_mode);
+	if (ret && priv->variant->cv200_policy) {
+		int err = phy_suspend(phy);
+
+		if (err)
+			netdev_err(dev, "failed to park PHY after connect failure: %d\n",
+				   err);
+	}
+
+out_put:
+	/* phy_connect_direct() holds its own reference after a successful attach. */
+	put_device(&phy->mdio.dev);
+	return ret;
+}
+
 static int hix5hd2_net_open(struct net_device *dev)
 {
 	struct hix5hd2_priv *priv = netdev_priv(dev);
@@ -926,26 +963,15 @@ static int hix5hd2_net_open(struct net_device *dev)
 		hix5hd2_hw_set_mac_addr(dev);
 	}
 
-	phy = of_phy_connect(dev, priv->phy_node,
-			     &hix5hd2_adjust_link, 0, priv->phy_mode);
-	if (!phy) {
+	ret = hix5hd2_phy_connect(dev);
+	if (ret) {
 		clk_disable_unprepare(priv->mac_ifc_clk);
 		clk_disable_unprepare(priv->mac_core_clk);
-		return -ENODEV;
+		return ret;
 	}
-
-	if (priv->variant->cv200_policy) {
-		/* The MDIO child must never touch registers after MAC clock-off. */
-		phy->mac_managed_pm = true;
-		ret = phy_resume(phy);
-		if (ret) {
-			phy_disconnect(phy);
-			clk_disable_unprepare(priv->mac_ifc_clk);
-			clk_disable_unprepare(priv->mac_core_clk);
-			return ret;
-		}
+	phy = dev->phydev;
+	if (priv->variant->cv200_policy)
 		priv->needs_phy_reset = false;
-	}
 
 	if (priv->variant->cv200_policy)
 		netif_carrier_off(dev);
@@ -1566,17 +1592,13 @@ out:
 resume_phy:
 	WRITE_ONCE(priv->suspended, false);
 	napi_enable(&priv->napi);
-	if (!ndev->phydev &&
-	    !of_phy_connect(ndev, priv->phy_node, hix5hd2_adjust_link, 0,
-			    priv->phy_mode)) {
-		netdev_err(ndev, "could not reconnect PHY during suspend rollback\n");
-		priv->resume_running = false;
-		rtnl_unlock();
-		return -ENODEV;
-	}
 	{
-		int err = phy_resume(ndev->phydev);
+		int err;
 
+		if (!ndev->phydev)
+			err = hix5hd2_phy_connect(ndev);
+		else
+			err = phy_resume(ndev->phydev);
 		if (err) {
 			netdev_err(ndev, "PHY suspend rollback failed: %d\n", err);
 			priv->resume_running = false;
