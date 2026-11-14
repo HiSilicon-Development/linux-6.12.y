@@ -8,6 +8,7 @@ config SND_I2S_HI6210_I2S
 config SND_SOC_HI3798CV200_AIAO
 	tristate "HiSilicon Hi3798CV200/Hi3798MV310 AIAO controller"
 	depends on ARCH_HISI || COMPILE_TEST
+	select SND_PCM_IEC958
 	help
 	  Say Y or M to enable the standard ASoC playback interface for the
 	  Hi3798CV200 and Hi3798MV310 AIAO controllers. The driver uses native
@@ -15,3 +16,9 @@ config SND_SOC_HI3798CV200_AIAO
 	  DAI 0 preserves the board's analog/external I2S routing; DAI 1 uses
 	  the SoC's internal HDMI port. Both expose stereo 16-bit or 24-bit
 	  PCM (24 significant MSBs in S32_LE DMA words).
+
+	  DAI 2 is the consumer S/PDIF transmitter: a SPDIF-TX DMA bank feeds
+	  the biphase encoder that drives the optical/coaxial pad. It exposes
+	  the ALSA IEC958 channel-status control, and switches the encoder to
+	  compressed mode and bypasses the TX DSP when AES0 marks a non-audio
+	  stream, so IEC 61937 (AC-3/DTS) bursts pass through unmodified.

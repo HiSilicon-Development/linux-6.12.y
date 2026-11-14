@@ -9,6 +9,19 @@
  * The controller owns a native circular DMA buffer.  ALSA's application
  * pointer is written directly to the hardware producer pointer while the
  * hardware consumer pointer provides the PCM position.
+ *
+ * Three transmit DAIs are exposed:
+ *   DAI 0 - board-selected I2S bank (the internal Tianlai DAC on Q10 Pro);
+ *   DAI 1 - internal HDMI I2S bank (TX3 on CV200, TX2 on MV310);
+ *   DAI 2 - S/PDIF transmitter.  A SPDIF-TX DMA bank feeds the matching
+ *           SPDIF encoder ("SPDIFER"), which drives the optical/coaxial
+ *           pad selected by AIAO_SPDIF_TX_MUX.  The encoder's channel
+ *           status comes from the ALSA IEC958 control, so IEC 61937
+ *           (AC-3/DTS) bursts pass through bit-exact: the TX DSP is
+ *           bypassed and the encoder is switched to compressed mode.
+ *
+ * All DAIs share one DMA engine and one channel-status state, so only one
+ * PCM can be open at a time.
  */
 
 #include <linux/bitfield.h>
@@ -26,13 +39,16 @@
 #include <linux/spinlock.h>
 #include <linux/sysfs.h>
 
+#include <sound/asoundef.h>
 #include <sound/pcm.h>
+#include <sound/pcm_iec958.h>
 #include <sound/pcm_params.h>
 #include <sound/soc.h>
 
 #define AIAO_INT_ENA			0x0000
 #define AIAO_INT_STATUS			0x0004
 #define AIAO_INT_RAW			0x0008
+#define AIAO_SPDIF_TX_MUX		0x0020
 #define AIAO_SWITCH_TX_BCLK		0x002c
 #define  AIAO_TX0_BCLK_SOURCE_MASK	GENMASK(3, 0)
 #define  AIAO_TX0_BCLK_SOURCE_TX0	8
@@ -40,14 +56,17 @@
 #define AIAO_OUTSTANDING		0x0034
 #define  AIAO_OUTSTANDING_MASK		GENMASK(2, 0)
 
-#define AIAO_TX0_CRG_CFG0		0x0140
-#define AIAO_TX0_CRG_CFG1		0x0144
-#define  AIAO_CRG_MCLK_DIV_MASK		GENMASK(26, 0)
-#define  AIAO_CRG_BCLK_DIV_MASK		GENMASK(3, 0)
-#define  AIAO_CRG_FSCLK_DIV_MASK	GENMASK(6, 4)
-#define  AIAO_CRG_CLK_EN		BIT(8)
+/* Per-bank register windows. */
+#define AIAO_TX_BASE			0x2000
+#define AIAO_SPDIF_TX_BASE		0x3000
+#define AIAO_TX_BANK_STRIDE		0x0100
+#define AIAO_SPDIFER_BASE		0x4000
+#define AIAO_SPDIFER_STRIDE		0x1000
+#define AIAO_I2S_TX_CRG_BASE		0x0140
+#define AIAO_SPDIF_CRG_BASE		0x0180
 
-#define AIAO_TX0_IF_ATTR		0x2000
+/* Offsets inside an I2S-TX or SPDIF-TX bank (they share one layout). */
+#define AIAO_TX_IF_ATTR			0x0000
 #define  AIAO_TX_PRECISION_MASK		GENMASK(3, 2)
 #define  AIAO_TX_CHANNELS_MASK		GENMASK(5, 4)
 #define  AIAO_TX_SOURCE_MASK		GENMASK(23, 20)
@@ -55,30 +74,53 @@
 #define  AIAO_TX_SD1_MASK		GENMASK(27, 26)
 #define  AIAO_TX_SD2_MASK		GENMASK(29, 28)
 #define  AIAO_TX_SD3_MASK		GENMASK(31, 30)
-#define AIAO_TX0_DSP_CTRL		0x2004
+#define AIAO_TX_DSP_CTRL		0x0004
 #define  AIAO_TX_MUTE_FADE		BIT(1)
 #define  AIAO_TX_VOLUME_MASK		GENMASK(14, 8)
 #define  AIAO_TX_FADE_IN_MASK		GENMASK(19, 16)
 #define  AIAO_TX_FADE_OUT_MASK		GENMASK(23, 20)
 #define  AIAO_TX_BYPASS			BIT(27)
-#define  AIAO_TX_ENABLE		BIT(28)
+#define  AIAO_TX_ENABLE			BIT(28)
 #define  AIAO_TX_DISABLE_DONE		BIT(29)
 
-#define AIAO_TX0_BUF_ADDR		0x2080
-#define AIAO_TX0_BUF_SIZE		0x2084
-#define AIAO_TX0_BUF_WPTR		0x2088
-#define AIAO_TX0_BUF_RPTR		0x208c
-#define AIAO_TX0_BUF_ALEMPTY		0x2090
-#define AIAO_TX0_TRANS_SIZE		0x2094
-#define AIAO_TX0_INT_ENA		0x20a0
-#define AIAO_TX0_INT_RAW		0x20a4
-#define AIAO_TX0_INT_STATUS		0x20a8
-#define AIAO_TX0_INT_CLR		0x20ac
+#define AIAO_TX_BUF_ADDR		0x0080
+#define AIAO_TX_BUF_SIZE		0x0084
+#define AIAO_TX_BUF_WPTR		0x0088
+#define AIAO_TX_BUF_RPTR		0x008c
+#define AIAO_TX_BUF_ALEMPTY		0x0090
+#define AIAO_TX_TRANS_SIZE		0x0094
+#define AIAO_TX_INT_ENA			0x00a0
+#define AIAO_TX_INT_RAW			0x00a4
+#define AIAO_TX_INT_STATUS		0x00a8
+#define AIAO_TX_INT_CLR			0x00ac
 #define  AIAO_TX_INT_PERIOD		BIT(0)
 #define  AIAO_TX_INT_EMPTY		BIT(1)
 #define  AIAO_TX_INT_ALL		GENMASK(7, 0)
 
-#define AIAO_TOP_TX0_INT		BIT(16)
+/* Clock configuration, 8 bytes per bank in the 0x140/0x180 windows. */
+#define AIAO_CRG_CFG0			0x0000
+#define AIAO_CRG_CFG1			0x0004
+#define  AIAO_CRG_MCLK_DIV_MASK		GENMASK(26, 0)
+#define  AIAO_CRG_BCLK_DIV_MASK		GENMASK(3, 0)
+#define  AIAO_CRG_FSCLK_DIV_MASK	GENMASK(6, 4)
+#define  AIAO_CRG_CLK_EN		BIT(8)
+#define  AIAO_CRG_BCLK_DIV_128FS	2	/* index into {1,3,2,4,...} */
+#define  AIAO_CRG_FS_DIV_128FS		4	/* index into {16,32,48,64,128,256} */
+#define  AIAO_CRG_BCLK_DIV_64FS		3
+#define  AIAO_CRG_FS_DIV_64FS		3
+
+/* S/PDIF encoder ("SPDIFER") register bank. */
+#define AIAO_SPDIF_CTRL			0x0000
+#define  AIAO_SPDIF_EN			BIT(0)
+#define AIAO_SPDIF_CONFIG		0x0004
+#define  AIAO_SPDIF_MODE_PCM		0
+#define  AIAO_SPDIF_MODE_COMPRESSED	1
+#define AIAO_SPDIF_CS1			0x0020
+#define AIAO_SPDIF_CS2			0x0024
+#define AIAO_SPDIF_CS3			0x0028
+#define AIAO_SPDIF_CS4			0x002c
+#define AIAO_SPDIF_CS5			0x0030
+
 #define AIAO_EPLL_RATE			933888000ULL
 #define AIAO_MCLK_RATIO			256ULL
 #define AIAO_BUFFER_ALIGN		128
@@ -95,15 +137,30 @@
 		    SNDRV_PCM_RATE_96000 | SNDRV_PCM_RATE_176400 | \
 		    SNDRV_PCM_RATE_192000)
 
+/* Consumer S/PDIF covers 32 kHz .. 192 kHz; the IEC 60958 status codes for
+ * all seven rates are representable in the encoder.
+ */
+#define AIAO_SPDIF_RATES (SNDRV_PCM_RATE_32000 | SNDRV_PCM_RATE_44100 | \
+			  SNDRV_PCM_RATE_48000 | SNDRV_PCM_RATE_88200 | \
+			  SNDRV_PCM_RATE_96000 | SNDRV_PCM_RATE_176400 | \
+			  SNDRV_PCM_RATE_192000)
+
 /* Only hw_params-owned configuration is replayed after controller reset. */
 struct aiao_tx_config {
 	u32 crg0;
 	u32 crg1;
 	u32 if_attr;
+	u32 dsp_ctrl;
 	u32 dma_addr;
 	u32 buffer_bytes;
 	u32 period_bytes;
 	unsigned int channel;
+	unsigned int spdif_pad;
+	unsigned int rate;
+	unsigned int sample_bits;
+	u8 cs[5];
+	bool spdif;
+	bool hdmi_bypass;
 	bool valid;
 	unsigned int frame_bytes;
 };
@@ -118,7 +175,6 @@ struct hi3798cv200_aiao {
 	struct snd_pcm_substream __rcu *substream;
 	/* Serializes top-level and channel register read-modify-write cycles. */
 	spinlock_t reg_lock;
-	u32 dsp_ctrl;
 	struct aiao_tx_config config;
 	u32 last_pos;
 	int stop_error;
@@ -130,6 +186,12 @@ struct hi3798cv200_aiao {
 	unsigned int analog_tx_channel;
 	bool hdmi_stream;
 	unsigned int hdmi_tx_channel;
+	unsigned int spdif_tx_channel;
+	unsigned int spdif_pad;
+	bool spdif_stream;
+	/* ALSA "IEC958 Playback Default" AES0..AES3 bytes. */
+	u8 iec958[4];
+	bool iec958_valid;
 	int irq;
 	atomic_t opened;
 	/* Only six-channel streams need a padded hardware ring. The public
@@ -141,20 +203,46 @@ struct hi3798cv200_aiao {
 	snd_pcm_uframes_t packed_appl;
 };
 
-static inline u32 aiao_tx_reg(const struct hi3798cv200_aiao *aiao, u32 tx0_reg)
+static inline u32 aiao_bank_base(unsigned int channel, bool spdif)
 {
-	return tx0_reg + aiao->tx_channel * 0x100;
+	return (spdif ? AIAO_SPDIF_TX_BASE : AIAO_TX_BASE) +
+	       AIAO_TX_BANK_STRIDE * channel;
 }
 
-static inline u32 aiao_tx_crg_reg(const struct hi3798cv200_aiao *aiao,
-					  u32 tx0_reg)
+static inline u32 aiao_crg_base(unsigned int channel, bool spdif)
 {
-	return tx0_reg + aiao->tx_channel * 8;
+	return (spdif ? AIAO_SPDIF_CRG_BASE : AIAO_I2S_TX_CRG_BASE) +
+	       8 * channel;
+}
+
+static inline u32 aiao_encoder_base(unsigned int channel)
+{
+	return AIAO_SPDIFER_BASE + AIAO_SPDIFER_STRIDE * channel;
+}
+
+static inline u32 aiao_tx_reg(const struct hi3798cv200_aiao *aiao, u32 reg)
+{
+	return aiao_bank_base(aiao->tx_channel, aiao->spdif_stream) + reg;
+}
+
+static inline u32 aiao_tx_crg_reg(const struct hi3798cv200_aiao *aiao, u32 reg)
+{
+	return aiao_crg_base(aiao->tx_channel, aiao->spdif_stream) + reg;
+}
+
+static inline u32 aiao_cfg_reg(const struct aiao_tx_config *config, u32 reg)
+{
+	return aiao_bank_base(config->channel, config->spdif) + reg;
+}
+
+static inline u32 aiao_cfg_crg_reg(const struct aiao_tx_config *config, u32 reg)
+{
+	return aiao_crg_base(config->channel, config->spdif) + reg;
 }
 
 static inline u32 aiao_tx_top_irq(const struct hi3798cv200_aiao *aiao)
 {
-	return BIT(16 + aiao->tx_channel);
+	return BIT((aiao->spdif_stream ? 24 : 16) + aiao->tx_channel);
 }
 
 static const struct snd_pcm_hardware hi3798cv200_aiao_pcm_hardware = {
@@ -213,46 +301,226 @@ static u32 aiao_mclk_div(struct hi3798cv200_aiao *aiao, unsigned int rate)
 	return DIV_ROUND_CLOSEST_ULL(numerator, aiao->mclk_rate);
 }
 
+/* IEC 60958-3 / IEC 60958-4 channel-status bytes, as ALSA defines them. */
+static u32 aiao_fs_code(unsigned int rate)
+{
+	switch (rate) {
+	case 32000:
+		return IEC958_AES3_CON_FS_32000;
+	case 44100:
+		return IEC958_AES3_CON_FS_44100;
+	case 48000:
+		return IEC958_AES3_CON_FS_48000;
+	case 88200:
+		return IEC958_AES3_CON_FS_88200;
+	case 96000:
+		return IEC958_AES3_CON_FS_96000;
+	case 176400:
+		return IEC958_AES3_CON_FS_176400;
+	case 192000:
+		return IEC958_AES3_CON_FS_192000;
+	default:
+		return IEC958_AES3_CON_FS_NOTID;
+	}
+}
+
+static u32 aiao_orig_fs_code(unsigned int rate)
+{
+	switch (rate) {
+	case 32000:
+		return IEC958_AES4_CON_ORIGFS_32000;
+	case 44100:
+		return IEC958_AES4_CON_ORIGFS_44100;
+	case 48000:
+		return IEC958_AES4_CON_ORIGFS_48000;
+	case 88200:
+		return IEC958_AES4_CON_ORIGFS_88200;
+	case 96000:
+		return IEC958_AES4_CON_ORIGFS_96000;
+	case 176400:
+		return IEC958_AES4_CON_ORIGFS_176400;
+	case 192000:
+		return IEC958_AES4_CON_ORIGFS_192000;
+	default:
+		return IEC958_AES4_CON_ORIGFS_NOTID;
+	}
+}
+
+static u32 aiao_wordlen_code(unsigned int sample_bits)
+{
+	/* AES4 bit 0 is "max word length 24"; bits 3:1 select the word
+	 * length class. 16-bit -> 0x02 (20/16), 24-bit -> 0x0b (24/20 + max).
+	 */
+	if (sample_bits <= 16)
+		return IEC958_AES4_CON_WORDLEN_20_16;
+
+	return IEC958_AES4_CON_WORDLEN_24_20 | IEC958_AES4_CON_MAX_WORDLEN_24;
+}
+
+/* L/R channel-status bytes live in one register, four bits each.  The
+ * encoder sends the same AES2 byte on both subframes; only the channel
+ * number differs.  An unspecified channel number becomes the stereo pair
+ * 1/2, matching the vendor's 0x2010 default.
+ */
+static u32 aiao_cs3_value(const u8 cs[5])
+{
+	unsigned int source = cs[2] & IEC958_AES2_CON_SOURCE;
+	unsigned int channel = (cs[2] & IEC958_AES2_CON_CHANNEL) >> 4;
+	unsigned int left = channel ? channel : 1;
+	unsigned int right = channel ? (channel < 15 ? channel + 1 : 15) : 2;
+
+	return source | (left << 4) | (source << 8) | (right << 12);
+}
+
+/*
+ * Build AES0..AES4 from the ALSA control (AES0..AES3) and the stream
+ * parameters.  The driver owns the sampling-frequency and word-length
+ * fields because they must match the clock it programmed; everything else
+ * is left to userspace.  A non-zero AES0 bit 1 marks an IEC 61937
+ * compressed burst and is preserved.
+ */
+static void aiao_build_cs(struct hi3798cv200_aiao *aiao,
+			  const struct aiao_tx_config *config, u8 cs[5])
+{
+	/* Callers serialize against the control's put callback: hw_params
+	 * takes reg_lock, and aiao_update_spdif_output already holds it.
+	 */
+	snd_pcm_create_iec958_consumer_default(cs, 5);
+	if (aiao->iec958_valid)
+		memcpy(cs, aiao->iec958, sizeof(aiao->iec958));
+
+	cs[3] = (cs[3] & ~IEC958_AES3_CON_FS) | aiao_fs_code(config->rate);
+	cs[4] = (cs[4] & ~(IEC958_AES4_CON_WORDLEN |
+			   IEC958_AES4_CON_MAX_WORDLEN_24 |
+			   IEC958_AES4_CON_ORIGFS)) |
+		aiao_wordlen_code(config->sample_bits) |
+		aiao_orig_fs_code(config->rate);
+}
+
+static u32 aiao_dsp_ctrl_value(const struct aiao_tx_config *config)
+{
+	/* A compressed burst must reach the encoder untouched, and the HDMI
+	 * transmitter must see IEC 61937 preambles bit-exact.  Both therefore
+	 * bypass the volume/fade block.  LPCM keeps the vendor's fade-in/out
+	 * and 0 dB setting.
+	 */
+	if ((config->spdif && (config->cs[0] & IEC958_AES0_NONAUDIO)) ||
+	    config->hdmi_bypass)
+		return AIAO_TX_BYPASS;
+
+	return AIAO_TX_MUTE_FADE |
+	       FIELD_PREP(AIAO_TX_VOLUME_MASK, 0x79) |
+	       FIELD_PREP(AIAO_TX_FADE_IN_MASK, 4) |
+	       FIELD_PREP(AIAO_TX_FADE_OUT_MASK, 3);
+}
+
+/* Write the five channel-status bytes and the PCM/compressed mode select.
+ * Caller holds reg_lock or owns the controller exclusively.
+ */
+static void aiao_program_cs(struct hi3798cv200_aiao *aiao,
+			    const struct aiao_tx_config *config, const u8 cs[5])
+{
+	u32 enc = aiao_encoder_base(config->channel);
+
+	aiao_write(aiao, enc + AIAO_SPDIF_CS1, (cs[0] << 8) | cs[0]);
+	aiao_write(aiao, enc + AIAO_SPDIF_CS2, (cs[1] << 8) | cs[1]);
+	aiao_write(aiao, enc + AIAO_SPDIF_CS3, aiao_cs3_value(cs));
+	aiao_write(aiao, enc + AIAO_SPDIF_CS4, (cs[3] << 8) | cs[3]);
+	aiao_write(aiao, enc + AIAO_SPDIF_CS5, (cs[4] << 8) | cs[4]);
+	aiao_write(aiao, enc + AIAO_SPDIF_CONFIG,
+		   (cs[0] & IEC958_AES0_NONAUDIO) ?
+		   AIAO_SPDIF_MODE_COMPRESSED : AIAO_SPDIF_MODE_PCM);
+}
+
 static void aiao_restore_tx_config(struct hi3798cv200_aiao *aiao)
 {
 	const struct aiao_tx_config *config = &aiao->config;
-	u32 tx_offset = config->channel * 0x100;
-	u32 crg_offset = config->channel * 8;
-	u32 bclk_mask = GENMASK(config->channel * 4 + 3, config->channel * 4);
-	u32 bclk_value = (8 + config->channel) << (config->channel * 4);
 
 	if (!config->valid)
 		return;
 
-	/* Replay only the owner of hw_params, never the other DAI's TX bank. */
-	aiao_write(aiao, AIAO_TX0_INT_ENA + tx_offset, 0);
-	aiao_write(aiao, AIAO_TX0_INT_CLR + tx_offset, AIAO_TX_INT_ALL);
-	aiao_write(aiao, AIAO_TX0_CRG_CFG1 + crg_offset, 0);
-	aiao_write(aiao, AIAO_TX0_CRG_CFG0 + crg_offset, config->crg0);
-	aiao_write(aiao, AIAO_TX0_CRG_CFG1 + crg_offset, config->crg1);
-	aiao_write(aiao, AIAO_TX0_CRG_CFG1 + crg_offset,
+	/* Replay only the owner of hw_params, never another DAI's TX bank. */
+	aiao_write(aiao, aiao_cfg_reg(config, AIAO_TX_INT_ENA), 0);
+	aiao_write(aiao, aiao_cfg_reg(config, AIAO_TX_INT_CLR), AIAO_TX_INT_ALL);
+	aiao_write(aiao, aiao_cfg_crg_reg(config, AIAO_CRG_CFG1), 0);
+	aiao_write(aiao, aiao_cfg_crg_reg(config, AIAO_CRG_CFG0), config->crg0);
+	aiao_write(aiao, aiao_cfg_crg_reg(config, AIAO_CRG_CFG1), config->crg1);
+	aiao_write(aiao, aiao_cfg_crg_reg(config, AIAO_CRG_CFG1),
 		   config->crg1 | AIAO_CRG_CLK_EN);
-	aiao_update_bits(aiao, AIAO_SWITCH_TX_BCLK, bclk_mask, bclk_value);
-	aiao_write(aiao, AIAO_TX0_IF_ATTR + tx_offset, config->if_attr);
-	aiao_write(aiao, AIAO_TX0_DSP_CTRL + tx_offset, aiao->dsp_ctrl);
-	aiao_write(aiao, AIAO_TX0_BUF_ADDR + tx_offset, config->dma_addr);
-	aiao_write(aiao, AIAO_TX0_BUF_SIZE + tx_offset, config->buffer_bytes);
-	aiao_write(aiao, AIAO_TX0_BUF_ALEMPTY + tx_offset, config->period_bytes);
-	aiao_write(aiao, AIAO_TX0_TRANS_SIZE + tx_offset, config->period_bytes);
+
+	if (config->spdif) {
+		u32 pad = config->spdif_pad;
+
+		/* Pad k: bits [8k+2:8k] select the encoder, [8k+3] enables it. */
+		aiao_update_bits(aiao, AIAO_SPDIF_TX_MUX,
+				 GENMASK(8 * pad + 3, 8 * pad),
+				 (config->channel | BIT(3)) << (8 * pad));
+	} else {
+		u32 bclk_mask = GENMASK(config->channel * 4 + 3,
+					config->channel * 4);
+		u32 bclk_value = (8 + config->channel) << (config->channel * 4);
+
+		aiao_update_bits(aiao, AIAO_SWITCH_TX_BCLK, bclk_mask,
+				 bclk_value);
+	}
+
+	aiao_write(aiao, aiao_cfg_reg(config, AIAO_TX_IF_ATTR), config->if_attr);
+	aiao_write(aiao, aiao_cfg_reg(config, AIAO_TX_DSP_CTRL),
+		   config->dsp_ctrl);
+	aiao_write(aiao, aiao_cfg_reg(config, AIAO_TX_BUF_ADDR),
+		   config->dma_addr);
+	aiao_write(aiao, aiao_cfg_reg(config, AIAO_TX_BUF_SIZE),
+		   config->buffer_bytes);
+	aiao_write(aiao, aiao_cfg_reg(config, AIAO_TX_BUF_ALEMPTY),
+		   config->period_bytes);
+	aiao_write(aiao, aiao_cfg_reg(config, AIAO_TX_TRANS_SIZE),
+		   config->period_bytes);
 	/* No queued samples survive the required ALSA prepare/refill operation. */
-	aiao_write(aiao, AIAO_TX0_BUF_WPTR + tx_offset, 0);
-	aiao_write(aiao, AIAO_TX0_BUF_RPTR + tx_offset, 0);
+	aiao_write(aiao, aiao_cfg_reg(config, AIAO_TX_BUF_WPTR), 0);
+	aiao_write(aiao, aiao_cfg_reg(config, AIAO_TX_BUF_RPTR), 0);
+
+	if (config->spdif) {
+		aiao_program_cs(aiao, config, config->cs);
+		aiao_write(aiao, aiao_encoder_base(config->channel) +
+			   AIAO_SPDIF_CTRL, 0);
+	}
+}
+
+/* Recompute and push the S/PDIF channel status after userspace changed the
+ * IEC958 control.
+ */
+static void aiao_update_spdif_output(struct hi3798cv200_aiao *aiao)
+{
+	struct aiao_tx_config *config = &aiao->config;
+	unsigned long flags;
+	u8 cs[5];
+
+	spin_lock_irqsave(&aiao->reg_lock, flags);
+	if (!config->valid || !config->spdif)
+		goto unlock;
+
+	aiao_build_cs(aiao, config, cs);
+	memcpy(config->cs, cs, sizeof(config->cs));
+	config->dsp_ctrl = aiao_dsp_ctrl_value(config);
+	if (!READ_ONCE(aiao->powered))
+		goto unlock;
+
+	aiao_write(aiao, aiao_cfg_reg(config, AIAO_TX_DSP_CTRL),
+		   config->dsp_ctrl);
+	aiao_program_cs(aiao, config, cs);
+unlock:
+	spin_unlock_irqrestore(&aiao->reg_lock, flags);
 }
 
 static int aiao_stop_tx(struct hi3798cv200_aiao *aiao)
 {
 	u32 val, trans_size;
 	int ret = 0;
-	const u32 tx_dsp = aiao_tx_reg(aiao, AIAO_TX0_DSP_CTRL);
-	const u32 tx_rptr = aiao_tx_reg(aiao, AIAO_TX0_BUF_RPTR);
-	const u32 tx_trans = aiao_tx_reg(aiao, AIAO_TX0_TRANS_SIZE);
-	const u32 tx_int_ena = aiao_tx_reg(aiao, AIAO_TX0_INT_ENA);
-	const u32 tx_int_clr = aiao_tx_reg(aiao, AIAO_TX0_INT_CLR);
+	const u32 tx_dsp = aiao_tx_reg(aiao, AIAO_TX_DSP_CTRL);
+	const u32 tx_rptr = aiao_tx_reg(aiao, AIAO_TX_BUF_RPTR);
+	const u32 tx_trans = aiao_tx_reg(aiao, AIAO_TX_TRANS_SIZE);
+	const u32 tx_int_ena = aiao_tx_reg(aiao, AIAO_TX_INT_ENA);
+	const u32 tx_int_clr = aiao_tx_reg(aiao, AIAO_TX_INT_CLR);
 	const u32 top_irq = aiao_tx_top_irq(aiao);
 
 	if (!READ_ONCE(aiao->powered))
@@ -284,6 +552,16 @@ static int aiao_stop_tx(struct hi3798cv200_aiao *aiao)
 	}
 
 	aiao_write(aiao, tx_int_clr, AIAO_TX_INT_ALL);
+	if (aiao->spdif_stream) {
+		u32 enc = aiao_encoder_base(aiao->tx_channel);
+
+		/* Vendor stop sequence: restore channel numbers, then gate the
+		 * biphase encoder so the pad goes idle instead of emitting the
+		 * tail of the ring.
+		 */
+		aiao_write(aiao, enc + AIAO_SPDIF_CS3, 0x2010);
+		aiao_write(aiao, enc + AIAO_SPDIF_CTRL, 0);
+	}
 	rcu_assign_pointer(aiao->substream, NULL);
 	aiao->stop_error = ret;
 	if (ret)
@@ -376,18 +654,23 @@ static int hi3798cv200_aiao_hw_params(struct snd_soc_component *component,
 {
 	struct hi3798cv200_aiao *aiao = dev_get_drvdata(component->dev);
 	struct snd_pcm_runtime *runtime = substream->runtime;
-	u32 precision, if_attr;
+	struct aiao_tx_config *config = &aiao->config;
+	u32 precision, if_attr, crg1;
 	size_t buffer_bytes = params_buffer_bytes(params);
 	size_t period_bytes = params_period_bytes(params);
 	unsigned int channels = params_channels(params);
 	unsigned int sample_bytes = snd_pcm_format_physical_width(params_format(params)) / 8;
 	unsigned int hw_channels = channels == 6 ? 8 : channels;
 	dma_addr_t dma_addr = runtime->dma_addr;
+	bool spdif = aiao->spdif_stream;
+	unsigned long flags;
 	int ret;
 
 	if (!READ_ONCE(aiao->powered))
 		return -ESTRPIPE;
-	if (channels != 2 &&
+	if (spdif && channels != 2)
+		return -EINVAL;
+	if (!spdif && channels != 2 &&
 	    (!aiao->hdmi_stream || aiao->hdmi_tx_channel != 3 ||
 	     (channels != 6 && channels != 8)))
 		return -EINVAL;
@@ -409,7 +692,7 @@ static int hi3798cv200_aiao_hw_params(struct snd_soc_component *component,
 	if (ret)
 		return ret;
 	aiao->prepared = false;
-	aiao->config.valid = false;
+	config->valid = false;
 	/* hw_params may be repeated without hw_free. Never leave an old
 	 * six-channel bounce buffer live after switching back to direct DMA.
 	 */
@@ -429,44 +712,61 @@ static int hi3798cv200_aiao_hw_params(struct snd_soc_component *component,
 		dma_addr = aiao->packed_addr;
 	}
 
-	if_attr = FIELD_PREP(AIAO_TX_PRECISION_MASK, precision) |
-		  FIELD_PREP(AIAO_TX_CHANNELS_MASK, hw_channels == 8 ? 3 : 1) |
-		  FIELD_PREP(AIAO_TX_SOURCE_MASK, aiao->tx_channel) |
-		  FIELD_PREP(AIAO_TX_SD0_MASK, 0) |
-		  FIELD_PREP(AIAO_TX_SD1_MASK, 1) |
-		  FIELD_PREP(AIAO_TX_SD2_MASK, 2) |
-		  FIELD_PREP(AIAO_TX_SD3_MASK, 3);
+	if (spdif) {
+		/* The SPDIF-TX bank only has the channel-count and precision
+		 * fields; there is no SD source mux.
+		 */
+		if_attr = FIELD_PREP(AIAO_TX_PRECISION_MASK, precision) |
+			  FIELD_PREP(AIAO_TX_CHANNELS_MASK, 1);
+		/* 256 fs MCLK, BCLK = 128 fs (biphase cell rate), frame = 128
+		 * BCLK; index values follow hal_aiao_priv.c:479-492/464-477.
+		 */
+		crg1 = FIELD_PREP(AIAO_CRG_BCLK_DIV_MASK,
+				  AIAO_CRG_BCLK_DIV_128FS) |
+		       FIELD_PREP(AIAO_CRG_FSCLK_DIV_MASK, AIAO_CRG_FS_DIV_128FS);
+	} else {
+		if_attr = FIELD_PREP(AIAO_TX_PRECISION_MASK, precision) |
+			  FIELD_PREP(AIAO_TX_CHANNELS_MASK, hw_channels == 8 ? 3 : 1) |
+			  FIELD_PREP(AIAO_TX_SOURCE_MASK, aiao->tx_channel) |
+			  FIELD_PREP(AIAO_TX_SD0_MASK, 0) |
+			  FIELD_PREP(AIAO_TX_SD1_MASK, 1) |
+			  FIELD_PREP(AIAO_TX_SD2_MASK, 2) |
+			  FIELD_PREP(AIAO_TX_SD3_MASK, 3);
+		crg1 = FIELD_PREP(AIAO_CRG_BCLK_DIV_MASK,
+				  AIAO_CRG_BCLK_DIV_64FS) |
+		       FIELD_PREP(AIAO_CRG_FSCLK_DIV_MASK, AIAO_CRG_FS_DIV_64FS);
+	}
 
-	aiao->config = (struct aiao_tx_config) {
-		.crg0 = FIELD_PREP(AIAO_CRG_MCLK_DIV_MASK,
-				  aiao_mclk_div(aiao, params_rate(params))),
-		.crg1 = FIELD_PREP(AIAO_CRG_BCLK_DIV_MASK, 3) |
-			FIELD_PREP(AIAO_CRG_FSCLK_DIV_MASK, 3),
-		.if_attr = if_attr,
-		.dma_addr = lower_32_bits(dma_addr),
-		.buffer_bytes = buffer_bytes,
-		.period_bytes = period_bytes,
-		.channel = aiao->tx_channel,
-		.valid = true,
-		.frame_bytes = hw_channels * sample_bytes,
-	};
+	memset(config, 0, sizeof(*config));
+	config->crg0 = FIELD_PREP(AIAO_CRG_MCLK_DIV_MASK,
+				  aiao_mclk_div(aiao, params_rate(params)));
+	config->crg1 = crg1;
+	config->if_attr = if_attr;
+	config->dma_addr = lower_32_bits(dma_addr);
+	config->buffer_bytes = buffer_bytes;
+	config->period_bytes = period_bytes;
+	config->channel = aiao->tx_channel;
+	config->spdif_pad = aiao->spdif_pad;
+	config->rate = params_rate(params);
+	config->sample_bits = precision == 1 ? 16 : 24;
+	config->spdif = spdif;
+	config->frame_bytes = hw_channels * sample_bytes;
+	config->hdmi_bypass = !spdif && aiao->hdmi_stream &&
+			      aiao->hdmi_tx_channel == 3;
+	spin_lock_irqsave(&aiao->reg_lock, flags);
+	aiao_build_cs(aiao, config, config->cs);
+	spin_unlock_irqrestore(&aiao->reg_lock, flags);
+	config->dsp_ctrl = aiao_dsp_ctrl_value(config);
+	config->valid = true;
 
-	aiao->dsp_ctrl = AIAO_TX_MUTE_FADE |
-		FIELD_PREP(AIAO_TX_VOLUME_MASK, 0x79) |
-		FIELD_PREP(AIAO_TX_FADE_IN_MASK, 4) |
-		FIELD_PREP(AIAO_TX_FADE_OUT_MASK, 3);
-	/* HDMI must preserve IEC61937 burst bits exactly, including start and
-	 * stop: bypass DSP volume/fades (BSP TX_DSP_CTRL.bypass_en bit 27).
-	 * LPCM uses the same unity/bypass path; analog retains its old DSP.
-	 */
-	if (aiao->hdmi_stream && aiao->hdmi_tx_channel == 3)
-		aiao->dsp_ctrl = AIAO_TX_BYPASS;
 	aiao->prepared = false;
 	aiao->last_pos = 0;
 	aiao_restore_tx_config(aiao);
 
-	dev_dbg(aiao->dev, "AIAO TX%u: %u Hz, %u significant bits\n",
-		aiao->tx_channel, params_rate(params), precision == 1 ? 16 : 24);
+	dev_dbg(aiao->dev, "AIAO TX%u%s: %u Hz, %u significant bits%s\n",
+		aiao->tx_channel, spdif ? " (S/PDIF)" : "",
+		params_rate(params), precision == 1 ? 16 : 24,
+		config->cs[0] & IEC958_AES0_NONAUDIO ? ", non-audio" : "");
 	return 0;
 }
 
@@ -487,9 +787,12 @@ static int hi3798cv200_aiao_hw_free(struct snd_soc_component *component,
 		aiao->packed_area = NULL;
 	}
 	if (READ_ONCE(aiao->powered)) {
-		aiao_write(aiao, aiao_tx_crg_reg(aiao, AIAO_TX0_CRG_CFG1), 0);
-		aiao_write(aiao, aiao_tx_reg(aiao, AIAO_TX0_BUF_ADDR), 0);
-		aiao_write(aiao, aiao_tx_reg(aiao, AIAO_TX0_BUF_SIZE), 0);
+		aiao_write(aiao, aiao_tx_crg_reg(aiao, AIAO_CRG_CFG1), 0);
+		aiao_write(aiao, aiao_tx_reg(aiao, AIAO_TX_BUF_ADDR), 0);
+		aiao_write(aiao, aiao_tx_reg(aiao, AIAO_TX_BUF_SIZE), 0);
+		if (aiao->spdif_stream)
+			aiao_write(aiao, aiao_encoder_base(aiao->tx_channel) +
+				   AIAO_SPDIF_CTRL, 0);
 	}
 	return ret;
 }
@@ -508,9 +811,9 @@ static int hi3798cv200_aiao_prepare(struct snd_soc_component *component,
 	ret = aiao_stop_tx(aiao);
 	if (ret)
 		return ret;
-	aiao_write(aiao, aiao_tx_reg(aiao, AIAO_TX0_DSP_CTRL), aiao->dsp_ctrl);
-	aiao_write(aiao, aiao_tx_reg(aiao, AIAO_TX0_BUF_WPTR), 0);
-	aiao_write(aiao, aiao_tx_reg(aiao, AIAO_TX0_BUF_RPTR), 0);
+	aiao_write(aiao, aiao_tx_reg(aiao, AIAO_TX_DSP_CTRL), aiao->config.dsp_ctrl);
+	aiao_write(aiao, aiao_tx_reg(aiao, AIAO_TX_BUF_WPTR), 0);
+	aiao_write(aiao, aiao_tx_reg(aiao, AIAO_TX_BUF_RPTR), 0);
 	aiao->last_pos = 0;
 	aiao->packed_appl = 0;
 	aiao->prepared = true;
@@ -522,9 +825,9 @@ static int hi3798cv200_aiao_trigger(struct snd_soc_component *component,
 				    int cmd)
 {
 	struct hi3798cv200_aiao *aiao = dev_get_drvdata(component->dev);
-	u32 tx_int_clr = aiao_tx_reg(aiao, AIAO_TX0_INT_CLR);
-	u32 tx_int_ena = aiao_tx_reg(aiao, AIAO_TX0_INT_ENA);
-	u32 tx_dsp = aiao_tx_reg(aiao, AIAO_TX0_DSP_CTRL);
+	u32 tx_int_clr = aiao_tx_reg(aiao, AIAO_TX_INT_CLR);
+	u32 tx_int_ena = aiao_tx_reg(aiao, AIAO_TX_INT_ENA);
+	u32 tx_dsp = aiao_tx_reg(aiao, AIAO_TX_DSP_CTRL);
 	u32 top_irq = aiao_tx_top_irq(aiao);
 
 	switch (cmd) {
@@ -539,6 +842,17 @@ static int hi3798cv200_aiao_trigger(struct snd_soc_component *component,
 		aiao_update_bits(aiao, AIAO_INT_ENA, top_irq, top_irq);
 		dma_wmb();
 		aiao_update_bits(aiao, tx_dsp, AIAO_TX_ENABLE, AIAO_TX_ENABLE);
+		if (aiao->spdif_stream) {
+			u32 enc = aiao_encoder_base(aiao->tx_channel);
+
+			/* Vendor AIAO_HW_SetStart SPDIF branch: channel
+			 * numbers are rewritten on every start, then the
+			 * biphase encoder is released.
+			 */
+			aiao_write(aiao, enc + AIAO_SPDIF_CS3,
+				   aiao_cs3_value(aiao->config.cs));
+			aiao_write(aiao, enc + AIAO_SPDIF_CTRL, AIAO_SPDIF_EN);
+		}
 		return 0;
 
 	case SNDRV_PCM_TRIGGER_RESUME:
@@ -594,13 +908,13 @@ static int hi3798cv200_aiao_publish(struct snd_soc_component *component,
 		       (queued_bytes - (buffer_bytes - AIAO_DMA_GAP))) %
 		      buffer_bytes;
 	dma_wmb();
-	aiao_write(aiao, aiao_tx_reg(aiao, AIAO_TX0_BUF_WPTR), pos);
+	aiao_write(aiao, aiao_tx_reg(aiao, AIAO_TX_BUF_WPTR), pos);
 	/* EMPTY is a level condition. Rearm it only when scanout has more data;
 	 * ALSA still decides genuine underrun versus normal final-buffer drain.
 	 */
 	if (queued_bytes &&
-	    (aiao_read(aiao, aiao_tx_reg(aiao, AIAO_TX0_DSP_CTRL)) & AIAO_TX_ENABLE))
-		aiao_update_bits(aiao, aiao_tx_reg(aiao, AIAO_TX0_INT_ENA),
+	    (aiao_read(aiao, aiao_tx_reg(aiao, AIAO_TX_DSP_CTRL)) & AIAO_TX_ENABLE))
+		aiao_update_bits(aiao, aiao_tx_reg(aiao, AIAO_TX_INT_ENA),
 				 AIAO_TX_INT_EMPTY, AIAO_TX_INT_EMPTY);
 	return 0;
 }
@@ -614,7 +928,7 @@ hi3798cv200_aiao_pointer(struct snd_soc_component *component,
 
 	if (!READ_ONCE(aiao->powered) || !aiao->prepared)
 		return aiao->config.frame_bytes ? pos / aiao->config.frame_bytes : 0;
-	pos = aiao_read(aiao, aiao_tx_reg(aiao, AIAO_TX0_BUF_RPTR)) &
+	pos = aiao_read(aiao, aiao_tx_reg(aiao, AIAO_TX_BUF_RPTR)) &
 		AIAO_BUFFER_PTR_MASK;
 
 	if (hi3798cv200_aiao_publish(component, substream, pos))
@@ -649,18 +963,115 @@ static int hi3798cv200_aiao_ack(struct snd_soc_component *component,
 					frames - count, runtime->sample_bits / 8);
 		aiao->packed_appl = appl;
 	}
-	rptr = aiao_read(aiao, aiao_tx_reg(aiao, AIAO_TX0_BUF_RPTR)) &
+	rptr = aiao_read(aiao, aiao_tx_reg(aiao, AIAO_TX_BUF_RPTR)) &
 		AIAO_BUFFER_PTR_MASK;
 
 	return hi3798cv200_aiao_publish(component, substream, rptr);
 }
 
+/* IEC958 control.  It belongs to the S/PDIF PCM device so that alsa-lib's
+ * iec958 plugin and applications using AES0..AES3 find it on the same
+ * device number they opened.
+ */
+static int hi3798cv200_aiao_iec958_info(struct snd_kcontrol *kcontrol,
+					struct snd_ctl_elem_info *uinfo)
+{
+	uinfo->type = SNDRV_CTL_ELEM_TYPE_IEC958;
+	uinfo->count = 1;
+	return 0;
+}
+
+static int hi3798cv200_aiao_iec958_get(struct snd_kcontrol *kcontrol,
+				       struct snd_ctl_elem_value *ucontrol)
+{
+	struct hi3798cv200_aiao *aiao = snd_kcontrol_chip(kcontrol);
+	unsigned long flags;
+
+	spin_lock_irqsave(&aiao->reg_lock, flags);
+	memcpy(ucontrol->value.iec958.status, aiao->iec958,
+	       sizeof(aiao->iec958));
+	spin_unlock_irqrestore(&aiao->reg_lock, flags);
+	return 0;
+}
+
+static int hi3798cv200_aiao_iec958_put(struct snd_kcontrol *kcontrol,
+				       struct snd_ctl_elem_value *ucontrol)
+{
+	struct hi3798cv200_aiao *aiao = snd_kcontrol_chip(kcontrol);
+	unsigned long flags;
+	bool changed;
+
+	spin_lock_irqsave(&aiao->reg_lock, flags);
+	changed = memcmp(aiao->iec958, ucontrol->value.iec958.status,
+			 sizeof(aiao->iec958));
+	if (changed) {
+		memcpy(aiao->iec958, ucontrol->value.iec958.status,
+		       sizeof(aiao->iec958));
+		aiao->iec958_valid = true;
+	}
+	spin_unlock_irqrestore(&aiao->reg_lock, flags);
+
+	if (changed)
+		aiao_update_spdif_output(aiao);
+	return changed;
+}
+
+static int hi3798cv200_aiao_iec958_mask_get(struct snd_kcontrol *kcontrol,
+					    struct snd_ctl_elem_value *ucontrol)
+{
+	memset(ucontrol->value.iec958.status, 0xff, 4);
+	return 0;
+}
+
+static const struct snd_kcontrol_new hi3798cv200_aiao_iec958_controls[] = {
+	{
+		.iface = SNDRV_CTL_ELEM_IFACE_PCM,
+		.name = SNDRV_CTL_NAME_IEC958("", PLAYBACK, DEFAULT),
+		.access = SNDRV_CTL_ELEM_ACCESS_READWRITE,
+		.info = hi3798cv200_aiao_iec958_info,
+		.get = hi3798cv200_aiao_iec958_get,
+		.put = hi3798cv200_aiao_iec958_put,
+	},
+	{
+		.iface = SNDRV_CTL_ELEM_IFACE_PCM,
+		.name = SNDRV_CTL_NAME_IEC958("", PLAYBACK, MASK),
+		.access = SNDRV_CTL_ELEM_ACCESS_READ,
+		.info = hi3798cv200_aiao_iec958_info,
+		.get = hi3798cv200_aiao_iec958_mask_get,
+	},
+};
+
 static int hi3798cv200_aiao_pcm_construct(struct snd_soc_component *component,
 					  struct snd_soc_pcm_runtime *rtd)
 {
-	return snd_pcm_set_managed_buffer_all(rtd->pcm, SNDRV_DMA_TYPE_DEV,
-					      component->dev, 64 * 1024,
-					      AIAO_BUFFER_BYTES_MAX);
+	struct hi3798cv200_aiao *aiao = dev_get_drvdata(component->dev);
+	struct snd_soc_dai *cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
+	struct snd_card *card = rtd->card->snd_card;
+	struct snd_kcontrol *kcontrol;
+	int ret, i;
+
+	ret = snd_pcm_set_managed_buffer_all(rtd->pcm, SNDRV_DMA_TYPE_DEV,
+					     component->dev, 64 * 1024,
+					     AIAO_BUFFER_BYTES_MAX);
+	if (ret)
+		return ret;
+
+	if (cpu_dai->id != 2)
+		return 0;
+
+	for (i = 0; i < ARRAY_SIZE(hi3798cv200_aiao_iec958_controls); i++) {
+		kcontrol = snd_ctl_new1(&hi3798cv200_aiao_iec958_controls[i],
+					aiao);
+		if (!kcontrol)
+			return -ENOMEM;
+		kcontrol->id.device = rtd->pcm->device;
+		ret = snd_ctl_add(card, kcontrol);
+		if (ret)
+			return ret;
+	}
+	dev_dbg(component->dev, "IEC958 controls on PCM device %u\n",
+		rtd->pcm->device);
+	return 0;
 }
 
 static int hi3798cv200_aiao_component_suspend(struct snd_soc_component *component)
@@ -697,7 +1108,7 @@ static const struct snd_soc_component_driver hi3798cv200_aiao_component = {
 };
 
 static int hi3798cv200_aiao_set_fmt(struct snd_soc_dai *dai,
-				    unsigned int fmt)
+				   unsigned int fmt)
 {
 	if ((fmt & SND_SOC_DAIFMT_FORMAT_MASK) != SND_SOC_DAIFMT_I2S)
 		return -EINVAL;
@@ -712,6 +1123,17 @@ static int hi3798cv200_aiao_set_fmt(struct snd_soc_dai *dai,
 	return 0;
 }
 
+static int hi3798cv200_aiao_spdif_set_fmt(struct snd_soc_dai *dai,
+					  unsigned int fmt)
+{
+	/* S/PDIF is a fixed biphase-mark transmitter: it has no I2S-style
+	 * frame format, clock polarity or provider role.  The machine driver
+	 * may copy an "i2s" property from another link; accept any value
+	 * instead of failing card instantiation.
+	 */
+	return 0;
+}
+
 static const unsigned int aiao_hdmi_channels[] = { 2, 6, 8 };
 static const struct snd_pcm_hw_constraint_list aiao_hdmi_channel_list = {
 	.count = ARRAY_SIZE(aiao_hdmi_channels),
@@ -719,21 +1141,43 @@ static const struct snd_pcm_hw_constraint_list aiao_hdmi_channel_list = {
 };
 
 static int hi3798cv200_aiao_dai_startup(struct snd_pcm_substream *substream,
-				      struct snd_soc_dai *dai)
+					struct snd_soc_dai *dai)
 {
 	struct hi3798cv200_aiao *aiao = snd_soc_dai_get_drvdata(dai);
 
-	aiao->tx_channel = dai->id ? aiao->hdmi_tx_channel : aiao->analog_tx_channel;
-	aiao->hdmi_stream = dai->id;
-	if (dai->id && aiao->hdmi_tx_channel == 3)
-		return snd_pcm_hw_constraint_list(substream->runtime, 0,
-			SNDRV_PCM_HW_PARAM_CHANNELS, &aiao_hdmi_channel_list);
+	switch (dai->id) {
+	case 0:
+		aiao->tx_channel = aiao->analog_tx_channel;
+		aiao->hdmi_stream = false;
+		aiao->spdif_stream = false;
+		break;
+	case 1:
+		aiao->tx_channel = aiao->hdmi_tx_channel;
+		aiao->hdmi_stream = true;
+		aiao->spdif_stream = false;
+		if (aiao->hdmi_tx_channel == 3)
+			return snd_pcm_hw_constraint_list(substream->runtime, 0,
+				SNDRV_PCM_HW_PARAM_CHANNELS, &aiao_hdmi_channel_list);
+		break;
+	case 2:
+		aiao->tx_channel = aiao->spdif_tx_channel;
+		aiao->hdmi_stream = false;
+		aiao->spdif_stream = true;
+		break;
+	default:
+		return -EINVAL;
+	}
 	return 0;
 }
 
 static const struct snd_soc_dai_ops hi3798cv200_aiao_dai_ops = {
 	.startup = hi3798cv200_aiao_dai_startup,
 	.set_fmt = hi3798cv200_aiao_set_fmt,
+};
+
+static const struct snd_soc_dai_ops hi3798cv200_aiao_spdif_dai_ops = {
+	.startup = hi3798cv200_aiao_dai_startup,
+	.set_fmt = hi3798cv200_aiao_spdif_set_fmt,
 };
 
 static struct snd_soc_dai_driver hi3798cv200_aiao_dais[] = {
@@ -762,6 +1206,17 @@ static struct snd_soc_dai_driver hi3798cv200_aiao_dais[] = {
 			.formats = SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S32_LE,
 		},
 		.ops = &hi3798cv200_aiao_dai_ops,
+	}, {
+		.id = 2,
+		.name = "hi3798-aiao-spdif",
+		.playback = {
+			.stream_name = "S/PDIF Playback",
+			.channels_min = 2,
+			.channels_max = 2,
+			.rates = AIAO_SPDIF_RATES,
+			.formats = SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S32_LE,
+		},
+		.ops = &hi3798cv200_aiao_spdif_dai_ops,
 	},
 };
 
@@ -770,10 +1225,10 @@ static bool hi3798cv200_aiao_ack_tx0(struct hi3798cv200_aiao *aiao,
 {
 	u32 top_raw = 0, top_status = 0, status = 0;
 	unsigned int attempt;
-	u32 tx_int_clr = aiao_tx_reg(aiao, AIAO_TX0_INT_CLR);
-	u32 tx_int_raw = aiao_tx_reg(aiao, AIAO_TX0_INT_RAW);
-	u32 tx_int_status = aiao_tx_reg(aiao, AIAO_TX0_INT_STATUS);
-	u32 tx_int_ena = aiao_tx_reg(aiao, AIAO_TX0_INT_ENA);
+	u32 tx_int_clr = aiao_tx_reg(aiao, AIAO_TX_INT_CLR);
+	u32 tx_int_raw = aiao_tx_reg(aiao, AIAO_TX_INT_RAW);
+	u32 tx_int_status = aiao_tx_reg(aiao, AIAO_TX_INT_STATUS);
+	u32 tx_int_ena = aiao_tx_reg(aiao, AIAO_TX_INT_ENA);
 	u32 top_irq = aiao_tx_top_irq(aiao);
 
 	/* An empty ring immediately reasserts EMPTY after W1C. Consume that
@@ -818,7 +1273,7 @@ static irqreturn_t hi3798cv200_aiao_irq(int irq, void *data)
 		return IRQ_NONE;
 	if (top & top_irq) {
 		handled = true;
-		raw = aiao_read(aiao, aiao_tx_reg(aiao, AIAO_TX0_INT_RAW));
+		raw = aiao_read(aiao, aiao_tx_reg(aiao, AIAO_TX_INT_RAW));
 		acked = hi3798cv200_aiao_ack_tx0(aiao, raw);
 		if (!acked || (raw & (AIAO_TX_INT_PERIOD | AIAO_TX_INT_EMPTY))) {
 			rcu_read_lock();
@@ -888,8 +1343,8 @@ static int aiao_power_on(struct hi3798cv200_aiao *aiao)
 
 	aiao_update_bits(aiao, AIAO_OUTSTANDING, AIAO_OUTSTANDING_MASK, 2);
 	aiao_write(aiao, AIAO_INT_ENA, 0);
-	aiao_write(aiao, aiao_tx_reg(aiao, AIAO_TX0_INT_ENA), 0);
-	aiao_write(aiao, aiao_tx_reg(aiao, AIAO_TX0_INT_CLR), AIAO_TX_INT_ALL);
+	aiao_write(aiao, aiao_tx_reg(aiao, AIAO_TX_INT_ENA), 0);
+	aiao_write(aiao, aiao_tx_reg(aiao, AIAO_TX_INT_CLR), AIAO_TX_INT_ALL);
 	aiao_restore_tx_config(aiao);
 	aiao->stop_error = 0;
 	WRITE_ONCE(aiao->powered, true);
@@ -994,6 +1449,27 @@ static int hi3798cv200_aiao_probe(struct platform_device *pdev)
 	/* BSP drv_ao_op.c:64-78: S40/CV200 HDMI is TX3, S28/MV310 TX2. */
 	aiao->hdmi_tx_channel = of_device_is_compatible(dev->of_node,
 						      "hisilicon,hi3798mv310-aiao") ? 2 : 3;
+	/* BSP drv_ao_op.c:83 maps the logical consumer S/PDIF output to
+	 * SPDIF TX1; boards that route TX0/TX2 override this.
+	 */
+	aiao->spdif_tx_channel = 1;
+	ret = device_property_read_u32(dev, "hisilicon,spdif-tx-channel",
+				       &aiao->spdif_tx_channel);
+	if (ret && ret != -EINVAL)
+		return dev_err_probe(dev, ret, "failed to read S/PDIF TX channel\n");
+	if (aiao->spdif_tx_channel > 2)
+		return dev_err_probe(dev, -EINVAL,
+				     "invalid S/PDIF TX channel %u\n",
+				     aiao->spdif_tx_channel);
+	aiao->spdif_pad = aiao->spdif_tx_channel;
+	ret = device_property_read_u32(dev, "hisilicon,spdif-tx-pad",
+				       &aiao->spdif_pad);
+	if (ret && ret != -EINVAL)
+		return dev_err_probe(dev, ret, "failed to read S/PDIF pad\n");
+	if (aiao->spdif_pad > 3)
+		return dev_err_probe(dev, -EINVAL, "invalid S/PDIF pad %u\n",
+				     aiao->spdif_pad);
+
 	aiao->base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(aiao->base))
 		return PTR_ERR(aiao->base);
@@ -1023,6 +1499,12 @@ static int hi3798cv200_aiao_probe(struct platform_device *pdev)
 	aiao->irq = platform_get_irq(pdev, 0);
 	if (aiao->irq < 0)
 		return aiao->irq;
+
+	/* Power on before registering the component so the first PCM open sees
+	 * a live controller; register-level state needs no clock here.
+	 */
+	snd_pcm_create_iec958_consumer_default(aiao->iec958,
+					       sizeof(aiao->iec958));
 
 	ret = aiao_power_on(aiao);
 	if (ret)

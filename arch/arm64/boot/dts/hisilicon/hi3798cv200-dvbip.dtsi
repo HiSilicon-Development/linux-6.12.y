@@ -199,6 +199,14 @@
 		};
 	};
 
+	/* The AIAO S/PDIF transmitter needs no register map, only the
+	 * stub codec that gives the DAI link a playback endpoint.
+	 */
+	spdif_out: spdif-out {
+		compatible = "linux,spdif-dit";
+		#sound-dai-cells = <0>;
+	};
+
 	dvbip_sound: sound {
 		compatible = "simple-audio-card";
 		simple-audio-card,name = "DVBIP-CV200";
@@ -233,6 +241,22 @@
 			};
 			codec {
 				sound-dai = <&hdmi>;
+			};
+		};
+
+		simple-audio-card,dai-link@2 {
+			reg = <2>;
+			/* Biphase mark coding has no I2S frame format; the DAI
+			 * accepts whatever the machine driver passes down.
+			 */
+			format = "i2s";
+			bitclock-master = <&spdif_sound_cpu>;
+			frame-master = <&spdif_sound_cpu>;
+			spdif_sound_cpu: cpu {
+				sound-dai = <&aiao 2>;
+			};
+			codec {
+				sound-dai = <&spdif_out>;
 			};
 		};
 	};
@@ -453,6 +477,8 @@
 
 &aiao {
 	status = "okay";
+	/* BSP drv_ao_op.c drives the logical S/PDIF consumer from TX1. */
+	hisilicon,spdif-tx-channel = <1>;
 };
 
 &tianlai {
