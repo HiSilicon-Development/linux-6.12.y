@@ -17,6 +17,10 @@ description:
   The PCM DMA path accepts signed 16-bit samples or 24 significant bits in
   the most significant bits of a 32-bit word (ALSA S32_LE with msbits 24).
   Low-justified S24_LE is not a native DMA format.
+  One of the transmit interfaces is the consumer S/PDIF transmitter: its DMA
+  bank feeds a separate biphase encoder, which drives an optical or coaxial
+  pad through the SPDIF transmit mux. The encoder carries IEC 60958 channel
+  status and supports IEC 61937 compressed bursts (AC-3/DTS) in bypass mode.
   CV200 uses the 933.888 MHz audio PLL, while MV310 uses the BSP's
   860.160 MHz source and has a different internal HDMI transmit port.
 
@@ -47,7 +51,8 @@ properties:
     const: 1
     description: |
       DAI 0 is the board-selected analog/external I2S port. DAI 1 is the
-      internal HDMI port (TX3 on CV200, TX2 on MV310). The two PCM devices
+      internal HDMI port (TX3 on CV200, TX2 on MV310). DAI 2 is the consumer
+      S/PDIF transmitter (SPDIF-TX bank plus its encoder). The PCM devices
       share the driver's DMA state and cannot be opened simultaneously.
 
   hisilicon,tx-channel:
@@ -56,6 +61,27 @@ properties:
     maximum: 3
     default: 0
     description: Analog/external I2S transmit port index (DAI 0 only).
+
+  hisilicon,spdif-tx-channel:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    minimum: 0
+    maximum: 2
+    default: 1
+    description: |
+      S/PDIF transmit engine index used by DAI 2.  The SPDIF-TX DMA bank
+      lives at 0x3000 + 0x100 * n and its encoder at 0x4000 + 0x1000 * n.
+      The BSP maps the logical consumer S/PDIF output to SPDIF TX1, which is
+      the default.
+
+  hisilicon,spdif-tx-pad:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    minimum: 0
+    maximum: 3
+    description: |
+      SPDIF_TX_MUX pad index driven by DAI 2.  Pad k selects its source
+      encoder with bits [8k+2:8k] and enables the pad with bit 8k+3.  Boards
+      that route the encoder to a different output pad override this.  When
+      absent the driver uses the value of hisilicon,spdif-tx-channel.
 
 required:
   - compatible
@@ -83,6 +109,8 @@ examples:
         clocks = <&crg HISTB_AIAO_CLK>, <&crg HISTB_AIAO_MCLK>;
         clock-names = "bus", "mclk";
         resets = <&crg 0x118 4>;
+        hisilicon,spdif-tx-channel = <1>;
+        hisilicon,spdif-tx-pad = <1>;
         #sound-dai-cells = <1>;
     };
 ...
